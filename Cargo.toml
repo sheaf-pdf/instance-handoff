@@ -1,0 +1,32 @@
+[package]
+name = "instance-handoff"
+version = "0.1.0"
+edition = "2024"
+# File::try_lock.
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "One instance of an app per user: later launches hand their files to the running one"
+repository = "https://github.com/sheaf-pdf/instance-handoff"
+keywords = ["single-instance", "instance", "ipc", "desktop", "launcher"]
+categories = ["os", "gui"]
+# Only what users need, so local tooling files can't end up in the package.
+include = ["/src", "/README.md", "/LICENSE-*"]
+# Still sheaf's crate, copied: its names and paths say "sheaf" (README,
+# Status). Drop this once the API is generic.
+publish = false
+
+[dependencies]
+futures = "0.3"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1.2"
+windows = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+tempfile = "3"

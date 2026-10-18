@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Each step runs a recipe from the justfile, so `just ci` locally checks the
+# same things.
+jobs:
+  check:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: extractions/setup-just@v4
+      - name: Check formatting
+        run: just fmt
+      - name: Clippy
+        run: just clippy
+      - name: Test (including doctests)
+        run: just test
+      - name: Build documentation
+        run: just doc
+
+  # Each platform has its own code: the runtime folder, the peer check on
+  # macOS (getpeereid), AF_UNIX through uds_windows and the foreground
+  # handoff on Windows.
+  platforms:
+    name: Checks on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: extractions/setup-just@v4
+      - name: Clippy
+        run: just clippy
+      - name: Test
+        run: just test
+
+  msrv:
+    name: Minimum Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Keep in step with rust-version in Cargo.toml, which `just msrv` reads.
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: extractions/setup-just@v4
+      - name: Test
+        run: just msrv
