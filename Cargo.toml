@@ -2,31 +2,54 @@
 name = "instance-handoff"
 version = "0.1.0"
 edition = "2024"
-# File::try_lock.
-rust-version = "1.89"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "One instance of an app per user: later launches hand their files to the running one"
+description = "Make a program single-instance: the first launch owns a per-user lock, and later launches hand their request to it over a local socket and exit"
 repository = "https://github.com/sheaf-pdf/instance-handoff"
-keywords = ["single-instance", "instance", "ipc", "desktop", "launcher"]
-categories = ["os", "gui"]
+keywords = ["single-instance", "single-process", "singleton", "ipc", "desktop"]
+categories = ["os", "gui", "command-line-interface"]
 # Only what users need, so local tooling files can't end up in the package.
-include = ["/src", "/README.md", "/LICENSE-*"]
-# Still sheaf's crate, copied: its names and paths say "sheaf" (README,
-# Status). Drop this once the API is generic.
+include = ["/src", "/README.md", "/CHANGELOG.md", "/LICENSE-*"]
+# Until the maintainers have reviewed the new API and Windows has run in CI.
 publish = false
 
+[features]
+# `Json<T>`: any serde type as a payload.
+serde = ["dep:serde", "dep:serde_json"]
+
 [dependencies]
-futures = "0.3"
-log = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+log = "0.4.17"
+serde = { version = "1.0.100", optional = true }
+serde_json = { version = "1.0.40", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "0.2.170"
 
 [target.'cfg(windows)'.dependencies]
-uds_windows = "1.2"
-windows = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
+serde = { version = "1", features = ["derive"] }
 tempfile = "3"
+
+[target.'cfg(any(unix, windows))'.dev-dependencies]
+tokio = { version = "1.38", features = ["rt", "sync", "macros", "signal"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2.170"
+
+[package.metadata.docs.rs]
+all-features = true

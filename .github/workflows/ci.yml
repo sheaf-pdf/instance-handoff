@@ -23,19 +23,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: x86_64-pc-windows-gnu, x86_64-apple-darwin, x86_64-unknown-freebsd, x86_64-unknown-netbsd, x86_64-unknown-illumos, aarch64-linux-android, wasm32-unknown-unknown, wasm32-wasip1
       - uses: extractions/setup-just@v4
       - name: Check formatting
         run: just fmt
       - name: Clippy
         run: just clippy
-      - name: Test (including doctests)
+      - name: Test (including doctests and cross-process tests)
         run: just test
       - name: Build documentation
         run: just doc
+      - name: Lint the Windows code
+        run: just windows
+      # The other Unixes the crate supports, and targets where it compiles
+      # but can't own (Reason::Unsupported).
+      - name: Lint other platforms
+        run: just targets
 
-  # Each platform has its own code: the runtime folder, the peer check on
-  # macOS (getpeereid), AF_UNIX through uds_windows and the foreground
-  # handoff on Windows.
+  # Each platform has its own code: the runtime folder, the peer checks,
+  # and on Windows the named-pipe transport, its access checks and the
+  # foreground handoff.
   platforms:
     name: Checks on ${{ matrix.os }}
     strategy:
@@ -64,7 +71,7 @@ jobs:
         with:
           persist-credentials: false
       # Keep in step with rust-version in Cargo.toml, which `just msrv` reads.
-      - uses: dtolnay/rust-toolchain@1.89
+      - uses: dtolnay/rust-toolchain@1.85
       - uses: extractions/setup-just@v4
       - name: Test
         run: just msrv

@@ -1,610 +1,395 @@
-//! One sheaf process per user on each machine.
+//! Funnel every launch of a program into one process per user.
 //!
-//! The process holding `instance.lock` in the runtime folder is the
-//! *owner*. It opens every window and is the only process that writes
-//! sheaf's state. A later launch connects to the owner's socket beside the
-//! lock, hands over the files it was given, and exits. The OS releases the
-//! lock when the owner exits, crash included, so a lock is never stale.
+//! The first launch takes a lock in a private, per-user runtime folder and
+//! becomes the **owner**: the one process that holds the program's state.
+//! Every later launch connects to the owner, hands over a payload (often its
+//! [`Args`]) and exits. The OS releases the lock when the owner exits, crash
+//! included, so a lock is never stale.
 //!
-//! The runtime folder is local and per user ([`default_dir`]). It is never
-//! the config folder, which on Windows roams and may sit on a network share:
-//! sockets don't work there, and a lock there would span machines.
+//! ```no_run
+//! use instance_handoff::{AppId, Args, Builder, Request, Started};
 //!
-//! Design and edge cases: `todos/m9.md`, slice 1.
+//! const APP: AppId = AppId::new("org.example.Player");
+//!
+//! // Hand over only what the owner needs: here, the files. A flag is not a
+//! // path, and `Request::resolve` would make one of it.
+//! let files: Args = Args::from_env()
+//!     .into_iter()
+//!     .filter(|arg| !arg.to_string_lossy().starts_with('-'))
+//!     .collect();
+//! // Decide first, before any window, event loop or runtime exists.
+//! let claim = match Builder::new(APP).start(&files) {
+//!     Started::Owner(claim) => claim,
+//!     Started::HandedOff(_) => return, // the owner has them; exit
+//!     Started::Alone(reason) => panic!("can't run as the only instance: {reason}"),
+//! };
+//! let (tx, rx) = std::sync::mpsc::channel();
+//! let owner = claim.serve(move |request| tx.send(request).is_ok());
+//! # fn play(_: &std::path::Path) {}
+//! // This launch's own files first (they never go through the handler),
+//! // then every later launch's.
+//! for request in std::iter::once(Request::local(files)).chain(rx) {
+//!     for file in request.payload() {
+//!         if let Some(file) = request.resolve(file) {
+//!             play(&file);
+//!         }
+//!     }
+//! }
+//! # drop(owner);
+//! ```
+//!
+//! # Guarantees
+//!
+//! - At most one process holds the lock for an app id and runtime folder
+//!   at a time, and only it gets [`Started::Owner`]. A process that gets
+//!   [`Started::Alone`] must not write the state the owner owns. If the
+//!   runtime folder is deleted under a running owner and another process
+//!   becomes the owner before this one re-creates its lock, this one is told
+//!   ([`End::LostLock`]) within a minute.
+//! - Each launch ends one of three ways, whatever the timing (stopped
+//!   processes, slow handlers, expired timeouts):
+//!   - it hands off ([`Started::HandedOff`]): an owner's handler takes its
+//!     request at most once, and has taken it when
+//!     [`OwnerInfo::confirmed`];
+//!   - it runs alone ([`Started::Alone`]): no owner takes its request;
+//!   - it becomes the owner.
+//!
+//!   "Takes" means the handler answered [`Answer::Take`]: a handler that
+//!   answers busy may see the same request again when the launch retries.
+//!   The one exception is an owner that dies mid-handoff, after its handler
+//!   may have taken a request but before it could say so. The launch then
+//!   takes the lock itself or hands the request to the next owner, so work
+//!   the dead owner had started may be done again.
+//! - Only processes of the same user at the same privilege level hand off
+//!   to each other, so a request never runs with more or fewer rights than
+//!   its launch had; see [Privileges](#privileges). On Unix both ends check
+//!   the other's user id. On Windows the owner checks the launch's token,
+//!   and the launch checks that the pipe is its own user's, at its own
+//!   integrity level.
+//! - [`Builder::start`], [`Builder::hand_off`] and [`Builder::probe`] never
+//!   panic, whatever the [timeout](Builder::timeout). Every failure is a
+//!   [`Reason`], and failures that waiting can't fix return at once.
+//!
+//! # Threads, blocking and fork
+//!
+//! - `start`, `hand_off` and `probe` block for at most the
+//!   [timeout](Builder::timeout) plus the greater of the timeout and one
+//!   second, and usually for a few milliseconds. Call
+//!   them first thing in `main`, before an event loop, a display connection
+//!   or an async runtime exists, or inside `spawn_blocking`. Serve the
+//!   [`Claim`] soon after: launches wait for it, and run alone if it takes
+//!   longer than their timeout.
+//! - `start` creates no thread. A [`Claim`] is a held lock and a listening
+//!   socket, nothing more; [`Claim::serve`] and [`Claim::decline_all`] start
+//!   the crate's one thread, named after the app id.
+//! - The handler given to [`Claim::serve`] runs on that thread, one call at
+//!   a time, and is dropped there. It must not block: send the [`Request`]
+//!   to a channel or an event-loop proxy and return. Use a send that can't
+//!   wait (`send` on an unbounded channel, `try_send` on a bounded one); a
+//!   send that blocks on a full channel stalls every launch.
+//! - Nothing in this crate waits for the handler. [`Owner::stop`],
+//!   [`Owner::release`] and dropping an `Owner` return at once, on any
+//!   thread, the handler's own included.
+//! - On Unix, daemonize by forking after `start` and before `serve`: the
+//!   child serves the `Claim`, and the parent leaves with
+//!   [`std::process::exit`] so that its copy of the `Claim` is never dropped.
+//!   The parent learns the outcome from `start` itself. Never fork after
+//!   `serve`: the crate's thread doesn't survive `fork`. (macOS forbids
+//!   `fork` without `exec` once Core Foundation is running: fork before
+//!   anything touches it.)
+//!
+//! # Quitting
+//!
+//! 1. Call [`Owner::stop`] once the quit is certain, after any prompt that
+//!    can still cancel it: stop can't be undone. Launches from then on are
+//!    told the owner is busy and keep trying the lock, so none hands work to
+//!    a process on its way out. The handler is dropped as soon as a call in
+//!    progress returns, even if no launch ever arrives again, which closes
+//!    your channel.
+//! 2. Drain the channel until it closes, if you can: each request in it was
+//!    answered "taken", and its launch has exited. Where requests go through
+//!    an event-loop proxy or a channel that has other senders, the callback
+//!    given to [`Claim::on_end`] marks the same moment.
+//! 3. Write your state while still holding the lock, unless the owner ended
+//!    with [`End::LostLock`].
+//! 4. Exit. The lock goes with the process.
+//!
+//! Dropping an [`Owner`] stops serving but **keeps the lock until the
+//! process exits**, so a value dropped by mistake (`let _ = …`, an `if let`
+//! or `matches!` on the result of `start`) can never let a second owner
+//! start beside this one. Dropping a [`Claim`] that was never served keeps
+//! the lock too, turns later launches away at once as
+//! [`Claim::decline_all`] does, and logs a warning. [`Owner::release`] gives
+//! the lock up while the process runs on, for tests and services that
+//! restart in place. `stop` stays necessary where destructors don't run:
+//! `process::exit`, GPUI's and AppKit's `terminate:` on macOS.
+//!
+//! # Where the lock lives
+//!
+//! In a local, per-user folder that every launch of the same user finds.
+//! Each launch has exactly one right folder and never falls back to
+//! another, because a fallback is how two launches end up with two owners:
+//!
+//! - Linux in a Flatpak sandbox: `$XDG_RUNTIME_DIR/app/$FLATPAK_ID/<id>`;
+//!   in a snap: `$XDG_RUNTIME_DIR/<id>`.
+//! - Linux with systemd: `/run/user/<uid>/<id>`, which exists while the
+//!   user has a session (or lingers). Without it, launches run alone with
+//!   [`Reason::NoSession`]; see "Daemons, services and cron".
+//! - Linux without systemd, and the BSDs and illumos: `/tmp/<id>-<uid>`,
+//!   created private. If another user created it first, launches run alone
+//!   with [`Reason::RuntimeDir`]. (CI checks FreeBSD, NetBSD and illumos;
+//!   OpenBSD and DragonFly share their code but aren't checked.)
+//! - macOS: `<id>` in the per-user temporary folder
+//!   (`confstr(_CS_DARWIN_USER_TEMP_DIR)`, not `$TMPDIR`), the same for GUI
+//!   apps, agents, ssh and cron.
+//! - Windows: `<id>\run` in the Local AppData known folder, and
+//!   `<id>\run-high` for a process run as administrator; see
+//!   [Privileges](#privileges).
+//! - Android: `$TMPDIR/<id>`.
+//! - Anywhere else: nothing; launches run alone with
+//!   [`Reason::Unsupported`].
+//!
+//! [`Builder::scope`] adds a subfolder (one owner per session, per profile,
+//! per container), and [`Builder::dir`] replaces the folder. It is never a
+//! config folder: on Windows that roams and may be a network share, where a
+//! lock would span machines. The owner touches its files every hour, so
+//! cleaners that go by age leave them alone, and checks every minute that
+//! its lock is still in place, re-creating it when something deleted it.
+//!
+//! # Privileges
+//!
+//! A request runs with the rights of the launch that made it, never more
+//! and never fewer. Handed to a more privileged owner, it would have that
+//! owner act for a process that isn't allowed to; handed to a less
+//! privileged one, it would run without the rights the user started it
+//! with. So a launch hands off only to an owner of its own user at its own
+//! privilege level, and each level has an owner of its own:
+//!
+//! - Unix: the level is the effective user. Root (`sudo`, `su`, `doas`,
+//!   `pkexec`) is another user, with its own folder and owner, and so is the
+//!   user a setuid program runs as. On Linux with systemd, root has
+//!   `/run/user/0` only while it is logged in somewhere (a console, SSH):
+//!   root's launches then meet one owner, like any user's, and launches
+//!   under `sudo` meet that owner too. Otherwise launches under `sudo` run
+//!   alone with [`Reason::NoSession`].
+//! - Windows: the level is the user and the integrity level. A launch run
+//!   as administrator (high) uses `<id>\run-high` and an owner of its own,
+//!   and never reaches the normal (medium) owner; nor does a normal launch
+//!   reach an elevated one. Each level's folder is labelled at its level,
+//!   so lower levels can't read it or take its lock. Below medium (low
+//!   integrity, AppContainer), launches can't make or open their folder and
+//!   run alone with [`Reason::RuntimeDir`].
+//!
+//! Two limits:
+//!
+//! - Owners at two levels are two owners. If both read and write the same
+//!   files, keep the state apart per level, or refuse to run elevated. An
+//!   elevated and a normal process on Windows share the profile, and root
+//!   under `sudo -E` (or wherever `HOME` is kept) writes into the user's
+//!   home.
+//! - Within one Unix user, finer privileges aren't compared: supplementary
+//!   groups (`newgrp`), capabilities and LSM confinement. A sandbox that
+//!   must keep its processes from the owner hides the runtime folder from
+//!   them, as Flatpak and snap do; each then has its own owner.
+//!
+//! # Daemons, services and cron
+//!
+//! A launch on Linux finds the owner only if both see the same folder. For
+//! a long-running owner that starts outside a login session:
+//!
+//! 1. Prefer a systemd user unit plus `loginctl enable-linger`, which keeps
+//!    `/run/user/<uid>` for good, so interactive launches and the service
+//!    meet there. An `@reboot` cron job gets [`Reason::NoSession`] instead.
+//! 2. For a system service with `User=`, add `PAMName=` with a PAM stack
+//!    that runs `pam_systemd`, or enable linger for that user.
+//! 3. [`Builder::dir`] only when every launch of the app passes the same
+//!    folder, or for a private instance that interactive launches must
+//!    never reach. With systemd's `RuntimeDirectory=`, set
+//!    `RuntimeDirectoryMode=0700`: the folder must be private.
+//!
+//! # Containers and sandboxes
+//!
+//! - Flatpak: instances of one `FLATPAK_ID` meet each other. Each has its
+//!   own PID namespace, so [`OwnerInfo::pid`] and [`Request::launcher_pid`]
+//!   are usually `None`.
+//! - Containers: one that sees the host's `/run/systemd/system` and
+//!   `/run/user/<uid>` (toolbox does) meets the host's owner, which is
+//!   usually what you want, since it shares `$HOME`. But paths outside the
+//!   shared mounts may name other files there. A container without systemd
+//!   uses its own `/tmp`, and so runs its own owner: if it must meet the
+//!   host's, pass the bind-mounted folder to [`Builder::dir`] in both. Use
+//!   [`Builder::scope`] with the container's name for one owner per
+//!   container.
+//! - Windows: mapped drives and `SUBST` letters belong to one logon
+//!   session, and every logon session of a user at one integrity level (a
+//!   second RDP session, an OpenSSH login, a scheduled task) reaches the
+//!   same owner. Hand off canonical paths when that matters.
+//!
+//! # Raising a window
+//!
+//! A launch the user just started may bring a window forward; the owner, in
+//! the background, usually may not. On Windows the launch calls
+//! `AllowSetForegroundWindow` for the owner's process before handing off. On
+//! Wayland and X11 the launch's `XDG_ACTIVATION_TOKEN` and
+//! `DESKTOP_STARTUP_ID` travel with its request: see
+//! [`Request::activation`]. macOS has no such token.
+//!
+//! # The contract between builds
+//!
+//! Two builds of one app may use different releases of this crate, so what
+//! they share is fixed, and only a major release changes it:
+//!
+//! - the folder rule above, and the scope subfolder's name. On Windows the
+//!   folder for an integrity level other than medium is `run-low`,
+//!   `run-high`, `run-system`, or else `run-` and the level's RID in
+//!   lowercase hex;
+//! - the lock: `flock(LOCK_EX | LOCK_NB)` on `instance.lock` on Unix, an
+//!   exclusive `LockFileEx` on its first byte on Windows. Both are held per
+//!   open file,
+//!   inherited across `fork`, and released when the last copy closes;
+//! - the address. On Unix, `instance.sock` beside the lock. When that path
+//!   is too long for a socket address, Linux reaches it through
+//!   `/proc/self/fd`; other Unixes use `<base>/<hash>.sock`, where the base
+//!   is the per-user temporary folder on macOS and `/tmp/ih-<uid>`
+//!   elsewhere, and the hash is 16 hex digits of the FNV-1a 64 hash of the
+//!   folder's device and inode (each a little-endian u64). On Windows, a
+//!   named pipe `\\.\pipe\instance-handoff.<id>.<secret>`, where the
+//!   secret is 32 random lowercase hex digits, published as
+//!   `<id> <secret>` and a newline in `instance.pipe` beside the lock;
+//! - the exchange. The owner sends HELLO (its app id, the protocol versions
+//!   it speaks, a random nonce, its payload version and its state). The
+//!   launch checks it and sends REQUEST. The owner answers READY. The
+//!   launch, if still inside its timeout, sends COMMIT, and only then does
+//!   the owner call the handler and send REPLY. Every message is
+//!   `"IHND" | kind u8 | length u32 LE | records`, and a record is
+//!   `tag u8 | length u32 LE | bytes`. Peers skip records they don't know,
+//!   so later releases add to the exchange without breaking it, unless the
+//!   tag's high bit is set: such a record is critical, and a peer that
+//!   doesn't know it refuses the message.
+//!
+//! # Not covered
+//!
+//! Replies beyond "taken" (exit codes, output, `--wait`), sharing state
+//! between processes, taking over from a hung owner, and general IPC. On
+//! macOS, Finder and Dock opens reach a running app as Apple Events through
+//! its toolkit, not as new launches; feed them to the same channel with
+//! [`Request::local`]. On Linux, D-Bus activation reaches the app the same
+//! way, if it registers for it.
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+#![warn(missing_docs, missing_debug_implementations, unsafe_op_in_unsafe_fn)]
+// Where nothing can own, the machinery for owning goes unused.
+#![cfg_attr(
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "illumos",
+        windows
+    )),
+    allow(dead_code)
+)]
 
-use futures::channel::mpsc::UnboundedSender;
-use serde::{Deserialize, Serialize};
+mod builder;
+mod id;
+mod launch;
+mod naming;
+mod outcome;
+mod owner;
+mod payload;
+mod request;
+mod server;
+mod wire;
 
-#[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
-#[cfg(windows)]
-use uds_windows::{UnixListener, UnixStream};
+#[cfg_attr(
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "illumos"
+    ),
+    path = "sys/unix.rs"
+)]
+#[cfg_attr(windows, path = "sys/windows.rs")]
+#[cfg_attr(
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "illumos",
+        windows
+    )),
+    path = "sys/unsupported.rs"
+)]
+mod sys;
 
-/// Bumped when a request or reply changes incompatibly.
-pub const PROTOCOL: u32 = 1;
-const LOCK: &str = "instance.lock";
-const SOCKET: &str = "instance.sock";
-/// Room for a socket path: `sun_path` holds 108 bytes on Linux and
-/// Windows, 104 on macOS.
-const MAX_SOCKET_PATH: usize = 100;
-/// The longest request read (thousands of paths).
-const MAX_REQUEST: u64 = 1 << 20;
-/// How long the owner waits for a request once a launch has connected.
-const SERVE_TIMEOUT: Duration = Duration::from_secs(2);
+pub use builder::{Builder, Mode};
+pub use id::{AppId, InvalidAppId};
+pub use outcome::{End, OwnerInfo, Reason, Started};
+pub use owner::{Claim, Owner};
+#[cfg(feature = "serde")]
+pub use payload::Json;
+pub use payload::{Args, BoxError, Payload};
+pub use request::{Activation, Answer, IntoAnswer, Request};
 
-/// What a launch hands to the owner.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Request {
-    pub v: u32,
-    /// Files to open, absolute (the owner's working directory isn't ours).
-    #[serde(default)]
-    pub paths: Vec<PathBuf>,
-    /// The launcher's Wayland activation token, if it was given one. Sent
-    /// for when the owner can use it to raise its window; ignored today.
-    #[serde(default)]
-    pub activation_token: Option<String>,
-}
-
-impl Request {
-    /// A request for `paths`, made absolute against the current directory.
-    pub fn new(paths: impl IntoIterator<Item = PathBuf>) -> Request {
-        Request {
-            v: PROTOCOL,
-            paths: paths
-                .into_iter()
-                .map(|p| std::path::absolute(&p).unwrap_or(p))
-                .collect(),
-            activation_token: std::env::var("XDG_ACTIVATION_TOKEN").ok(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Reply {
-    ok: bool,
-    /// The owner is quitting or can't take requests yet: try the lock
-    /// again rather than giving up.
-    #[serde(default)]
-    retry: bool,
-}
-
-/// How a launch joins the running sheaf.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// Become the owner, or hand our files to it.
-    Join,
-    /// Become the owner if nobody is; otherwise run alone, writing no
-    /// state. For `--new-instance`, scripts, self-tests and debug builds.
-    Separate,
-}
-
-pub enum Started {
-    /// We hold the lock: we own sheaf's state and take other launches'
-    /// files.
-    Owner(Owner),
-    /// The owner took our files; this process should exit.
-    HandedOff,
-    /// Running without the lock, so writing no state. Says why.
-    Standalone(String),
-}
-
-/// Holding the lock. Dropping it stops taking requests; the lock itself
-/// goes when the process ends.
-pub struct Owner {
-    _lock: File,
-    socket: Option<PathBuf>,
-    accepting: Arc<AtomicBool>,
-}
-
-impl Owner {
-    /// Stop taking requests, as the process starts to quit. Launches from
-    /// now on wait for the lock instead of handing files to a process that
-    /// won't open them.
-    pub fn stop(&self) {
-        self.accepting.store(false, Ordering::SeqCst);
-        if let Some(path) = &self.socket {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
-    /// Whether other launches can reach this process.
-    pub fn listening(&self) -> bool {
-        self.socket.is_some()
-    }
-}
-
-impl Drop for Owner {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// The local, per-user runtime folder: `$XDG_RUNTIME_DIR/sheaf` on Linux
-/// (or `/tmp/sheaf-<uid>` without one), `$TMPDIR/sheaf` on macOS,
-/// `%LOCALAPPDATA%\sheaf\run` on Windows.
-pub fn default_dir() -> Option<PathBuf> {
-    let var = |name| std::env::var_os(name).filter(|v| !v.is_empty());
-    #[cfg(windows)]
-    {
-        var("LOCALAPPDATA").map(|d| PathBuf::from(d).join("sheaf").join("run"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Some(
-            var("TMPDIR")
-                .map(|d| PathBuf::from(d).join("sheaf"))
-                .unwrap_or_else(tmp_dir),
-        )
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        Some(
-            var("XDG_RUNTIME_DIR")
-                .map(|d| PathBuf::from(d).join("sheaf"))
-                .unwrap_or_else(tmp_dir),
-        )
-    }
-}
-
-#[cfg(unix)]
-fn tmp_dir() -> PathBuf {
-    PathBuf::from(format!("/tmp/sheaf-{}", euid()))
-}
-
-#[cfg(unix)]
-fn euid() -> u32 {
-    // SAFETY: geteuid has no preconditions and can't fail.
-    unsafe { libc::geteuid() }
-}
-
-/// Take the lock in `dir`, or hand `request` to whoever holds it. A
-/// request that arrives while we're the owner, from a later launch, goes to
-/// `sink`. `wait` bounds how long a launch keeps trying to reach an owner
-/// that holds the lock but doesn't answer (starting up, or quitting).
-pub fn start(
-    dir: &Path,
-    mode: Mode,
-    request: &Request,
-    sink: UnboundedSender<Request>,
-    wait: Duration,
-) -> Started {
-    if let Err(e) = private_dir(dir) {
-        return Started::Standalone(format!("runtime folder {}: {e}", dir.display()));
-    }
-    let socket = socket_path(dir);
-    let deadline = Instant::now() + wait;
-    loop {
-        match try_own(dir, &socket, &sink) {
-            Ok(Some(owner)) => return Started::Owner(owner),
-            Ok(None) => {}
-            Err(e) => {
-                return Started::Standalone(format!("{}: {e}", dir.join(LOCK).display()));
-            }
-        }
-        if mode == Mode::Separate {
-            return Started::Standalone("another sheaf is running".into());
-        }
-        let left = deadline.saturating_duration_since(Instant::now());
-        match hand_off(&socket, request, left.max(Duration::from_millis(200))) {
-            Ok(Handoff::Taken) => return Started::HandedOff,
-            Ok(Handoff::Refused) => {
-                return Started::Standalone(
-                    "the running sheaf is a different version and refused the files".into(),
-                );
-            }
-            // Quitting, or not listening yet.
-            Ok(Handoff::Retry) | Err(_) => {}
-        }
-        if Instant::now() >= deadline {
-            return Started::Standalone("a sheaf is running but didn't answer".into());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// `Ok(None)` when another process holds the lock.
-fn try_own(
-    dir: &Path,
-    socket: &Path,
-    sink: &UnboundedSender<Request>,
-) -> io::Result<Option<Owner>> {
-    let mut lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join(LOCK))?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => return Err(e),
-    }
-    // Which process owns it, for anyone looking.
-    let _ = lock.set_len(0);
-    let _ = writeln!(lock, "{}", std::process::id());
-    let accepting = Arc::new(AtomicBool::new(true));
-    let socket = match listen(socket, sink.clone(), accepting.clone()) {
-        Ok(()) => Some(socket.to_path_buf()),
-        Err(e) => {
-            // Still the owner (the only state writer); launches just can't
-            // reach us, and run alone.
-            log::warn!("sheaf instance socket {}: {e}", socket.display());
-            None
-        }
-    };
-    Ok(Some(Owner {
-        _lock: lock,
-        socket,
-        accepting,
-    }))
-}
-
-fn listen(
-    path: &Path,
-    sink: UnboundedSender<Request>,
-    accepting: Arc<AtomicBool>,
-) -> io::Result<()> {
-    // We hold the lock, so a socket file here is a dead owner's.
-    let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path)?;
-    std::thread::Builder::new()
-        .name("sheaf-instance".into())
-        .spawn(move || {
-            for conn in listener.incoming() {
-                match conn {
-                    Ok(stream) => {
-                        if let Err(e) = serve(stream, &sink, &accepting) {
-                            log::warn!("sheaf instance: {e}");
-                        }
-                    }
-                    Err(e) => log::warn!("sheaf instance: accept: {e}"),
-                }
-            }
-        })?;
-    Ok(())
-}
-
-/// Answer one launch. The reply goes as soon as the request is queued, so
-/// a busy window never keeps the launcher waiting.
-fn serve(
-    mut stream: UnixStream,
-    sink: &UnboundedSender<Request>,
-    accepting: &AtomicBool,
-) -> io::Result<()> {
-    #[cfg(unix)]
-    check_peer(&stream)?;
-    stream.set_read_timeout(Some(SERVE_TIMEOUT))?;
-    stream.set_write_timeout(Some(SERVE_TIMEOUT))?;
-    let mut line = String::new();
-    BufReader::new((&stream).take(MAX_REQUEST)).read_line(&mut line)?;
-    let reply = match serde_json::from_str::<Request>(line.trim()) {
-        Ok(req) if req.v != PROTOCOL => Reply {
-            ok: false,
-            retry: false,
-        },
-        Ok(_) if !accepting.load(Ordering::SeqCst) => Reply {
-            ok: false,
-            retry: true,
-        },
-        Ok(req) => match sink.unbounded_send(req) {
-            Ok(()) => Reply {
-                ok: true,
-                retry: false,
-            },
-            // The app stopped listening: it's on its way out.
-            Err(_) => Reply {
-                ok: false,
-                retry: true,
-            },
-        },
-        Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-    };
-    let mut out = serde_json::to_vec(&reply)?;
-    out.push(b'\n');
-    stream.write_all(&out)
-}
-
-enum Handoff {
-    Taken,
-    Retry,
-    Refused,
-}
-
-fn hand_off(socket: &Path, request: &Request, timeout: Duration) -> io::Result<Handoff> {
-    let mut stream = UnixStream::connect(socket)?;
-    #[cfg(unix)]
-    check_peer(&stream)?;
-    // Let the owner bring its window forward: we were just launched by the
-    // user, so we may, and it otherwise may not.
-    #[cfg(windows)]
-    allow_foreground();
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let mut out = serde_json::to_vec(request)?;
-    out.push(b'\n');
-    stream.write_all(&out)?;
-    let mut line = String::new();
-    BufReader::new((&stream).take(4096)).read_line(&mut line)?;
-    let reply: Reply = serde_json::from_str(line.trim())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    Ok(match reply {
-        Reply { ok: true, .. } => Handoff::Taken,
-        Reply { retry: true, .. } => Handoff::Retry,
-        _ => Handoff::Refused,
-    })
-}
-
-/// `dir/instance.sock`, or a hashed name in the temp folder when that's
-/// too long for a socket address.
-fn socket_path(dir: &Path) -> PathBuf {
-    let path = dir.join(SOCKET);
-    if path.as_os_str().len() <= MAX_SOCKET_PATH {
-        return path;
-    }
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in dir.as_os_str().as_encoded_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    std::env::temp_dir().join(format!("sheaf-{h:016x}.sock"))
-}
-
-/// Create `dir` if needed, and on Unix refuse one that isn't ours alone:
-/// in a shared place like `/tmp`, another user could have made it first
-/// and be waiting with a socket of their own.
-fn private_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-        let meta = std::fs::symlink_metadata(dir)?;
-        let refuse = |why: &str| {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                why.to_string(),
-            ))
-        };
-        if !meta.is_dir() {
-            return refuse("not a folder");
-        }
-        if meta.uid() != euid() {
-            return refuse("owned by another user");
-        }
-        if meta.mode() & 0o022 != 0 {
-            return refuse("other users can write to it");
-        }
-        Ok(())
-    }
-    #[cfg(windows)]
-    {
-        // Under the user's own profile, which only they can reach.
-        std::fs::create_dir_all(dir)
-    }
-}
-
-/// Refuse a peer that isn't this user: the runtime folder should make that
-/// impossible, but the socket may live in the shared temp folder.
-#[cfg(unix)]
-fn check_peer(stream: &UnixStream) -> io::Result<()> {
-    let uid = peer_uid(stream)?;
-    if uid != euid() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("socket peer is user {uid}"),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: ucred is plain data; getsockopt writes at most `len` bytes.
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let r = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    if r != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(cred.uid)
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    use std::os::fd::AsRawFd;
-    let (mut uid, mut gid) = (0, 0);
-    // SAFETY: both out-pointers are valid for writes.
-    let r = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    if r != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(uid)
-}
-
-#[cfg(windows)]
-fn allow_foreground() {
-    use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
-    // SAFETY: no preconditions; failure only means the window may not come
-    // forward.
-    let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
-}
-
-#[cfg(all(test, unix))]
-mod tests {
+#[cfg(test)]
+mod bounds {
     use super::*;
-    use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 
-    const WAIT: Duration = Duration::from_millis(500);
+    fn send_sync<T: Send + Sync + 'static>() {}
+    fn send<T: Send + 'static>() {}
 
-    fn launch(dir: &Path, mode: Mode, paths: &[&str]) -> (Started, UnboundedReceiver<Request>) {
-        let (tx, rx) = unbounded();
-        let req = Request::new(paths.iter().map(PathBuf::from));
-        (start(dir, mode, &req, tx, WAIT), rx)
+    #[test]
+    fn the_types_an_app_stores_cross_threads() {
+        send_sync::<Owner>();
+        send_sync::<Claim<Args>>();
+        send_sync::<Builder>();
+        send_sync::<Reason>();
+        send_sync::<Request<Args>>();
+        send_sync::<OwnerInfo>();
+        send_sync::<End>();
+        send::<Started<Args>>();
     }
 
-    fn owner(s: Started) -> Owner {
-        match s {
-            Started::Owner(o) => o,
-            Started::HandedOff => panic!("handed off"),
-            Started::Standalone(why) => panic!("standalone: {why}"),
+    #[test]
+    fn handlers_are_one_liners() {
+        // The element type is inferred from the bound, and `bool` converts.
+        fn takes<T: Payload>(claim: Claim<T>) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _o = claim.serve(move |r| tx.send(r).is_ok());
+            drop(rx);
         }
-    }
-
-    #[test]
-    fn a_second_launch_hands_its_files_to_the_first() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("run");
-        let (first, mut rx) = launch(&dir, Mode::Join, &["one.pdf"]);
-        let first = owner(first);
-        assert!(first.listening());
-        let (second, _) = launch(&dir, Mode::Join, &["two.pdf", "/abs/three.pdf"]);
-        assert!(matches!(second, Started::HandedOff));
-        let got = rx.try_recv().unwrap();
-        let cwd = std::env::current_dir().unwrap();
-        assert_eq!(
-            got.paths,
-            vec![cwd.join("two.pdf"), PathBuf::from("/abs/three.pdf")]
-        );
-        assert_eq!(got.v, PROTOCOL);
-        // The owner's own request isn't queued.
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn separate_launches_run_alone_beside_an_owner() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("run");
-        let _first = owner(launch(&dir, Mode::Join, &[]).0);
-        match launch(&dir, Mode::Separate, &["x.pdf"]).0 {
-            Started::Standalone(why) => assert!(why.contains("another sheaf"), "{why}"),
-            _ => panic!("expected standalone"),
+        fn bounded(claim: Claim<Args>) {
+            let (tx, _rx) = std::sync::mpsc::sync_channel(16);
+            let _o = claim.serve(move |r| tx.try_send(r).is_ok());
         }
-    }
-
-    #[test]
-    fn a_separate_launch_owns_when_nobody_does() {
-        let tmp = tempfile::tempdir().unwrap();
-        let first = owner(launch(&tmp.path().join("run"), Mode::Separate, &[]).0);
-        assert!(first.listening());
-    }
-
-    #[test]
-    fn the_lock_frees_when_the_owner_goes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("run");
-        let first = owner(launch(&dir, Mode::Join, &[]).0);
-        drop(first);
-        // Its socket file is gone too, but a stale one wouldn't matter.
-        let _second = owner(launch(&dir, Mode::Join, &[]).0);
-    }
-
-    #[test]
-    fn an_owner_that_stopped_makes_launches_wait_then_run_alone() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("run");
-        let first = owner(launch(&dir, Mode::Join, &[]).0);
-        first.stop();
-        let t = Instant::now();
-        match launch(&dir, Mode::Join, &["x.pdf"]).0 {
-            Started::Standalone(why) => assert!(why.contains("didn't answer"), "{why}"),
-            _ => panic!("expected standalone"),
+        fn refusing(claim: Claim<Args>) {
+            let _o = claim.serve(|r| {
+                if r.payload().iter().any(|a| a == "--unknown") {
+                    Answer::Decline
+                } else {
+                    Answer::Take
+                }
+            });
         }
-        assert!(t.elapsed() >= WAIT);
-    }
-
-    #[test]
-    fn requests_from_a_quitting_owner_say_retry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("run");
-        let (first, rx) = launch(&dir, Mode::Join, &[]);
-        let _first = owner(first);
-        // The app has gone (its receiver dropped): retry, not refuse.
-        drop(rx);
-        let r = hand_off(&socket_path(&dir), &Request::new([]), WAIT).unwrap();
-        assert!(matches!(r, Handoff::Retry));
-    }
-
-    #[test]
-    fn another_protocol_version_is_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("run");
-        let (first, mut rx) = launch(&dir, Mode::Join, &[]);
-        let _first = owner(first);
-        let req = Request {
-            v: PROTOCOL + 1,
-            ..Request::default()
-        };
-        let r = hand_off(&socket_path(&dir), &req, WAIT).unwrap();
-        assert!(matches!(r, Handoff::Refused));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn a_folder_others_can_write_is_refused() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("run");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-        match launch(&dir, Mode::Join, &[]).0 {
-            Started::Standalone(why) => assert!(why.contains("other users"), "{why}"),
-            _ => panic!("expected standalone"),
+        fn with_end(claim: Claim<Args>) {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let ended = tx.clone();
+            let _o = claim
+                .on_end(move |end| drop(ended.send(Err(end))))
+                .serve(move |r| tx.send(Ok(r)).is_ok());
         }
-    }
-
-    #[test]
-    fn a_symlinked_folder_is_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let real = tmp.path().join("real");
-        std::fs::create_dir(&real).unwrap();
-        let link = tmp.path().join("run");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(matches!(
-            launch(&link, Mode::Join, &[]).0,
-            Started::Standalone(_)
-        ));
-    }
-
-    #[test]
-    fn a_long_folder_puts_the_socket_in_temp() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("x".repeat(120)).join("run");
-        let socket = socket_path(&dir);
-        assert!(socket.starts_with(std::env::temp_dir()));
-        assert!(socket.as_os_str().len() <= MAX_SOCKET_PATH);
-        let (first, mut rx) = launch(&dir, Mode::Join, &[]);
-        let _first = owner(first);
-        assert!(matches!(
-            launch(&dir, Mode::Join, &["a.pdf"]).0,
-            Started::HandedOff
-        ));
-        assert!(rx.try_recv().is_ok());
-    }
-
-    #[test]
-    fn the_lock_file_names_the_owner() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("run");
-        let _first = owner(launch(&dir, Mode::Join, &[]).0);
-        let text = std::fs::read_to_string(dir.join(LOCK)).unwrap();
-        assert_eq!(text.trim(), std::process::id().to_string());
+        let _ = (takes::<Args>, bounded, refusing, with_end);
     }
 }

@@ -1,0 +1,556 @@
+//! The handoff protocol's bytes. Frozen at 0.1, and only ever extended with
+//! records old peers skip; see the crate docs for the exchange itself.
+//!
+//! Every message is `"IHND" | kind u8 | body length u32 LE | body`, and a
+//! body is a sequence of records, `tag u8 | length u32 LE | bytes`. A peer
+//! skips a record whose tag it doesn't know, unless the tag's high bit is
+//! set: such a record is critical, and a peer that doesn't know it refuses
+//! the message. A tag twice in one body is malformed.
+
+use std::ffi::{OsStr, OsString};
+
+use crate::BoxError;
+
+pub(crate) const MAGIC: [u8; 4] = *b"IHND";
+pub(crate) const HEADER: usize = 9;
+/// The wire versions this build speaks.
+pub(crate) const WIRE_MIN: u16 = 1;
+pub(crate) const WIRE_MAX: u16 = 1;
+/// The largest HELLO, READY, COMMIT or REPLY body.
+pub(crate) const SMALL: usize = 4096;
+/// The largest REQUEST an owner takes.
+pub(crate) const MAX_REQUEST: u32 = 4 << 20;
+/// Activation values longer than this are left out, or dropped on receipt.
+pub(crate) const MAX_TOKEN: usize = 1024;
+
+pub(crate) const HELLO: u8 = 1;
+pub(crate) const REQUEST: u8 = 2;
+pub(crate) const READY: u8 = 3;
+pub(crate) const COMMIT: u8 = 4;
+pub(crate) const REPLY: u8 = 5;
+
+const CRITICAL: u8 = 0x80;
+
+/// HELLO record tags.
+mod hello {
+    pub const WIRE: u8 = 1;
+    pub const APP: u8 = 2;
+    pub const NONCE: u8 = 3;
+    pub const PAYLOAD_VERSION: u8 = 4;
+    pub const MAX_REQUEST: u8 = 5;
+    pub const STATE: u8 = 6;
+}
+
+/// The owner's state, in HELLO.
+pub(crate) mod state {
+    pub const TAKING: u8 = 0;
+    pub const BUSY: u8 = 1;
+    pub const DECLINING: u8 = 2;
+}
+
+/// REQUEST record tags.
+mod request {
+    pub const WIRE: u8 = 1;
+    pub const PAYLOAD_VERSION: u8 = 2;
+    pub const CWD: u8 = 3;
+    pub const XDG_TOKEN: u8 = 4;
+    pub const STARTUP_ID: u8 = 5;
+    pub const PAYLOAD: u8 = 6;
+}
+
+/// REPLY record tags.
+mod reply {
+    pub const DELIVERED: u8 = 1;
+    pub const STATUS: u8 = 2;
+    pub const REFUSAL: u8 = 3;
+    pub const PAYLOAD_VERSION: u8 = 4;
+}
+
+/// REPLY statuses. A launch decides on `delivered` first; a status it
+/// doesn't know counts as busy.
+pub(crate) mod status {
+    pub const TAKEN: u8 = 0;
+    pub const BUSY: u8 = 1;
+    pub const DECLINED: u8 = 2;
+    pub const REFUSED: u8 = 3;
+    /// The owner stopped waiting for COMMIT.
+    pub const GAVE_UP: u8 = 4;
+}
+
+/// Why an owner refused a REQUEST.
+pub(crate) mod refusal {
+    pub const WIRE: u8 = 1;
+    pub const APP: u8 = 2;
+    pub const PAYLOAD_VERSION: u8 = 3;
+    pub const UNDECODABLE: u8 = 4;
+    pub const TOO_LARGE: u8 = 5;
+    pub const MALFORMED: u8 = 6;
+    pub const UNSUPPORTED: u8 = 7;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Error {
+    /// Not this protocol at all.
+    BadMagic,
+    Malformed,
+    TooLarge {
+        size: usize,
+        limit: usize,
+    },
+    /// A critical record this build doesn't know.
+    Unsupported,
+}
+
+/// Builds one message.
+pub(crate) struct Writer {
+    buf: Vec<u8>,
+}
+
+impl Writer {
+    pub(crate) fn new(kind: u8) -> Writer {
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(&MAGIC);
+        buf.push(kind);
+        buf.extend_from_slice(&[0; 4]);
+        Writer { buf }
+    }
+
+    pub(crate) fn bytes(mut self, tag: u8, bytes: &[u8]) -> Writer {
+        self.buf.push(tag);
+        self.buf
+            .extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(bytes);
+        self
+    }
+
+    pub(crate) fn finish(mut self) -> Vec<u8> {
+        let len = (self.buf.len() - HEADER) as u32;
+        self.buf[5..HEADER].copy_from_slice(&len.to_le_bytes());
+        self.buf
+    }
+}
+
+/// The kind and body length of the message at the start of `buf`, once its
+/// header has arrived. A body over `limit` is refused before it is read.
+pub(crate) fn header(buf: &[u8], limit: usize) -> Result<Option<(u8, usize)>, Error> {
+    if buf.len() < HEADER {
+        // Refuse a stranger as soon as its first bytes show it.
+        let n = buf.len().min(MAGIC.len());
+        if buf[..n] != MAGIC[..n] {
+            return Err(Error::BadMagic);
+        }
+        return Ok(None);
+    }
+    if buf[..4] != MAGIC {
+        return Err(Error::BadMagic);
+    }
+    let len = u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize;
+    if len > limit {
+        return Err(Error::TooLarge { size: len, limit });
+    }
+    Ok(Some((buf[4], len)))
+}
+
+/// A whole message: its kind, its body, and its length in the buffer.
+pub(crate) type Frame<'a> = (u8, &'a [u8], usize);
+
+/// The whole message at the start of `buf`, if it has all arrived.
+pub(crate) fn split(buf: &[u8], limit: usize) -> Result<Option<Frame<'_>>, Error> {
+    match header(buf, limit)? {
+        Some((kind, len)) if buf.len() >= HEADER + len => {
+            Ok(Some((kind, &buf[HEADER..HEADER + len], HEADER + len)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// A body's records, those with `known` tags kept.
+struct Records<'a> {
+    items: Vec<(u8, &'a [u8])>,
+}
+
+impl<'a> Records<'a> {
+    fn parse(mut body: &'a [u8], known: &[u8]) -> Result<Records<'a>, Error> {
+        let mut items: Vec<(u8, &[u8])> = Vec::new();
+        let mut seen = [false; 256];
+        while !body.is_empty() {
+            if body.len() < 5 {
+                return Err(Error::Malformed);
+            }
+            let tag = body[0];
+            let len = u32::from_le_bytes([body[1], body[2], body[3], body[4]]) as usize;
+            let rest = &body[5..];
+            if rest.len() < len {
+                return Err(Error::Malformed);
+            }
+            if std::mem::replace(&mut seen[usize::from(tag)], true) {
+                return Err(Error::Malformed);
+            }
+            if known.contains(&tag) {
+                items.push((tag, &rest[..len]));
+            } else if tag & CRITICAL != 0 {
+                return Err(Error::Unsupported);
+            }
+            body = &rest[len..];
+        }
+        Ok(Records { items })
+    }
+
+    fn get(&self, tag: u8) -> Option<&'a [u8]> {
+        self.items.iter().find(|(t, _)| *t == tag).map(|(_, b)| *b)
+    }
+
+    fn fixed<const N: usize>(&self, tag: u8) -> Result<Option<[u8; N]>, Error> {
+        match self.get(tag) {
+            None => Ok(None),
+            Some(b) => b.try_into().map(Some).map_err(|_| Error::Malformed),
+        }
+    }
+
+    fn required<const N: usize>(&self, tag: u8) -> Result<[u8; N], Error> {
+        self.fixed(tag)?.ok_or(Error::Malformed)
+    }
+}
+
+/// The owner's greeting, sent as soon as it accepts a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Hello {
+    pub(crate) wire_min: u16,
+    pub(crate) wire_max: u16,
+    pub(crate) app_id: String,
+    /// Random for each owner, so a launch can tell a new owner from the one
+    /// it committed to.
+    pub(crate) nonce: u64,
+    pub(crate) payload_version: u32,
+    pub(crate) max_request: u32,
+    pub(crate) state: u8,
+}
+
+impl Hello {
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut wire = [0; 4];
+        wire[..2].copy_from_slice(&self.wire_min.to_le_bytes());
+        wire[2..].copy_from_slice(&self.wire_max.to_le_bytes());
+        Writer::new(HELLO)
+            .bytes(hello::WIRE, &wire)
+            .bytes(hello::APP, self.app_id.as_bytes())
+            .bytes(hello::NONCE, &self.nonce.to_le_bytes())
+            .bytes(hello::PAYLOAD_VERSION, &self.payload_version.to_le_bytes())
+            .bytes(hello::MAX_REQUEST, &self.max_request.to_le_bytes())
+            .bytes(hello::STATE, &[self.state])
+            .finish()
+    }
+
+    pub(crate) fn decode(body: &[u8]) -> Result<Hello, Error> {
+        use hello::*;
+        let r = Records::parse(
+            body,
+            &[WIRE, APP, NONCE, PAYLOAD_VERSION, MAX_REQUEST, STATE],
+        )?;
+        let wire: [u8; 4] = r.required(WIRE)?;
+        let app_id = std::str::from_utf8(r.get(APP).ok_or(Error::Malformed)?)
+            .map_err(|_| Error::Malformed)?
+            .to_owned();
+        Ok(Hello {
+            wire_min: u16::from_le_bytes([wire[0], wire[1]]),
+            wire_max: u16::from_le_bytes([wire[2], wire[3]]),
+            app_id,
+            nonce: u64::from_le_bytes(r.required(NONCE)?),
+            payload_version: u32::from_le_bytes(r.required(PAYLOAD_VERSION)?),
+            max_request: u32::from_le_bytes(r.required(MAX_REQUEST)?),
+            state: r.fixed::<1>(STATE)?.map_or(state::TAKING, |[s]| s),
+        })
+    }
+}
+
+/// What a launch hands over.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct Request {
+    pub(crate) wire: u16,
+    pub(crate) payload_version: u32,
+    /// The launch's working directory, in [native bytes](os_to_bytes).
+    pub(crate) cwd: Option<Vec<u8>>,
+    pub(crate) xdg_activation_token: Option<String>,
+    pub(crate) startup_id: Option<String>,
+    pub(crate) payload: Vec<u8>,
+}
+
+impl Request {
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new(REQUEST)
+            .bytes(request::WIRE, &self.wire.to_le_bytes())
+            .bytes(
+                request::PAYLOAD_VERSION,
+                &self.payload_version.to_le_bytes(),
+            );
+        if let Some(cwd) = &self.cwd {
+            w = w.bytes(request::CWD, cwd);
+        }
+        for (tag, value) in [
+            (request::XDG_TOKEN, &self.xdg_activation_token),
+            (request::STARTUP_ID, &self.startup_id),
+        ] {
+            if let Some(v) = value.as_deref().filter(|v| v.len() <= MAX_TOKEN) {
+                w = w.bytes(tag, v.as_bytes());
+            }
+        }
+        w.bytes(request::PAYLOAD, &self.payload).finish()
+    }
+
+    pub(crate) fn decode(body: &[u8]) -> Result<Request, Error> {
+        use request::*;
+        let r = Records::parse(
+            body,
+            &[WIRE, PAYLOAD_VERSION, CWD, XDG_TOKEN, STARTUP_ID, PAYLOAD],
+        )?;
+        // Activation values are hints: a bad one is dropped, not refused.
+        let token = |tag| {
+            r.get(tag)
+                .filter(|v| v.len() <= MAX_TOKEN)
+                .and_then(|v| std::str::from_utf8(v).ok())
+                .map(str::to_owned)
+        };
+        Ok(Request {
+            wire: u16::from_le_bytes(r.required(WIRE)?),
+            payload_version: u32::from_le_bytes(r.required(PAYLOAD_VERSION)?),
+            cwd: r.get(CWD).map(<[u8]>::to_vec),
+            xdg_activation_token: token(XDG_TOKEN),
+            startup_id: token(STARTUP_ID),
+            payload: r.get(PAYLOAD).ok_or(Error::Malformed)?.to_vec(),
+        })
+    }
+}
+
+/// An empty READY or COMMIT.
+pub(crate) fn empty(kind: u8) -> Vec<u8> {
+    Writer::new(kind).finish()
+}
+
+/// Checks an empty READY or COMMIT body: records are allowed, and skipped.
+pub(crate) fn check_empty(body: &[u8]) -> Result<(), Error> {
+    Records::parse(body, &[]).map(|_| ())
+}
+
+/// The owner's answer to a REQUEST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Reply {
+    /// Whether the handler took the request.
+    pub(crate) delivered: bool,
+    pub(crate) status: u8,
+    pub(crate) refusal: Option<u8>,
+    /// The owner's payload version, sent with a payload-version refusal.
+    pub(crate) payload_version: Option<u32>,
+}
+
+impl Reply {
+    pub(crate) fn new(delivered: bool, status: u8) -> Reply {
+        Reply {
+            delivered,
+            status,
+            refusal: None,
+            payload_version: None,
+        }
+    }
+
+    pub(crate) fn refused(why: u8) -> Reply {
+        Reply {
+            refusal: Some(why),
+            ..Reply::new(false, status::REFUSED)
+        }
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new(REPLY)
+            .bytes(reply::DELIVERED, &[u8::from(self.delivered)])
+            .bytes(reply::STATUS, &[self.status]);
+        if let Some(why) = self.refusal {
+            w = w.bytes(reply::REFUSAL, &[why]);
+        }
+        if let Some(v) = self.payload_version {
+            w = w.bytes(reply::PAYLOAD_VERSION, &v.to_le_bytes());
+        }
+        w.finish()
+    }
+
+    pub(crate) fn decode(body: &[u8]) -> Result<Reply, Error> {
+        use reply::*;
+        let r = Records::parse(body, &[DELIVERED, STATUS, REFUSAL, PAYLOAD_VERSION])?;
+        let [delivered] = r.required::<1>(DELIVERED)?;
+        let [status] = r.required::<1>(STATUS)?;
+        Ok(Reply {
+            delivered: delivered != 0,
+            status,
+            refusal: r.fixed::<1>(REFUSAL)?.map(|[b]| b),
+            payload_version: r.fixed(PAYLOAD_VERSION)?.map(u32::from_le_bytes),
+        })
+    }
+}
+
+/// An OS string as it travels: its bytes on Unix, its UTF-16 little-endian
+/// on Windows. Lossless both ways.
+pub(crate) fn os_to_bytes(s: &OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        s.as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        s.encode_wide().flat_map(u16::to_le_bytes).collect()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        s.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+pub(crate) fn os_from_bytes(b: &[u8]) -> Result<OsString, BoxError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(OsStr::from_bytes(b).to_os_string())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        if b.len() % 2 != 0 {
+            return Err("an odd number of bytes isn't UTF-16".into());
+        }
+        let units: Vec<u16> = b
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        Ok(OsString::from_wide(&units))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(String::from_utf8(b.to_vec())?.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The exact bytes of each message are the contract between builds that
+    // use different releases of this crate.
+    #[test]
+    fn hello_bytes_are_frozen() {
+        let hello = Hello {
+            wire_min: 1,
+            wire_max: 1,
+            app_id: "a".into(),
+            nonce: 0x0102_0304_0506_0708,
+            payload_version: 7,
+            max_request: MAX_REQUEST,
+            state: state::BUSY,
+        };
+        let bytes = hello.encode();
+        #[rustfmt::skip]
+        assert_eq!(bytes, [
+            b'I', b'H', b'N', b'D', HELLO, 52, 0, 0, 0,
+            1, 4, 0, 0, 0, 1, 0, 1, 0,
+            2, 1, 0, 0, 0, b'a',
+            3, 8, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1,
+            4, 4, 0, 0, 0, 7, 0, 0, 0,
+            5, 4, 0, 0, 0, 0, 0, 0x40, 0,
+            6, 1, 0, 0, 0, 1,
+        ]);
+        let (kind, body, used) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!((kind, used), (HELLO, bytes.len()));
+        assert_eq!(Hello::decode(body).unwrap(), hello);
+    }
+
+    #[test]
+    fn request_and_reply_round_trip() {
+        let req = Request {
+            wire: 1,
+            payload_version: 3,
+            cwd: Some(b"/home/u".to_vec()),
+            xdg_activation_token: Some("tok".into()),
+            startup_id: None,
+            payload: vec![0, 159, 146, 150],
+        };
+        let bytes = req.encode();
+        let (kind, body, _) = split(&bytes, MAX_REQUEST as usize).unwrap().unwrap();
+        assert_eq!(kind, REQUEST);
+        assert_eq!(Request::decode(body).unwrap(), req);
+
+        let mut reply = Reply::refused(refusal::PAYLOAD_VERSION);
+        reply.payload_version = Some(4);
+        let bytes = reply.encode();
+        assert_eq!(
+            bytes,
+            [
+                b'I', b'H', b'N', b'D', REPLY, 27, 0, 0, 0, 1, 1, 0, 0, 0, 0, 2, 1, 0, 0, 0, 3, 3,
+                1, 0, 0, 0, 3, 4, 4, 0, 0, 0, 4, 0, 0, 0,
+            ]
+        );
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(Reply::decode(body).unwrap(), reply);
+    }
+
+    #[test]
+    fn unknown_records_are_skipped_unless_critical() {
+        let base = Writer::new(REPLY)
+            .bytes(1, &[1])
+            .bytes(2, &[0])
+            .bytes(0x40, b"later");
+        let bytes = base.finish();
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert!(Reply::decode(body).unwrap().delivered);
+
+        let bytes = Writer::new(REPLY)
+            .bytes(1, &[1])
+            .bytes(2, &[0])
+            .bytes(0xc0, b"must know")
+            .finish();
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(Reply::decode(body), Err(Error::Unsupported));
+    }
+
+    #[test]
+    fn bad_frames_are_refused() {
+        // A duplicate record.
+        let bytes = Writer::new(REPLY).bytes(1, &[1]).bytes(1, &[0]).finish();
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(Reply::decode(body), Err(Error::Malformed));
+        // A record running past the body.
+        assert_eq!(
+            Records::parse(&[1, 9, 0, 0, 0, 1], &[1]).err(),
+            Some(Error::Malformed)
+        );
+        // Someone else's protocol, seen from the first byte.
+        assert_eq!(header(b"{\"v\"", SMALL), Err(Error::BadMagic));
+        // A length over the limit, before the body is read.
+        let mut big = Writer::new(REQUEST).finish();
+        big[5..9].copy_from_slice(&(SMALL as u32 + 1).to_le_bytes());
+        assert_eq!(
+            header(&big, SMALL),
+            Err(Error::TooLarge {
+                size: SMALL + 1,
+                limit: SMALL
+            })
+        );
+        // Not all here yet.
+        assert_eq!(header(b"IHN", SMALL), Ok(None));
+    }
+
+    #[test]
+    fn os_strings_travel_losslessly() {
+        #[cfg(unix)]
+        let s = {
+            use std::os::unix::ffi::OsStrExt;
+            OsStr::from_bytes(b"caf\xe9.pdf").to_os_string()
+        };
+        #[cfg(windows)]
+        let s = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0x63, 0xd800, 0x66])
+        };
+        #[cfg(not(any(unix, windows)))]
+        let s = OsString::from("café");
+        assert_eq!(os_from_bytes(&os_to_bytes(&s)).unwrap(), s);
+    }
+}
