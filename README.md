@@ -43,7 +43,7 @@ Not published yet. The API was reworked from sheaf's `sheaf-instance` after a pr
 - **Only the same user, at the same privilege level.** A request never runs with more or fewer rights than its launch had, so root on Unix and an elevated process on Windows each get an owner of their own: run as administrator, a launch never hands off to the normal instance, which lacks those rights. On Unix the runtime folder must be private, and both ends check the peer's uid. On Windows each integrity level has its own folder, labelled at that level; the pipe has a random name published in that folder, an access list for the user alone and an integrity label; the owner checks the launch's token, and the launch checks that the pipe is its own user's at its own level.
 - **One right folder.** Each launch has exactly one runtime folder and never falls back to another, so two launches of one user can't end up with two owners. On Linux with systemd it's `/run/user/<uid>/<id>`; a launch with no session (cron, `@reboot`) runs alone with `Reason::NoSession` instead of guessing.
 
-The crate docs have the full guarantees, the folder rule for each platform, the protocol, and notes on daemons, containers and quitting.
+The crate docs have the full guarantees, the folder rule for each platform, the protocol, and notes on daemons, containers and quitting. [docs/design](docs/design) records why each of these was chosen over the alternatives.
 
 ## With an event loop
 
