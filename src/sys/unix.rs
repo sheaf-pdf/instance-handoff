@@ -347,34 +347,80 @@ const _: () = assert!(std::mem::size_of::<libc::statx>() == 256);
 fn owner_mode(fd: BorrowedFd<'_>) -> io::Result<(libc::uid_t, libc::mode_t)> {
     #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
     {
-        const WANT: libc::c_uint = libc::STATX_UID | libc::STATX_MODE;
-        // SAFETY: statx is plain data; the kernel fills it in.
-        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
-        // SAFETY: the empty path with AT_EMPTY_PATH names `fd` itself, and
-        // `stx` is valid for writes of the kernel's struct, checked above.
-        let r = unsafe {
-            libc::syscall(
-                libc::SYS_statx,
-                fd.as_raw_fd(),
-                c"".as_ptr(),
-                libc::AT_EMPTY_PATH,
-                WANT,
-                &mut stx as *mut libc::statx,
-            )
-        };
-        if r == 0 {
-            if stx.stx_mask & WANT != WANT {
-                return Err(denied("its owner or mode is unknown"));
-            }
-            return Ok((stx.stx_uid, stx.stx_mode.into()));
-        }
-        let e = io::Error::last_os_error();
-        if !matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) {
-            return Err(e);
+        // The empty path with AT_EMPTY_PATH names `fd` itself.
+        if let Some(found) = statx_owner_mode(fd.as_raw_fd(), c"", libc::AT_EMPTY_PATH) {
+            return found;
         }
     }
     let st = fstat(fd)?;
     Ok((st.st_uid, st.st_mode))
+}
+
+/// The owner of the file at `path`, following links, read as [`owner_mode`]
+/// reads it. Unlike opening the file, this needs no right to read it.
+fn path_owner(path: &Path) -> io::Result<libc::uid_t> {
+    let c = cstr(path.as_os_str())?;
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    {
+        if let Some(found) = statx_owner_mode(libc::AT_FDCWD, &c, 0) {
+            return found.map(|(uid, _)| uid);
+        }
+    }
+    // SAFETY: stat is plain data; fstatat fills it in.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid C string, and `st` is valid for writes.
+    cvt(unsafe { libc::fstatat(libc::AT_FDCWD, c.as_ptr(), &mut st, 0) })?;
+    Ok(st.st_uid)
+}
+
+/// A file's owner and mode from the `statx` system call: `path` from
+/// `dirfd`, with `flags`. `None` where the kernel (before 4.11) or a
+/// seccomp filter refuses the call.
+#[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+fn statx_owner_mode(
+    dirfd: libc::c_int,
+    path: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> Option<io::Result<(libc::uid_t, libc::mode_t)>> {
+    const WANT: libc::c_uint = libc::STATX_UID | libc::STATX_MODE;
+    // SAFETY: statx is plain data; the kernel fills it in.
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a valid C string, and `stx` is valid for writes of
+    // the kernel's struct, checked above.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            dirfd,
+            path.as_ptr(),
+            flags,
+            WANT,
+            &mut stx as *mut libc::statx,
+        )
+    };
+    if r == 0 {
+        if stx.stx_mask & WANT != WANT {
+            return Some(Err(denied("its owner or mode is unknown")));
+        }
+        return Some(Ok((stx.stx_uid, stx.stx_mode.into())));
+    }
+    let e = io::Error::last_os_error();
+    if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) {
+        return None;
+    }
+    Some(Err(e))
+}
+
+/// Whether a launch whose effective user is `euid` may keep its state in a
+/// folder that `owner` owns: its own, or root's. Root trusts only its own,
+/// so root given the user's home finds it another user's.
+fn trusted_owner(owner: libc::uid_t, euid: libc::uid_t) -> bool {
+    owner == euid || owner == 0
+}
+
+/// Whether the file at `path` belongs to a user this process doesn't
+/// trust with its state (see [`trusted_owner`]).
+pub(crate) fn is_foreign(path: &Path) -> io::Result<bool> {
+    Ok(!trusted_owner(path_owner(path)?, euid()))
 }
 
 /// This user's, and writable by nobody else.
@@ -1752,6 +1798,40 @@ mod tests {
             let st = fstat(fd).unwrap();
             assert_eq!(owner_mode(fd).unwrap(), (st.st_uid, st.st_mode));
         }
+        let st = fstat(folder.fd.as_fd()).unwrap();
+        assert_eq!(path_owner(folder.path()).unwrap(), st.st_uid);
+    }
+
+    // Who may keep its state in whose folder: (owner, euid, trusted).
+    #[test]
+    fn the_state_owner_rule() {
+        let table = [
+            (1000, 1000, true),
+            // Root's folders, such as `/` above a missing state folder.
+            (0, 1000, true),
+            (1001, 1000, false),
+            // A user namespace shows owners it doesn't map as nobody.
+            (65534, 1000, false),
+            (0, 0, true),
+            // Root given the user's home: sudo -E, macOS sudo, su -m.
+            (1000, 0, false),
+            (65534, 0, false),
+        ];
+        for (owner, euid, trusted) in table {
+            assert_eq!(
+                trusted_owner(owner, euid),
+                trusted,
+                "owner {owner}, euid {euid}"
+            );
+        }
+    }
+
+    #[test]
+    fn this_users_folders_are_not_foreign() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_foreign(tmp.path()).unwrap());
+        let err = is_foreign(&tmp.path().join("missing")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

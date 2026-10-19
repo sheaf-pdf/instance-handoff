@@ -1,5 +1,5 @@
 //! The state folder's canonical path, so that launches naming one folder
-//! through different links agree on it.
+//! through different links agree on it, and whether it is another user's.
 
 use std::ffi::OsStr;
 use std::io;
@@ -97,6 +97,34 @@ fn fold(mut resolved: PathBuf, tail: &[Component<'_>]) -> PathBuf {
     }
     resolved.extend(parts);
     resolved
+}
+
+/// The folder that makes the canonical `state` another user's, if one
+/// does: `state` itself or, while it is missing, the nearest folder above
+/// it that exists, which is where it would be created. A folder whose
+/// owner can't be read passes, with a warning in the log, as a path whose
+/// links can't be resolved does.
+pub(crate) fn foreign(state: &Path) -> Option<PathBuf> {
+    foreign_with(state, sys::is_foreign)
+}
+
+/// [`foreign`], asking `is_foreign` about each folder in turn.
+fn foreign_with(state: &Path, is_foreign: impl Fn(&Path) -> io::Result<bool>) -> Option<PathBuf> {
+    let mut path = state;
+    loop {
+        match is_foreign(path) {
+            Ok(true) => return Some(path.to_path_buf()),
+            Ok(false) => return None,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => path = path.parent()?,
+            Err(e) => {
+                log::warn!(
+                    "instance-handoff: can't read who owns {}, so the state folder isn't checked: {e}",
+                    path.display()
+                );
+                return None;
+            }
+        }
+    }
 }
 
 #[cfg(all(test, any(unix, windows)))]
@@ -209,5 +237,46 @@ mod tests {
     #[test]
     fn an_empty_path_is_kept_as_given() {
         assert_eq!(canonical(Path::new("")), Path::new(""));
+    }
+
+    // Which folders exist, and whether each is another user's: root given
+    // greg's home.
+    #[test]
+    fn the_nearest_folder_that_exists_decides() {
+        let disk = [("/", false), ("/home", false), ("/home/greg", true)];
+        let is_foreign = |path: &Path| match disk.iter().find(|(p, _)| Path::new(p) == path) {
+            Some(&(_, foreign)) => Ok(foreign),
+            None => Err(io::ErrorKind::NotFound.into()),
+        };
+        let foreign = |state: &str| foreign_with(Path::new(state), is_foreign);
+        let greg = Some(PathBuf::from("/home/greg"));
+        assert_eq!(foreign("/home/greg"), greg);
+        assert_eq!(foreign("/home/greg/.config/app"), greg);
+        assert_eq!(foreign("/home/other/app"), None);
+        assert_eq!(foreign("/srv/app"), None);
+        // Nothing exists, not even the root.
+        assert_eq!(
+            foreign_with(Path::new("/a"), |_| Err(io::ErrorKind::NotFound.into())),
+            None
+        );
+        assert_eq!(foreign_with(Path::new(""), is_foreign), None);
+    }
+
+    // The walk stops there, though the folder above it is another user's.
+    #[test]
+    fn a_folder_whose_owner_cant_be_read_passes() {
+        let is_foreign = |path: &Path| match path.to_str() {
+            Some("/home/greg") => Ok(true),
+            _ => Err(io::ErrorKind::PermissionDenied.into()),
+        };
+        assert_eq!(foreign_with(Path::new("/home/greg/app"), is_foreign), None);
+    }
+
+    #[test]
+    fn this_users_temporary_folder_is_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = canonical(tmp.path());
+        assert_eq!(foreign(&state), None);
+        assert_eq!(foreign(&state.join(missing_name()).join("app")), None);
     }
 }

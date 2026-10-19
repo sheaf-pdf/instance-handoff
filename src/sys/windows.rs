@@ -61,9 +61,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
     FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, GetFileInformationByHandle,
-    GetFinalPathNameByHandleW, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
-    PIPE_ACCESS_DUPLEX, READ_CONTROL, ReadFile, SECURITY_IDENTIFICATION, SYNCHRONIZE,
-    VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER, WriteFile,
+    GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, LOCKFILE_EXCLUSIVE_LOCK,
+    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, PIPE_ACCESS_DUPLEX, READ_CONTROL, ReadFile,
+    SECURITY_IDENTIFICATION, SYNCHRONIZE, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER, WriteFile,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
@@ -74,8 +74,8 @@ use windows_sys::Win32::System::Pipes::{
     WaitNamedPipeW,
 };
 use windows_sys::Win32::System::SystemServices::{
-    ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE, SECURITY_MANDATORY_MEDIUM_RID,
-    SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+    ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE, FILE_PERSISTENT_ACLS,
+    SECURITY_MANDATORY_MEDIUM_RID, SYSTEM_MANDATORY_LABEL_ACE_TYPE,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, GetCurrentThread, INFINITE, OpenProcessToken, OpenThreadToken,
@@ -364,6 +364,64 @@ pub(crate) fn final_path(path: &Path) -> io::Result<PathBuf> {
         // Too small: `n` is the length it needs, the NUL included.
         buf.resize(n, 0);
     }
+}
+
+/// Whether the file at `path` belongs to a user this process doesn't trust
+/// with its state: its owner isn't this user, SYSTEM, Administrators (which
+/// owns what an elevated process makes) or TrustedInstaller. On a volume
+/// that keeps no owners, such as FAT, nothing does.
+pub(crate) fn is_foreign(path: &Path) -> io::Result<bool> {
+    let file = OpenOptions::new()
+        .access_mode(READ_CONTROL)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let handle = file.as_raw_handle();
+    let mut flags = 0;
+    // SAFETY: an open handle; the other out-parameters are null, which asks
+    // for nothing.
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            handle,
+            null_mut(),
+            0,
+            null_mut(),
+            null_mut(),
+            &mut flags,
+            null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & FILE_PERSISTENT_ACLS == 0 {
+        return Ok(false);
+    }
+    let mut owner: PSID = null_mut();
+    let mut sd: *mut c_void = null_mut();
+    // SAFETY: a handle opened with READ_CONTROL; `owner` points into `sd`,
+    // freed by `Local`.
+    let err = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut sd,
+        )
+    };
+    if err != 0 {
+        return Err(win32(err));
+    }
+    let _sd = Local(sd);
+    if owner.is_null() {
+        return Err(denied("its owner is unknown"));
+    }
+    Ok(!trusted(owner, me()?))
 }
 
 /// A final path in the form launches compare: `C:\…` on a drive and
@@ -1815,6 +1873,46 @@ mod tests {
         folder.unpublish();
         std::fs::write(&file, "x \\\\evil\\pipe\n").unwrap();
         assert!(folder.address().is_err());
+    }
+
+    // Whose folders a launch may keep its state in, by owner SID.
+    #[test]
+    fn the_state_owner_rule() {
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        let me = me().unwrap();
+        let table = [
+            (me.sid_string.as_str(), true),
+            ("S-1-5-18", true),
+            // Administrators: an elevated process's own files.
+            ("S-1-5-32-544", true),
+            (TRUSTED_INSTALLER, true),
+            // Another user, such as the account that administrator
+            // protection elevates to.
+            ("S-1-5-21-1-2-3-1001", false),
+            ("S-1-5-32-545", false),
+            ("S-1-1-0", false),
+        ];
+        for (sid_string, want) in table {
+            let mut sid: PSID = null_mut();
+            let s = wide(OsStr::new(sid_string));
+            // SAFETY: a NUL-terminated string; `sid` receives a LocalAlloc'd
+            // SID, freed by `Local`.
+            assert_ne!(unsafe { ConvertStringSidToSidW(s.as_ptr(), &mut sid) }, 0);
+            let _sid = Local(sid);
+            assert_eq!(trusted(sid, me), want, "{sid_string}");
+        }
+    }
+
+    #[test]
+    fn this_users_folders_are_not_foreign() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_foreign(tmp.path()).unwrap());
+        let local = default_place(&AppId::headless("test.windows"))
+            .unwrap()
+            .base;
+        assert!(!is_foreign(&local).unwrap());
+        let err = is_foreign(&tmp.path().join("missing").join("app")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

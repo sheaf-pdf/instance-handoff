@@ -298,6 +298,19 @@ pub enum Reason {
         /// What went wrong.
         source: io::Error,
     },
+    /// The state folder, or the folder it would be created in, belongs to
+    /// another user: root given the user's home by `sudo -E`, say. Nothing
+    /// was created. Only [`Builder::start`] checks this; see
+    /// [`Builder::new`].
+    ///
+    /// [`Builder::start`]: crate::Builder::start
+    /// [`Builder::new`]: crate::Builder::new
+    #[non_exhaustive]
+    ForeignState {
+        /// The folder that belongs to another user: the state folder, or
+        /// the nearest folder above it that exists.
+        path: PathBuf,
+    },
     /// This crate doesn't support the target platform (the web, WASI,
     /// Solaris, iOS and others), so no process can be the owner. An app
     /// that runs one process by design owns its state anyway:
@@ -363,6 +376,11 @@ impl fmt::Display for Reason {
                 write!(f, "runtime folder {}: {source}", path.display())
             }
             Reason::Lock { path, source } => write!(f, "lock {}: {source}", path.display()),
+            Reason::ForeignState { path } => write!(
+                f,
+                "the state folder, or the folder it would be created in, belongs to another user: {}",
+                path.display()
+            ),
             Reason::Unsupported {} => {
                 f.write_str("single-instance handoff isn't available on this platform")
             }
@@ -434,5 +452,17 @@ mod tests {
             "the running instance (pid unknown, high) has high integrity, which this launch lacks"
         );
         assert!(more.source().is_none() && fewer.source().is_none());
+    }
+
+    #[test]
+    fn foreign_state_names_the_folder() {
+        let reason = Reason::ForeignState {
+            path: PathBuf::from("/home/me"),
+        };
+        assert!(
+            reason.to_string().ends_with("another user: /home/me"),
+            "{reason}"
+        );
+        assert!(reason.source().is_none());
     }
 }

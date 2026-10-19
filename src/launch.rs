@@ -145,6 +145,11 @@ pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
         return Started::Alone(Reason::Unsupported {});
     }
     let state = b.canonical_state();
+    // Before anything is created: a launch never makes or owns state in
+    // another user's folder. `hand_off` and `probe` write nothing there.
+    if let Some(path) = state.as_deref().and_then(crate::state::foreign) {
+        return Started::Alone(Reason::ForeignState { path });
+    }
     let place = match b.place() {
         Ok(place) => place,
         Err(reason) => return Started::Alone(reason),

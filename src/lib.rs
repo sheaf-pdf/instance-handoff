@@ -199,9 +199,10 @@
 //!
 //! - Owners at two levels are two owners. If both read and write the same
 //!   files, keep the state apart per level, or refuse to run elevated. An
-//!   elevated and a normal process on Windows share the profile, and root
-//!   under `sudo -E` (or wherever `HOME` is kept) writes into the user's
-//!   home.
+//!   elevated and a normal process on Windows share the profile. Root under
+//!   `sudo -E` (or wherever `HOME` is kept) would write into the user's
+//!   home, so a state folder of the user's there, or one root would
+//!   create there, gives root [`Reason::ForeignState`] instead of the lock.
 //! - Within one Unix user, finer privileges aren't compared: supplementary
 //!   groups (`newgrp`), capabilities and LSM confinement. A sandbox that
 //!   must keep its processes from the owner hides the runtime folder from

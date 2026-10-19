@@ -43,7 +43,8 @@ impl State {
     }
 
     /// No state folder: the app keeps no files of its own.
-    /// [`Claim::state_dir`] is then `None`.
+    /// [`Claim::state_dir`] is then `None`, and nothing gives
+    /// [`Reason::ForeignState`].
     ///
     /// [`Claim::state_dir`]: crate::Claim::state_dir
     pub fn none() -> State {
@@ -114,6 +115,25 @@ impl Builder {
     /// or which keeps none ([`State::none`]). The defaults: the default
     /// runtime folder, [`Mode::Join`], a 5 second timeout and payload
     /// version 0.
+    ///
+    /// Before [`start`](Builder::start) creates anything, it checks whose
+    /// the state folder is, or, while it is missing, whose the nearest
+    /// folder above it is. If that folder belongs to another user, the
+    /// launch runs alone with [`Reason::ForeignState`]. That catches root
+    /// given the user's home by macOS `sudo`, `sudo -E` or `su -m`, and the
+    /// separate account that Windows administrator protection elevates to,
+    /// given the user's `%APPDATA%`.
+    ///
+    /// - On Unix, a folder of the launch's user or of root passes. Root's
+    ///   launches pass only root's.
+    /// - On Windows, a folder of the launch's user, SYSTEM, Administrators
+    ///   or TrustedInstaller passes, and so does any folder on a volume
+    ///   that keeps no owners, such as FAT.
+    /// - A folder whose owner can't be read passes, with a warning in the
+    ///   log.
+    ///
+    /// [`hand_off`](Builder::hand_off) and [`probe`](Builder::probe) write
+    /// nothing there, and don't check.
     pub fn new(app_id: AppId, state: impl Into<State>) -> Builder {
         Builder {
             app_id,
