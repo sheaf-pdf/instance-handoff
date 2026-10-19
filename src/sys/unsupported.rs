@@ -63,6 +63,10 @@ pub(crate) fn level() -> Option<crate::Level> {
     None
 }
 
+pub(crate) fn excluded() -> Option<crate::Excluded> {
+    None
+}
+
 pub(crate) fn can_show_windows() -> Option<bool> {
     None
 }

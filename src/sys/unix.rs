@@ -42,20 +42,50 @@ const SOCKET_FILE: &str = "instance.sock";
 /// Connections open at once; more are accepted and closed, and retry.
 const MAX_CONNECTIONS: usize = 64;
 
+/// One of the ids [`raw_id`] reads.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum Id {
+    Uid,
+    Euid,
+    Gid,
+    Egid,
+}
+
+/// One of this process's ids, as the kernel reports it in its own
+/// namespace: from its system call, not from the C library, which fakeroot
+/// replaces to report root.
+#[cfg(target_os = "linux")]
+fn raw_id(id: Id) -> u32 {
+    // In `Id`'s order. 32-bit x86, arm and sparc keep the 16-bit calls
+    // under the plain names. On m68k, libc's plain names are already the
+    // 32-bit calls.
+    #[cfg(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc"))]
+    let nrs = [
+        libc::SYS_getuid32,
+        libc::SYS_geteuid32,
+        libc::SYS_getgid32,
+        libc::SYS_getegid32,
+    ];
+    #[cfg(not(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc")))]
+    let nrs = [
+        libc::SYS_getuid,
+        libc::SYS_geteuid,
+        libc::SYS_getgid,
+        libc::SYS_getegid,
+    ];
+    // SAFETY: getuid, geteuid, getgid and getegid take no arguments and
+    // can't fail.
+    unsafe { libc::syscall(nrs[id as usize]) as u32 }
+}
+
 /// The effective user id, as the kernel reports it in this process's own
 /// namespace. On Linux it comes from the system call, not from the C
 /// library's `geteuid`, which fakeroot replaces to report root.
 fn euid() -> libc::uid_t {
     #[cfg(target_os = "linux")]
     {
-        // 32-bit x86, arm and sparc keep the 16-bit call under the plain
-        // name. On m68k, libc's SYS_geteuid is already the 32-bit one.
-        #[cfg(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc"))]
-        let nr = libc::SYS_geteuid32;
-        #[cfg(not(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc")))]
-        let nr = libc::SYS_geteuid;
-        // SAFETY: geteuid takes no arguments and can't fail.
-        unsafe { libc::syscall(nr) as libc::uid_t }
+        raw_id(Id::Euid)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -393,6 +423,52 @@ pub(crate) fn above_normal() -> bool {
 /// This process's integrity level: none, since only Windows has them.
 pub(crate) fn level() -> Option<crate::Level> {
     None
+}
+
+/// A process's real and effective ids, gathered apart from the rule so
+/// that the rule can be tested.
+#[derive(Debug)]
+pub(crate) struct Ids {
+    pub(crate) uid: u32,
+    pub(crate) euid: u32,
+    pub(crate) gid: u32,
+    pub(crate) egid: u32,
+}
+
+/// Why a process with these ids may take no part, if it may not: its real
+/// and effective user ids differ, or its group ids do, as in a setuid or
+/// setgid program that runs with its rights. Only these ids are compared
+/// (call 7.2). The saved set-ids aren't, so a set-id program that has set
+/// its effective ids back to its real ones takes part, though it may take
+/// its rights back. Nor is Linux's `AT_SECURE`, which also marks a program
+/// given file capabilities. Root, and a process whose ids were all set
+/// alike, as by `su` or `sudo -u`, take part.
+pub(crate) fn excluded_from(ids: &Ids) -> Option<crate::Excluded> {
+    (ids.uid != ids.euid || ids.gid != ids.egid).then_some(crate::Excluded::SetId)
+}
+
+/// This process's real and effective ids, as the kernel reports them in
+/// its own namespace. On Linux each comes from its system call, as
+/// [`euid`]'s does: fakeroot reports root for all four through the C
+/// library, so one read there and one from the kernel would differ.
+fn ids() -> Ids {
+    #[cfg(target_os = "linux")]
+    let (uid, gid, egid) = (raw_id(Id::Uid), raw_id(Id::Gid), raw_id(Id::Egid));
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: getuid, getgid and getegid have no preconditions and can't
+    // fail.
+    let (uid, gid, egid) = unsafe { (libc::getuid(), libc::getgid(), libc::getegid()) };
+    Ids {
+        uid,
+        euid: euid(),
+        gid,
+        egid,
+    }
+}
+
+/// Why this process may take no part, if it may not.
+pub(crate) fn excluded() -> Option<crate::Excluded> {
+    excluded_from(&ids())
 }
 
 /// The display variables, gathered apart from the rule so that the rule
@@ -2437,6 +2513,40 @@ mod tests {
         }
     }
 
+    // A process whose real and effective user or group ids differ takes no
+    // part. Only those ids count, so root takes part, and so does a process
+    // whose ids were all set alike, or a set-id one that set its effective
+    // ids back.
+    #[test]
+    fn set_id_processes_are_excluded() {
+        // (process, uid, euid, gid, egid, excluded)
+        let rows = [
+            ("a user's launch", 1000, 1000, 1000, 1000, false),
+            ("a user in group users", 1000, 1000, 100, 100, false),
+            ("root, under sudo or not", 0, 0, 0, 0, false),
+            ("sudo -u bob", 1001, 1001, 1001, 1001, false),
+            // A setuid program whose saved id lets it take root back.
+            ("after seteuid(getuid())", 1000, 1000, 1000, 1000, false),
+            ("a setuid-root program", 1000, 0, 1000, 1000, true),
+            ("setuid to another user", 1000, 1001, 1000, 1000, true),
+            ("a setgid program", 1000, 1000, 1000, 60, true),
+            ("setuid and setgid", 1000, 0, 1000, 0, true),
+            ("root with another effective user", 0, 1000, 0, 0, true),
+            ("root with another effective group", 0, 0, 0, 1000, true),
+        ];
+        for (process, uid, euid, gid, egid, excluded) in rows {
+            let ids = Ids {
+                uid,
+                euid,
+                gid,
+                egid,
+            };
+            let expected = excluded.then_some(crate::Excluded::SetId);
+            assert_eq!(excluded_from(&ids), expected, "{process}: {ids:?}");
+        }
+        assert_eq!(super::excluded(), None, "{:?}", ids());
+    }
+
     #[test]
     fn doas_users_are_looked_up() {
         assert_eq!(uid_of(OsStr::new("root")), Some(0));
@@ -2538,6 +2648,11 @@ mod tests {
     fn the_kernel_and_the_c_library_agree() {
         // SAFETY: geteuid has no preconditions and can't fail.
         assert_eq!(euid(), unsafe { libc::geteuid() });
+        let ids = ids();
+        // SAFETY: getuid, getgid and getegid have no preconditions and
+        // can't fail.
+        let c_library = unsafe { (libc::getuid(), libc::getgid(), libc::getegid()) };
+        assert_eq!((ids.uid, ids.gid, ids.egid), c_library);
         let tmp = tempfile::tempdir().unwrap();
         let folder = open_folder(&Place::dir(tmp.path().join("run")), true)
             .unwrap()

@@ -273,6 +273,38 @@ impl fmt::Display for Ineligible {
     }
 }
 
+/// Why a process may take no part at all: what [`Reason::Excluded`]
+/// carries.
+///
+/// It displays as the cause, for messages: `its real and effective user or
+/// group ids differ`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Excluded {
+    /// On Unix, its real and effective user ids differ, or its real and
+    /// effective group ids do, as in a setuid or setgid program that runs
+    /// with its rights. It has rights its caller lacks, but its caller
+    /// chose its environment and arguments, so it must neither act on
+    /// other launches' requests nor hand its caller's to an owner. Only
+    /// these ids are compared: a set-id program that has set its effective
+    /// ids back to its real ones isn't excluded, though its saved ids may
+    /// let it take its rights back.
+    SetId,
+    /// On Windows, its token is below medium integrity, in an AppContainer,
+    /// or restricted. No launch gets this yet: the crate docs on privileges
+    /// say what a launch below medium gets.
+    Sandboxed,
+}
+
+impl fmt::Display for Excluded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Excluded::SetId => "its real and effective user or group ids differ",
+            Excluded::Sandboxed => "it runs in a sandbox",
+        })
+    }
+}
+
 /// Why a launch runs without the lock and handed nothing off.
 ///
 /// Every reason leaves the process able to run, as long as it writes none
@@ -440,6 +472,23 @@ pub enum Reason {
         /// Why it may not.
         why: Ineligible,
     },
+    /// This process may take no part at all: on Unix, one whose real and
+    /// effective user or group ids differ, as a setuid or setgid program's
+    /// do while it runs with its rights. It neither owns nor hands off, nor
+    /// holds the state with [`Builder::exclusive`]. [`Builder::start`],
+    /// [`Builder::hand_off`], [`Builder::probe`] and `exclusive` return
+    /// this at once, before they look for an owner or make anything. See
+    /// the crate docs on privileges.
+    ///
+    /// [`Builder::start`]: crate::Builder::start
+    /// [`Builder::hand_off`]: crate::Builder::hand_off
+    /// [`Builder::probe`]: crate::Builder::probe
+    /// [`Builder::exclusive`]: crate::Builder::exclusive
+    #[non_exhaustive]
+    Excluded {
+        /// Why it may not.
+        why: Excluded,
+    },
     /// On Linux with systemd: this process has no login session, so the
     /// user's runtime folder (`/run/user/<uid>`) doesn't exist. Launches
     /// from cron, `@reboot` or a system service land here. Run `loginctl
@@ -578,6 +627,10 @@ impl fmt::Display for Reason {
             Reason::MayNotOwn { why } => {
                 write!(f, "this launch may not become the running instance: {why}")
             }
+            Reason::Excluded { why } => write!(
+                f,
+                "this launch may neither hand off nor become the running instance: {why}"
+            ),
             Reason::NoSession {} => f.write_str(
                 "no login session, so no runtime folder (`loginctl enable-linger` keeps one)",
             ),
@@ -727,5 +780,19 @@ mod tests {
             "this launch may not become the running instance: it can't show windows"
         );
         assert!(raised.source().is_none());
+    }
+
+    #[test]
+    fn excluded_says_why() {
+        let set_id = Reason::Excluded {
+            why: Excluded::SetId,
+        };
+        assert_eq!(
+            set_id.to_string(),
+            "this launch may neither hand off nor become the running instance: its real and \
+             effective user or group ids differ"
+        );
+        assert_eq!(Excluded::Sandboxed.to_string(), "it runs in a sandbox");
+        assert!(set_id.source().is_none());
     }
 }

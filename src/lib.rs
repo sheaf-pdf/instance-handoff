@@ -246,15 +246,23 @@
 //! request down to one at a lower level ([`Builder::hand_down`]):
 //!
 //! - Unix: the level is the effective user, as the kernel reports it in the
-//!   process's own user namespace. On Linux the crate reads it, and the
-//!   owners of its folders, with system calls rather than through the C
-//!   library, so `fakeroot` doesn't change them: a launch under `fakeroot`
-//!   is still its user's, and hands off to that user's owner. Root (`sudo`,
-//!   `su`, `doas`, `pkexec`) is another user, with its own folder and
-//!   owner, and so is the user a setuid program runs as. On Linux, the BSDs
-//!   and illumos, root's folder is fixed, so root's own launches and
-//!   launches under `sudo` meet one owner, whether or not root is logged in
-//!   anywhere.
+//!   process's own user namespace. On Linux the crate reads it, the
+//!   process's other ids and the owners of its folders with system calls
+//!   rather than through the C library, so `fakeroot` doesn't change them:
+//!   a launch under `fakeroot` is still its user's, and hands off to that
+//!   user's owner. Root (`sudo`, `su`, `doas`, `pkexec`) is another user,
+//!   with its own folder and owner. On Linux, the BSDs and illumos, root's
+//!   folder is fixed, so root's own launches and launches under `sudo` meet
+//!   one owner, whether or not root is logged in anywhere. A process whose
+//!   real and effective user or group ids differ, as a setuid or setgid
+//!   program's do while it runs with its rights, takes no part at all: it
+//!   has rights its caller lacks, in an environment its caller chose. Its
+//!   launches run alone at once with [`Reason::Excluded`], and
+//!   [`Builder::hand_off`], [`Builder::probe`] and [`Builder::exclusive`]
+//!   fail with it. Only those ids are compared: a set-id program that has
+//!   set its effective ids back to its real ones takes part, though its
+//!   saved ids may let it take its rights back, and so does a program given
+//!   file capabilities.
 //! - Windows: the level is the user and the integrity level. Every level
 //!   shares one lock per state, in the instance folder, so a launch run as
 //!   administrator (high) and a normal (medium) one meet the same owner,
@@ -541,7 +549,7 @@ mod sys;
 pub use builder::{Builder, ElevatedOwner, Guard, State};
 pub use id::{AppId, InvalidAppId, Kind};
 pub use level::{Level, Rights};
-pub use outcome::{End, Exclusive, Ineligible, OwnerInfo, Reason, Started};
+pub use outcome::{End, Excluded, Exclusive, Ineligible, OwnerInfo, Reason, Started};
 pub use owner::{Claim, Owner};
 #[cfg(feature = "serde")]
 pub use payload::Json;

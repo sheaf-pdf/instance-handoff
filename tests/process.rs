@@ -716,6 +716,145 @@ fn a_launch_under_fakeroot_hands_off_to_the_users_owner() {
     );
 }
 
+/// Not a test: a launch that `launch_setgid` runs from a setgid copy of
+/// the test binary. It prints its real and effective group ids, then the
+/// reason `start` ran alone, and `hand_off`, `probe` and `exclusive`
+/// failed, if they did.
+#[cfg(unix)]
+#[test]
+fn setgid_launch_process() {
+    if std::env::var_os(ROLE).is_none() {
+        return;
+    }
+    let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
+    // SAFETY: getgid and getegid have no preconditions and can't fail.
+    let (gid, egid) = unsafe { (libc::getgid(), libc::getegid()) };
+    println!("gid {gid} egid {egid}");
+    let builder = Builder::new(APP, state(&dir)).dir(dir);
+    let args = Args::new(["setgid"]);
+    let alone = match builder.start(&args) {
+        Started::Alone(reason) => Some(reason),
+        _ => None,
+    };
+    println!("start {alone:?}");
+    println!("hand_off {:?}", builder.hand_off(&args).err());
+    println!("probe {:?}", builder.probe().err());
+    println!("exclusive {:?}", builder.exclusive().err());
+}
+
+/// Runs `setgid_launch_process` from a copy of the test binary that is
+/// setgid to another of this user's groups, which needs no root, and
+/// returns its output lines. `None`, with a message, when the user has no
+/// other group, the copy can't be made setgid, or its file system ignores
+/// set-id bits, unless INSTANCE_HANDOFF_REQUIRE_SETGID is set.
+#[cfg(unix)]
+fn launch_setgid(dir: &Path) -> Option<Vec<String>> {
+    use std::os::unix::fs::PermissionsExt;
+    const REQUIRE: &str = "INSTANCE_HANDOFF_REQUIRE_SETGID";
+    let skip = |why: String| {
+        assert!(std::env::var_os(REQUIRE).is_none(), "{why}");
+        eprintln!("skipped: {why}; set {REQUIRE} to fail instead");
+    };
+    // SAFETY: getgid has no preconditions and can't fail.
+    let gid = unsafe { libc::getgid() };
+    let Some(group) = groups().into_iter().find(|&g| g != gid) else {
+        skip("this user has no group but its own".into());
+        return None;
+    };
+    // In the build folder, since /tmp may be mounted nosuid.
+    let copy = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let exe = copy.path().join("setgid");
+    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    // The group first: changing it clears the set-id bits.
+    let made = std::os::unix::fs::chown(&exe, None, Some(group))
+        .and_then(|()| std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o2755)));
+    if let Err(e) = made {
+        skip(format!(
+            "the copy can't be made setgid to group {group}: {e}"
+        ));
+        return None;
+    }
+    let mut command = Command::new(&exe);
+    command
+        .args([
+            "--exact",
+            "setgid_launch_process",
+            "--nocapture",
+            "--test-threads=1",
+            "-q",
+        ])
+        .env(ROLE, "setgid")
+        .env(DIR, dir);
+    let t = Instant::now();
+    let out = loop {
+        match command.output() {
+            // A child that another test forked while the copy was open for
+            // writing holds it until it execs.
+            Err(e)
+                if e.raw_os_error() == Some(libc::ETXTBSY)
+                    && t.elapsed() < Duration::from_secs(5) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            run => break run.expect("the setgid copy starts"),
+        }
+    };
+    assert!(
+        out.status.success(),
+        "{}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<String> = stdout.lines().map(str::to_owned).collect();
+    if !lines.contains(&format!("gid {gid} egid {group}")) {
+        skip(format!(
+            "the setgid copy ran with its caller's group: {lines:?}"
+        ));
+        return None;
+    }
+    Some(lines)
+}
+
+/// This process's supplementary groups.
+#[cfg(unix)]
+fn groups() -> Vec<libc::gid_t> {
+    // SAFETY: with a size of 0, getgroups only counts, and writes nothing.
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let mut groups = vec![0; usize::try_from(n).unwrap()];
+    // SAFETY: groups has room for n ids.
+    let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+    groups.truncate(usize::try_from(n).unwrap());
+    groups
+}
+
+// A setgid program has rights its caller lacks, in an environment its
+// caller chose, so it takes no part: its start runs alone, and its
+// hand_off, probe and exclusive fail, all with Excluded, although an owner
+// serves. Nothing reaches the owner.
+#[cfg(unix)]
+#[test]
+fn a_setgid_launch_takes_no_part() {
+    let (_tmp, dir) = dir();
+    let owner = Owner::start(&dir);
+    let Some(lines) = launch_setgid(&dir) else {
+        return;
+    };
+    for call in ["start", "hand_off", "probe", "exclusive"] {
+        let excluded = format!("{call} Some(Excluded {{ why: SetId }})");
+        assert!(lines.contains(&excluded), "{call}: {lines:?}");
+    }
+    // The first request the owner takes is this one.
+    Builder::new(APP, state(&dir))
+        .dir(&dir)
+        .hand_off(&Args::new(["after"]))
+        .unwrap();
+    assert_eq!(
+        owner.took(Duration::from_secs(5)).as_deref(),
+        Some(hex(b"after").as_str())
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_stopped_owner_never_delivers_a_launch_that_ran_alone() {

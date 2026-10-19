@@ -41,11 +41,15 @@ jobs:
         run: just fmt
       - name: Clippy
         run: just clippy
+      # tests/process.rs also runs a launch from a copy of itself made
+      # setgid to another of the runner's groups, which needs no root. It
+      # skips where it can't, except here and on macOS.
       - name: Test (including doctests and cross-process tests)
         run: just test
         env:
           INSTANCE_HANDOFF_REQUIRE_FAKEROOT: "1"
           INSTANCE_HANDOFF_REQUIRE_BWRAP: "1"
+          INSTANCE_HANDOFF_REQUIRE_SETGID: "1"
       - name: Build documentation
         run: just doc
       - name: Lint the Windows code
@@ -77,6 +81,9 @@ jobs:
         run: just clippy
       - name: Test
         run: just test
+        # For tests/process.rs's setgid launch on macOS; Windows has none.
+        env:
+          INSTANCE_HANDOFF_REQUIRE_SETGID: "1"
       # The runner is an administrator with UAC off, so the step above runs
       # at high integrity. This one covers an ordinary, unelevated launch.
       - name: Test at medium integrity

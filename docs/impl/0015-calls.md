@@ -155,8 +155,11 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
 
 ## 7. Who may own (slices 32 to 37)
 
-1. `Excluded` applies to `start`, `hand_off`, `probe` and `exclusive`. *Recommended.*
-2. Set-id is a plain comparison of the raw ids. *Recommended.* Slice 4 must show that the SAFER token used by the medium tests isn't restricted, or the medium job would break.
+1. `Excluded` applies to `start`, `hand_off`, `probe` and `exclusive`. *Recommended.* It comes first in each, after only `Unsupported`: in `start` before `NoWindows` and the rights reasons, as in `exclusive` (4.7), and in `hand_off` and `probe` before the runtime folder is looked for and before the payload is encoded, so before `Encode`. *Our call (slice 32).*
+2. Set-id is a plain comparison of the raw ids. *Recommended.* Slice 4 must show that the SAFER token used by the medium tests isn't restricted, or the medium job would break. Slice 32 settled what this leaves open. *Our call (slice 32).*
+   - Only the real and effective ids are compared, not the saved set-ids. A set-id program that has set its effective ids back to its real ones, as with `seteuid(getuid())`, takes part, though it can take its rights back. Comparing the saved ids would need `getresuid` and `getresgid`, which macOS, NetBSD and illumos lack, and would be a change of call.
+   - Linux's `AT_SECURE`, which R38 also names, isn't read, so a program given file capabilities takes part.
+   - The docs say "a setuid or setgid program that runs with its rights", not "a setuid or setgid program", for the cases above.
 3. **Raised on Unix.** `SUDO_UID`, `PKEXEC_UID`, `DOAS_USER` and `loginuid` are enough for 0.1. `su` on the BSDs and macOS goes undetected, since they have no `loginuid`. `run0` sets `SUDO_UID`: its man page lists it, with `SUDO_USER` and `SUDO_GID`, since systemd 256 (checked in slice 34 against systemd 259). *Our call.* A variable that isn't a number, or a `DOAS_USER` that names no user, counts as unset. *Our call (slice 34).*
 4. On Unix, `NotAboveNormal` means no root owner. *Recommended.*
 5. UIAccess (0x2010) may own under `NotAboveNormal`, as the sketch says. MEDIUM_PLUS (0x2100) counts as above normal. *Our call.*
@@ -176,9 +179,9 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
    Slice 37 settled how the two Windows facts combine when one can't be read. *Our call (slice 37).* Either alone can say no: session 0, or a window station that isn't visible. A visible station says yes only with a session that was read and isn't 0, since nobody sees session 0's windows. Otherwise the answer is unknown.
 7. **No test hook in 0.1.** The docs tell a windowed app to run its tests under a display (Xvfb), or to build its test `AppId` as headless with its own test state. The crate's own tests use headless ids. *Our call.*
 
-## 8. Tests and CI (slices 6, 38)
+## 8. Tests and CI (slices 6, 32, 38)
 
-1. CI installs fakeroot and bubblewrap and requires them through `INSTANCE_HANDOFF_REQUIRE_*` variables. For the bwrap tests, it relaxes AppArmor's limit on unprivileged user namespaces. Locally, these tests skip with a message when a tool is missing. *Recommended.*
+1. CI installs fakeroot and bubblewrap and requires them through `INSTANCE_HANDOFF_REQUIRE_*` variables. For the bwrap tests, it relaxes AppArmor's limit on unprivileged user namespaces. Locally, these tests skip with a message when a tool is missing. *Recommended.* Slice 32 added a launch from a copy of the test binary made setgid to another of the user's groups, which needs no root, so `Excluded { SetId }` is tested end to end after all. The copy goes in the build folder, since `/tmp` may be mounted nosuid. CI requires it on Linux and macOS with `INSTANCE_HANDOFF_REQUIRE_SETGID`. Locally it skips with a message where the user has no other group or the file system ignores set-id bits, as under a build folder in a nosuid `/tmp`. *Our call (slice 32).*
 
 ## 9. Scope (slices 39 to 46)
 

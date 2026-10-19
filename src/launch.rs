@@ -297,9 +297,23 @@ fn ineligible_rights(
     }
 }
 
-pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
+/// Whether this process may take part at all: not where nothing can own
+/// ([`Reason::Unsupported`]), nor when it is excluded
+/// ([`Reason::Excluded`]). `start`, `hand_off`, `probe` and `exclusive` ask
+/// first, before they look for an owner or make anything.
+fn take_part() -> Result<(), Reason> {
     if !sys::SUPPORTED {
-        return Started::Alone(Reason::Unsupported {});
+        return Err(Reason::Unsupported {});
+    }
+    match sys::excluded() {
+        Some(why) => Err(Reason::Excluded { why }),
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
+    if let Err(reason) = take_part() {
+        return Started::Alone(reason);
     }
     let may_not_own = ineligible(
         b.app_id.kind(),
@@ -475,9 +489,7 @@ fn take_guard(state: &Path, shared: bool) -> Result<Option<sys::Guard>, Reason> 
 }
 
 pub(crate) fn exclusive(b: &Builder) -> Result<Exclusive, Reason> {
-    if !sys::SUPPORTED {
-        return Err(Reason::Unsupported {});
-    }
+    take_part()?;
     let may_not_own = ineligible_rights(b.elevated_owner, sys::raised(), sys::above_normal());
     exclusive_as(b, may_not_own)
 }
@@ -552,9 +564,7 @@ fn hand_off_at<T: Payload>(
     payload: Option<&T>,
     own: Option<Level>,
 ) -> Result<OwnerInfo, Reason> {
-    if !sys::SUPPORTED {
-        return Err(Reason::Unsupported {});
-    }
+    take_part()?;
     let state = b.canonical_state();
     let place = b.place(state.as_deref())?;
     let key = b.instance_key(state.as_deref());

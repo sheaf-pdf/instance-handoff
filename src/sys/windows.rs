@@ -322,6 +322,12 @@ pub(crate) fn above_normal() -> bool {
     false
 }
 
+/// Why this process may take no part, if it may not. Sandboxed tokens
+/// aren't read here yet, so no process is excluded.
+pub(crate) fn excluded() -> Option<crate::Excluded> {
+    None
+}
+
 /// This process's integrity level, or `None` when its token can't be
 /// read.
 pub(crate) fn level() -> Option<crate::Level> {
