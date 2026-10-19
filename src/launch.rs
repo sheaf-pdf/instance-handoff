@@ -11,7 +11,7 @@ use crate::outcome::Holding;
 use crate::wire::{self, Hello, Reply, refusal, serving, status};
 use crate::{
     Activation, AppId, Builder, Claim, ElevatedOwner, Exclusive, Guard, Ineligible, Kind, Level,
-    OwnerInfo, Payload, Reason, Rights, Started, sys,
+    OwnerInfo, Payload, Reason, Rights, Started, naming, sys,
 };
 
 /// Between attempts while the owner starts, is busy or quits.
@@ -566,10 +566,24 @@ fn hand_off_at<T: Payload>(
 ) -> Result<OwnerInfo, Reason> {
     take_part()?;
     let state = b.canonical_state();
-    let place = b.place(state.as_deref())?;
+    let place = match b.place(state.as_deref()) {
+        Ok(place) => place,
+        Err(Reason::NoSession {} | Reason::NoRuntimeDir {}) => {
+            return Err(no_folder(b, state.as_deref()));
+        }
+        Err(reason) => return Err(reason),
+    };
     let key = b.instance_key(state.as_deref());
-    let Some(folder) = sys::open_folder(&place, false)? else {
-        return Err(Reason::NoOwner {});
+    let folder = match sys::open_folder(&place, false)? {
+        Some(folder) => folder,
+        None => match no_folder(b, state.as_deref()) {
+            // An owner that made the folder since holds the guard too: look
+            // again, so this launch reaches it.
+            Reason::StateInUse { path } => {
+                sys::open_folder(&place, false)?.ok_or(Reason::StateInUse { path })?
+            }
+            reason => return Err(reason),
+        },
     };
     let request = payload.map(|p| encode_request(b, p)).transpose()?;
     let began = Instant::now();
@@ -613,6 +627,28 @@ fn hand_off_at<T: Payload>(
             }
         }
         pause(deadline);
+    }
+}
+
+/// What `hand_off` and `probe` report with no runtime folder to look in,
+/// where they can reach nobody. They look at the guard of the canonical
+/// `state` folder in the mode `start` would take it ([`take_state`]:
+/// shared for a keyed launch, and otherwise alone): [`Reason::StateInUse`]
+/// while another process holds it in a mode that conflicts, as an
+/// exclusive run or an owner in another runtime folder may, and otherwise
+/// [`Reason::NoOwner`]. So a keyed launch finds it in use beside an
+/// unkeyed owner or an exclusive run, but not beside keyed owners, which
+/// `start` would own beside. They look only where `start` would take it:
+/// not for no state folder, nor under [`Guard::Off`].
+fn no_folder(b: &Builder, state: Option<&Path>) -> Reason {
+    let Some(state) = state.filter(|_| b.guard == Guard::Local) else {
+        return Reason::NoOwner {};
+    };
+    let path = state.join(naming::GUARD_FILE);
+    match sys::guard_held(state, b.scope.is_some()) {
+        Ok(true) => Reason::StateInUse { path },
+        Ok(false) => Reason::NoOwner {},
+        Err(source) => Reason::Lock { path, source },
     }
 }
 
@@ -1632,6 +1668,48 @@ mod tests {
         owner.release();
         may_not_own(start_as(&b, &Args::default(), raised));
         own(start_as(&b, &Args::default(), None)).release();
+    }
+
+    // With no runtime folder to look in, a launch that may not own looks
+    // at the guard as hand_off does, in the mode start would take it: held
+    // so that it couldn't own, here by keyed owners for an unkeyed launch,
+    // or by an unkeyed one for a keyed launch, it runs alone with
+    // StateInUse, and otherwise with MayNotOwn. It makes nothing.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_launch_that_may_not_own_and_has_no_folder_looks_at_the_guard() {
+        use crate::Args;
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        let unkeyed =
+            Builder::new(AppId::headless("test.gate"), tmp.path().join("state")).dir(&run);
+        let keyed = unkeyed.clone().scope("a");
+        let state = unkeyed.canonical_state().unwrap();
+        let raised = Some(Ineligible::Raised);
+        let alone = |b: &Builder| match start_as(b, &Args::default(), raised) {
+            Started::Alone(Reason::StateInUse { path }) => {
+                assert_eq!(path, state.join(naming::GUARD_FILE));
+                "in use"
+            }
+            Started::Alone(Reason::MayNotOwn { why }) => {
+                assert_eq!(why, Ineligible::Raised);
+                "may not own"
+            }
+            other => panic!("expected StateInUse or MayNotOwn: {other:?}"),
+        };
+        make_state(&state).unwrap();
+        let guard = take_guard(&state, true).unwrap();
+        assert!(guard.is_some(), "a local folder locks");
+        assert_eq!(alone(&unkeyed), "in use");
+        assert_eq!(alone(&keyed), "may not own");
+        drop(guard);
+        let guard = take_guard(&state, false).unwrap();
+        assert_eq!(alone(&unkeyed), "in use");
+        assert_eq!(alone(&keyed), "in use");
+        drop(guard);
+        assert_eq!(alone(&unkeyed), "may not own");
+        assert_eq!(alone(&keyed), "may not own");
+        assert!(!run.exists());
     }
 
     // The owner this launch committed to died, and another process holds

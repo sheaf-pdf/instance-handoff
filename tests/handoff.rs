@@ -6,6 +6,7 @@
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -352,6 +353,7 @@ fn hand_off_and_probe_never_own_and_create_nothing() {
     let reason = builder(&dir).probe().unwrap_err();
     assert!(matches!(reason, Reason::NoOwner { .. }), "{reason}");
     assert!(!dir.path.exists());
+    assert!(!dir.tmp.path().join("state").exists());
 
     let (owner, rx) = serve(claim(builder(&dir).start(&Args::default())));
     let info = builder(&dir).probe().unwrap();
@@ -364,6 +366,103 @@ fn hand_off_and_probe_never_own_and_create_nothing() {
 
     let reason = builder(&dir).probe().unwrap_err();
     assert!(matches!(reason, Reason::NoOwner { .. }), "{reason}");
+}
+
+/// What `hand_off` and then `probe` from `b` failed with.
+fn looks(b: &Builder) -> [Reason; 2] {
+    [
+        b.hand_off(&args(&["x"])).unwrap_err(),
+        b.probe().unwrap_err(),
+    ]
+}
+
+// With no runtime folder to look in, hand_off and probe can reach nobody,
+// and look at the guard instead, as start would take it. Held so that
+// start couldn't own, the state folder is in use, and they are told so at
+// once: beside an owner without a scope in another runtime folder, or an
+// exclusive run, for launches with a scope and without, and beside keyed
+// owners for launches without one. Keyed launches would own beside keyed
+// owners, of their own scope or another, so nobody owns it for them. They
+// make nothing.
+#[test]
+fn without_a_runtime_folder_hand_off_and_probe_look_at_the_guard() {
+    let dir = dir();
+    let missing = dir.tmp.path().join("missing");
+    let unkeyed = builder(&dir).dir(&missing);
+    let keyed = unkeyed.clone().scope("a");
+    let nobody = |b: &Builder| {
+        for reason in looks(b) {
+            assert!(matches!(reason, Reason::NoOwner { .. }), "{reason}");
+        }
+    };
+    nobody(&unkeyed);
+    nobody(&keyed);
+
+    let (owner, rx) = serve(claim(builder(&dir).start(&Args::default())));
+    let t = Instant::now();
+    for reason in looks(&unkeyed).into_iter().chain(looks(&keyed)) {
+        in_use(reason, &guard_file(&dir));
+    }
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert!(rx.try_recv().is_err());
+    // Under Guard::Off, or with no state folder, there is no guard to look
+    // at.
+    nobody(&unkeyed.clone().guard(Guard::Off));
+    nobody(&Builder::new(APP, State::none()).dir(&missing));
+    owner.release();
+
+    let a = claim(builder(&dir).scope("a").start(&Args::default()));
+    let b = claim(builder(&dir).scope("b").start(&Args::default()));
+    for reason in looks(&unkeyed) {
+        in_use(reason, &guard_file(&dir));
+    }
+    nobody(&keyed);
+    nobody(&unkeyed.clone().scope("b"));
+    a.release();
+    b.release();
+    let held = builder(&dir).exclusive().unwrap();
+    for reason in looks(&unkeyed).into_iter().chain(looks(&keyed)) {
+        in_use(reason, &guard_file(&dir));
+    }
+    held.release();
+    nobody(&unkeyed);
+    nobody(&keyed);
+    assert!(!missing.exists());
+}
+
+// A launch with no runtime folder takes the guard for a moment to look at
+// it, and a start or an exclusive run that finds it held looks again for a
+// while, so a stream of such launches, with a scope and without, never
+// turns either away.
+#[test]
+fn launches_that_look_at_the_guard_never_turn_an_owner_away() {
+    let dir = dir();
+    let missing = dir.tmp.path().join("missing");
+    let unreached = builder(&dir).dir(&missing);
+    let keyed = unreached.clone().scope("a");
+    let done = Arc::new(AtomicBool::new(false));
+    let looking = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let mut looked = 0;
+            while !done.load(Ordering::Relaxed) {
+                let b = if looked % 2 == 0 { &unreached } else { &keyed };
+                match b.probe() {
+                    Err(Reason::NoOwner { .. } | Reason::StateInUse { .. }) => looked += 1,
+                    other => panic!("{other:?}"),
+                }
+            }
+            looked
+        })
+    };
+    for _ in 0..30 {
+        claim(builder(&dir).start(&Args::default())).release();
+        claim(builder(&dir).scope("a").start(&Args::default())).release();
+        builder(&dir).exclusive().unwrap().release();
+    }
+    done.store(true, Ordering::Relaxed);
+    assert!(looking.join().unwrap() > 0);
+    assert!(!missing.exists());
 }
 
 #[test]

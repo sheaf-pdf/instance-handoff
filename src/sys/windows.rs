@@ -60,7 +60,11 @@
 //! own, for this user and SYSTEM, and no label of its own: it still takes
 //! one that the folder above it hands down, and one above medium is then
 //! refused. No guard is taken on a share, which a mapped drive resolves
-//! to, or on a drive that Windows says is remote.
+//! to, or on a drive that Windows says is remote. A launch with no runtime
+//! folder to look in locks the guard's byte for a moment as `start` would,
+//! shared with a scope and alone without, and gives it back at once with
+//! `UnlockFileEx`, to see whether an owner or an exclusive run holds it in
+//! a mode that would keep `start` out.
 //!
 //! A launch that finds byte 0 held reads the owner's level from its marker
 //! before it connects. It tries its own level's byte with a shared lock.
@@ -1926,6 +1930,55 @@ fn open_guard(state: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Whether another handle holds the guard in the canonical `state` folder
+/// in a mode that conflicts with `shared` ([`take_guard`]'s modes), for a
+/// launch with no runtime folder to look in. It makes nothing: it opens the
+/// guard file if there is one, locks its byte in that mode without
+/// waiting, and gives it back at once. `false` when the folder or the file
+/// is missing, a path through a file, on a network volume ([`is_remote`]),
+/// or where the file system can't lock files, since no owner holds a guard
+/// there. Unlike [`take_guard`], it only looks, so it doesn't check the
+/// folder's label or whose the file is.
+pub(crate) fn guard_held(state: &Path, shared: bool) -> io::Result<bool> {
+    if is_remote(state) {
+        return Ok(false);
+    }
+    // Shares everything, so it stands in nobody's way while open. A folder
+    // in the file's place opens too, to be refused below.
+    let file = match OpenOptions::new()
+        .access_mode(GENERIC_READ)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(state.join(GUARD_FILE))
+    {
+        Ok(file) => file,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    let (attributes, link) = attributes(&file)?;
+    if link || attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+    }
+    match try_lock(&file, GUARD_BYTE, 1, !shared) {
+        Ok(true) => {
+            if let Err(e) = unlock(&file, GUARD_BYTE, 1) {
+                log::debug!("instance-handoff: giving back {GUARD_FILE}: {e}");
+            }
+            Ok(false)
+        }
+        Ok(false) => Ok(true),
+        Err(e) if locks_unsupported(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// The integrity level that the label of the state folder at `path` names,
 /// if it has a label. A folder on a volume that keeps no labels has none.
 /// The folder is opened as itself, as on Unix: a link or a junction at
@@ -3284,6 +3337,45 @@ mod tests {
         assert!(matches!(err, Reason::StateInUse { .. }), "{err}");
         drop(unkeyed);
         assert!(take_guard(state, true).unwrap().is_some());
+    }
+
+    // A launch with no runtime folder looks at the guard in the mode start
+    // would take it: alone, it finds the guard held in either mode, and
+    // shared, only held alone, since keyed owners hold it side by side.
+    // Looking makes nothing, and leaves the guard free. A missing folder, a
+    // path through a file, or a folder with no guard file, is free; a
+    // folder in the file's place is refused.
+    #[test]
+    fn a_launch_finds_the_guard_held_as_start_would() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let file = state.join(GUARD_FILE);
+        let through = tmp.path().join("file");
+        std::fs::write(&through, b"").unwrap();
+        for look in [false, true] {
+            assert!(!guard_held(&state, look).unwrap());
+            assert!(!guard_held(&through.join("state"), look).unwrap());
+        }
+        make_state_dir(&state).unwrap();
+        for look in [false, true] {
+            assert!(!guard_held(&state, look).unwrap());
+        }
+        assert!(!file.exists());
+        for (held, look) in [(false, false), (false, true), (true, false), (true, true)] {
+            let guard = take_guard(&state, held).unwrap().unwrap();
+            let found = guard_held(&state, look).unwrap();
+            assert_eq!(found, !(held && look), "{held} {look}");
+            drop(guard);
+            assert!(!guard_held(&state, look).unwrap(), "{held} {look}");
+        }
+        assert!(take_guard(&state, false).unwrap().is_some());
+
+        let folder = tmp.path().join("folder");
+        std::fs::create_dir_all(folder.join(GUARD_FILE)).unwrap();
+        for look in [false, true] {
+            let err = guard_held(&folder, look).unwrap_err();
+            assert!(err.to_string().contains("not a file"), "{err}");
+        }
     }
 
     // A launch at medium couldn't make or lock a guard in a folder labelled

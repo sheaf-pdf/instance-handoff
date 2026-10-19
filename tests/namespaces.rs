@@ -25,7 +25,9 @@ const DIR: &str = "INSTANCE_HANDOFF_TEST_DIR";
 /// `started` and how: `owner <pid> in <runtime folder>`, and then it
 /// serves, or how it handed off, or why it ran alone. When ROLE is
 /// `exclusive`, it is an exclusive run instead: it prints `exclusive` and
-/// `held`, releasing the state folder at once, or why it failed.
+/// `held`, releasing the state folder at once, or why it failed. When ROLE
+/// is `hand_off` or `probe`, it does that instead, and prints the role and
+/// `found` and the owner's process id, or `failed` and why.
 #[test]
 fn launch_process() {
     let Some(role) = std::env::var_os(ROLE) else {
@@ -43,6 +45,19 @@ fn launch_process() {
                 held.release();
             }
             Err(reason) => say(&format!("exclusive failed: {reason:?}")),
+        }
+        return;
+    }
+    if role == "hand_off" || role == "probe" {
+        let found = if role == "probe" {
+            builder.probe()
+        } else {
+            builder.hand_off(&Args::new(["launch"]))
+        };
+        let role = role.to_string_lossy();
+        match found {
+            Ok(info) => say(&format!("{role} found {:?}", info.pid())),
+            Err(reason) => say(&format!("{role} failed: {reason:?}")),
         }
         return;
     }
@@ -368,6 +383,56 @@ fn the_same_user_with_its_own_run_and_tmp_finds_the_state_in_use() {
     let run = run_folder(tmp.path(), "run");
     let launch = Launch::run(sandboxed(tmp.path(), &state, &run, Uid::User, true));
     assert_eq!(launch.started(), in_use(&state));
+    assert_eq!(host.took(Duration::from_millis(500)), None);
+}
+
+// A launch with no runtime folder: the user in a namespace whose /run
+// shows systemd but no /run/user/<uid>, as without a login session, or in
+// a snap without XDG_RUNTIME_DIR. Its start runs alone, but hand_off and
+// probe look at the state folder's guard: free, nobody owns the state;
+// held by the host's owner, it is in use.
+#[test]
+fn without_a_runtime_folder_hand_off_and_probe_look_at_the_guard() {
+    if !bwrap_works() {
+        return;
+    }
+    let (tmp, state) = setup();
+    let run = run_folder(tmp.path(), "run");
+    std::fs::create_dir_all(run.join("systemd").join("system")).unwrap();
+    let launch = |role: &str, snap: bool| {
+        let mut command = sandboxed(tmp.path(), &state, &run, Uid::User, false);
+        command.env(ROLE, role);
+        if snap {
+            command
+                .env("SNAP_INSTANCE_NAME", "test")
+                .env_remove("XDG_RUNTIME_DIR");
+        }
+        Launch::run(command)
+    };
+    let said = |role: &str, snap: bool| {
+        launch(role, snap)
+            .said(&format!("{role} "), Duration::from_secs(10))
+            .unwrap_or_else(|| panic!("{role} said nothing"))
+    };
+    let looks = [
+        ("hand_off", false),
+        ("probe", false),
+        ("hand_off", true),
+        ("probe", true),
+    ];
+    assert_eq!(launch("launch", false).started(), "alone: NoSession");
+    assert_eq!(launch("launch", true).started(), "alone: NoRuntimeDir");
+    for (role, snap) in looks {
+        assert_eq!(said(role, snap), "failed: NoOwner", "{role} {snap}");
+    }
+    assert!(!state.exists());
+
+    let host = Launch::run(on_host(&state, &tmp.path().join("host")));
+    host.owner();
+    let held = in_use(&state).replace("alone: ", "failed: ");
+    for (role, snap) in looks {
+        assert_eq!(said(role, snap), held, "{role} {snap}");
+    }
     assert_eq!(host.took(Duration::from_millis(500)), None);
 }
 

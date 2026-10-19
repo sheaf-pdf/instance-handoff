@@ -131,6 +131,10 @@ pub(crate) fn take_guard(_: &Path, _: bool) -> Result<Option<Guard>, Reason> {
     Ok(None)
 }
 
+pub(crate) fn guard_held(_: &Path, _: bool) -> io::Result<bool> {
+    Ok(false)
+}
+
 pub(crate) struct Conn(());
 
 impl Conn {

@@ -159,12 +159,12 @@ pub enum Guard {
 /// Which launches with raised rights may become the owner when nobody is:
 /// see [`Builder::elevated_owner`].
 ///
-/// A launch that may not own never takes the lock. It hands off to the
-/// owner if one is running, and otherwise runs alone at once with
-/// [`Reason::MayNotOwn`]. This only keeps launches from owning: it never
-/// lets one hand off where it otherwise couldn't. It also says who may
-/// hold the state with [`Builder::exclusive`], which otherwise fails at
-/// once with [`Reason::MayNotOwn`].
+/// A launch that may not own never takes the lock. It hands off as
+/// [`Builder::hand_off`] does, and where that finds no owner, it runs alone
+/// at once with [`Reason::MayNotOwn`]. This only keeps launches from
+/// owning: it never lets one hand off where it otherwise couldn't. It also
+/// says who may hold the state with [`Builder::exclusive`], which otherwise
+/// fails at once with [`Reason::MayNotOwn`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ElevatedOwner {
@@ -338,7 +338,9 @@ impl Builder {
 
     /// Whether the owner takes the state folder's guard: see [`Guard`].
     /// Defaults to [`Guard::Local`]. Only `start` and `exclusive` take the
-    /// guard, so `hand_off` and `probe` don't look at it.
+    /// guard. `hand_off` and `probe` look at it only under `Guard::Local`,
+    /// and only where they have no runtime folder to look in: see
+    /// [`Builder::hand_off`].
     pub fn guard(mut self, guard: Guard) -> Builder {
         self.guard = guard;
         self
@@ -468,8 +470,9 @@ impl Builder {
     }
 
     /// Take the lock, or hand `payload` to the process holding it. A
-    /// launch that may not own never takes the lock: with nobody to hand
-    /// off to, it runs alone with [`Reason::MayNotOwn`]. That is a
+    /// launch that may not own never takes the lock: it hands off as
+    /// [`Builder::hand_off`] does, and where that finds no owner, it runs
+    /// alone with [`Reason::MayNotOwn`]. That is a
     /// [windowed](crate::Kind::Windowed) app's launch that can't show
     /// windows, or one with raised rights ([`Builder::elevated_owner`]). A
     /// process that may take no part at all, as a setuid or setgid program
@@ -490,6 +493,18 @@ impl Builder {
     /// running, fail at once with [`Reason::NoOwner`]. For command-line
     /// front ends (`app --remote open x`, `appctl reload`) that only make
     /// sense against a running app. Creates no folder and no lock.
+    ///
+    /// Without a runtime folder to look in (on Linux without a login
+    /// session, say, or where no launch has made it yet), it can reach no
+    /// owner, and looks at the state folder's [guard](Guard) instead, as
+    /// `start` would take it: shared with a [scope](Builder::scope), and
+    /// alone without one. While another process holds it so that `start`
+    /// couldn't own, as an owner in another runtime folder or an exclusive
+    /// run may, it fails at once with [`Reason::StateInUse`], and otherwise
+    /// with [`Reason::NoOwner`]. So with a scope, owners with scopes, which
+    /// `start` would own beside, give `NoOwner`, while an owner without one
+    /// or an exclusive run gives `StateInUse`. It never fails with
+    /// [`Reason::NoSession`] or [`Reason::NoRuntimeDir`].
     pub fn hand_off<T: Payload>(&self, payload: &T) -> Result<OwnerInfo, Reason> {
         launch::hand_off(self, Some(payload))
     }
@@ -500,7 +515,10 @@ impl Builder {
     /// that wait for an owner to be ready.
     ///
     /// Fails as [`Builder::hand_off`] would: at once with
-    /// [`Reason::NoOwner`] when nobody holds the lock, with
+    /// [`Reason::NoOwner`] when nobody holds the lock, or, without a
+    /// runtime folder to look in, with [`Reason::StateInUse`] while another
+    /// process holds the state folder's [guard](Guard) so that `start`
+    /// couldn't own; with
     /// [`Reason::Declined`] for an owner that turns launches away, and with
     /// [`Reason::Busy`] or [`Reason::Unresponsive`] when the owner hasn't
     /// served (or has stopped) by the [timeout](Builder::timeout). An owner

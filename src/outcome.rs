@@ -493,15 +493,24 @@ pub enum Reason {
     /// user's runtime folder (`/run/user/<uid>`) doesn't exist. Launches
     /// from cron, `@reboot` or a system service land here. Run `loginctl
     /// enable-linger` to keep the folder for good, or see the crate docs on
-    /// daemons. Never returned to root, whose folder is fixed.
+    /// daemons. Never returned to root, whose folder is fixed, nor from
+    /// [`Builder::hand_off`] or [`Builder::probe`], which look at the state
+    /// folder's [guard](crate::Guard) instead.
+    ///
+    /// [`Builder::hand_off`]: crate::Builder::hand_off
+    /// [`Builder::probe`]: crate::Builder::probe
     #[non_exhaustive]
     NoSession {},
     /// There is no runtime folder to use (Windows without a Local AppData
     /// folder, macOS without a per-user temporary folder, Android without
     /// `TMPDIR`, a Flatpak or snap without `XDG_RUNTIME_DIR`), and
-    /// [`Builder::dir`] wasn't given.
+    /// [`Builder::dir`] wasn't given. Never returned from
+    /// [`Builder::hand_off`] or [`Builder::probe`], which look at the state
+    /// folder's [guard](crate::Guard) instead.
     ///
     /// [`Builder::dir`]: crate::Builder::dir
+    /// [`Builder::hand_off`]: crate::Builder::hand_off
+    /// [`Builder::probe`]: crate::Builder::probe
     #[non_exhaustive]
     NoRuntimeDir {},
     /// The runtime folder can't be created, or isn't safe: not the user's,
@@ -538,15 +547,25 @@ pub enum Reason {
     /// [scope](crate::Builder::scope) and the other hasn't: owners with
     /// scopes share the guard only with one another. This launch let go of
     /// its lock before anyone could connect. Only `start` and `exclusive`
-    /// take the guard.
+    /// hold the guard.
     ///
     /// From `exclusive`, it is any owner of the state folder, or another
     /// exclusive run, that holds the guard. Where `exclusive` takes no
     /// guard, it is an owner or another exclusive run that holds the lock
     /// in its runtime folder, on Windows at any integrity level.
     ///
+    /// From [`Builder::hand_off`] and [`Builder::probe`], which found no
+    /// runtime folder to look in, and from a `start` that may not own and
+    /// so looks as they do, it is an exclusive run, or an owner of the state
+    /// folder in another runtime folder, that holds the guard so that
+    /// `start` couldn't take it: any owner, for a launch without a scope,
+    /// and one without a scope, for a launch with one. They take the guard
+    /// for a moment to look, and give it back at once.
+    ///
     /// [`Builder::dir`]: crate::Builder::dir
     /// [`Builder::start`]: crate::Builder::start
+    /// [`Builder::hand_off`]: crate::Builder::hand_off
+    /// [`Builder::probe`]: crate::Builder::probe
     #[non_exhaustive]
     StateInUse {
         /// The guard file, or the lock file for an exclusive run that takes

@@ -171,8 +171,10 @@
 //!   alone with [`Reason::RuntimeDir`].
 //! - Other users on Linux with systemd: `/run/user/<uid>/<id>`, which
 //!   exists while the user has a session (or lingers). Without it,
-//!   launches run alone with [`Reason::NoSession`]; see "Daemons, services
-//!   and cron".
+//!   launches that may own run alone with [`Reason::NoSession`], and
+//!   [`Builder::hand_off`], [`Builder::probe`] and the other launches look
+//!   only at the state folder's [guard](Guard); see "Daemons, services and
+//!   cron".
 //! - Other users on Linux without systemd, the BSDs and illumos:
 //!   `/tmp/<id>-<uid>`, created private. If another user created it first,
 //!   launches run alone with [`Reason::RuntimeDir`]. (CI checks FreeBSD,
@@ -386,8 +388,10 @@
 //! [windowed](Kind::Windowed) app: an owner without a display couldn't
 //! open the windows its launches ask for. A launch that can't, as from
 //! `ssh`, cron or a system service, hands off to the owner if one is
-//! running, and otherwise runs alone at once, with [`Reason::MayNotOwn`],
-//! or with [`Reason::NoSession`] where it has no runtime folder to look in.
+//! running, and otherwise runs alone at once, with [`Reason::MayNotOwn`].
+//! Where it has no runtime folder to look in, it looks at the state
+//! folder's [guard](Guard) as [`Builder::hand_off`] does, and runs alone
+//! with [`Reason::StateInUse`] where `hand_off` would fail with it.
 //! On Linux, the BSDs and illumos a launch can show windows when
 //! `WAYLAND_DISPLAY` or `DISPLAY` is set and not empty, and on macOS when
 //! its login session has graphic access. On Windows it can unless it runs
@@ -437,7 +441,11 @@
 //!   `flock(LOCK_SH | LOCK_NB)` for an owner with a scope, held as the lock
 //!   is. On Windows, a `LockFileEx` lock on one byte of it, at 2^31
 //!   (0x80000000), exclusive, or shared for an owner with a scope, released
-//!   when the handle closes;
+//!   when the handle closes. A launch with no runtime folder to look in
+//!   takes it for a moment, in the mode an owner of its scope would, and
+//!   gives it back at once, with `LOCK_UN` or `UnlockFileEx`. So a launch
+//!   or an owner that would take it, and finds it held, looks again for
+//!   50 ms;
 //! - the address. On Unix, `instance.sock` beside the lock. When that path
 //!   is too long for a socket address, Linux reaches it through
 //!   `/proc/self/fd`; otherwise, and on other Unixes, it uses

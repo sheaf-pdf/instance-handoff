@@ -1450,6 +1450,65 @@ fn open_guard_in(dir: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
+/// Whether another process holds the guard in the canonical `state`
+/// folder in a mode that conflicts with `shared` ([`take_guard`]'s modes),
+/// for a launch with no runtime folder to look in. It makes nothing: it
+/// opens the guard file if there is one, takes an `flock` in that mode
+/// without waiting, and gives it back at once. `false` when the folder or
+/// the file is missing, a path through a file, on a network file system,
+/// or where the file system can't lock files, since no owner holds a guard
+/// there. Unlike [`take_guard`], it only looks, so it doesn't check whose
+/// the file is.
+pub(crate) fn guard_held(state: &Path, shared: bool) -> io::Result<bool> {
+    let dir = match open_dir(None, state, true) {
+        Ok(dir) => dir,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    if is_network(dir.as_fd()) {
+        return Ok(false);
+    }
+    let c = cstr(OsStr::new(naming::GUARD_FILE))?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // SAFETY: `c` is a valid C string and `dir` an open folder.
+    let fd = match cvt(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) }) {
+        // SAFETY: openat returned a new descriptor that nothing else owns.
+        Ok(fd) => unsafe { OwnedFd::from_raw_fd(fd) },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if fstat(fd.as_fd())?.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+    }
+    look_at_guard(fd.as_fd(), shared)
+}
+
+/// [`guard_held`] on the guard file open as `fd`: takes the guard in the
+/// mode `shared` names without waiting, and gives it back with `LOCK_UN`,
+/// not as `fd` closes, since a child forked meanwhile would keep a copy of
+/// it, and the lock with it.
+fn look_at_guard(fd: BorrowedFd<'_>, shared: bool) -> io::Result<bool> {
+    match flock_nb(fd, guard_op(shared)) {
+        Ok(true) => {
+            // SAFETY: flock on an open descriptor.
+            if let Err(e) = cvt(unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_UN) }) {
+                log::debug!("instance-handoff: giving back {}: {e}", naming::GUARD_FILE);
+            }
+            Ok(false)
+        }
+        Ok(false) => Ok(true),
+        Err(e) if locks_unsupported(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// The device and inode of what is at `path`, from the folder open as
 /// `at` or else from the working directory, without following a link
 /// there.
@@ -1474,9 +1533,10 @@ impl Guard {
     /// inode, and not a link. A guard file removed (its path names nothing)
     /// or replaced (it names another file) in that folder is opened, made
     /// if missing, and locked again in the same mode, unless another
-    /// process holds the new one in a mode that conflicts. Any other error
-    /// is [`GuardFound::Unknown`]: a second lock on the file held, were it
-    /// still in place, would conflict with this guard's own.
+    /// process still holds the new one in a mode that conflicts after
+    /// [`RELOCK_RETRY`]. Any other error is [`GuardFound::Unknown`]: a
+    /// second lock on the file held, were it still in place, would conflict
+    /// with this guard's own.
     fn look(&mut self) -> GuardFound {
         let held = |fd: &OwnedFd| fstat(fd.as_fd()).map(|st| stat_key(&st));
         match (lstat_key(None, &self.state), held(&self.dir)) {
@@ -1513,25 +1573,37 @@ impl Guard {
             Ok(_) => {}
             Err(e) => return GuardFound::Unknown(e),
         }
-        match flock_nb(file.as_fd(), guard_op(self.shared)) {
-            Ok(true) => {
-                // Closing the old file gives its lock up.
-                self.file = file;
-                GuardFound::Retaken
+        let until = Instant::now() + RELOCK_RETRY;
+        loop {
+            match flock_nb(file.as_fd(), guard_op(self.shared)) {
+                Ok(true) => {
+                    // Closing the old file gives its lock up.
+                    self.file = file;
+                    return GuardFound::Retaken;
+                }
+                Ok(false) if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(false) => return GuardFound::Lost,
+                Err(e) => return GuardFound::Unknown(e),
             }
-            Ok(false) => GuardFound::Lost,
-            Err(e) => GuardFound::Unknown(e),
         }
     }
 }
 
-/// Whether `e`, from `flock` on the guard file [`open_guard`] just opened,
-/// says that the file system can't lock it. `ENOTSUP` is `EOPNOTSUPP` on
-/// Linux and FreeBSD, and a number of its own elsewhere. `EBADF`, on a
-/// descriptor just opened, is NFS: its client emulates `flock` with POSIX
-/// locks on the server, and an exclusive one needs a descriptor open for
-/// writing (flock(2)), which the guard's isn't. A shared one needs only
-/// reading, so a keyed owner there holds the guard.
+/// An owner that locks a new guard file again ([`Guard::look`]) and finds
+/// it held looks again for this long, as `start` does, so a launch that
+/// takes the guard for a moment to look at it ([`guard_held`]) doesn't end
+/// the owner.
+const RELOCK_RETRY: Duration = Duration::from_millis(50);
+
+/// Whether `e`, from `flock` on the guard file [`open_guard`] or
+/// [`guard_held`] just opened, says that the file system can't lock it.
+/// `ENOTSUP` is `EOPNOTSUPP` on Linux and FreeBSD, and a number of its own
+/// elsewhere. `EBADF`, on a descriptor just opened, is NFS: its client
+/// emulates `flock` with POSIX locks on the server, and an exclusive one
+/// needs a descriptor open for writing (flock(2)), which the guard's isn't.
+/// A shared one needs only reading, so a keyed owner there holds the guard.
 fn locks_unsupported(e: &io::Error) -> bool {
     e.raw_os_error().is_some_and(|code| {
         [libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOTSUP, libc::EBADF].contains(&code)
@@ -2825,6 +2897,52 @@ mod tests {
         assert!(take_guard(state, true).unwrap().is_some());
     }
 
+    // A launch with no runtime folder looks at the guard in the mode start
+    // would take it: alone, it finds the guard held in either mode, and
+    // shared, only held alone, since keyed owners hold it side by side.
+    // Looking makes nothing, and leaves the guard free. A missing folder, a
+    // path through a file, or a folder with no guard file, is free.
+    #[test]
+    fn a_launch_finds_the_guard_held_as_start_would() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let file = state.join(".instance-handoff.lock");
+        let through = tmp.path().join("file");
+        std::fs::write(&through, b"").unwrap();
+        for look in [false, true] {
+            assert!(!guard_held(&state, look).unwrap());
+            assert!(!guard_held(&through.join("state"), look).unwrap());
+        }
+        make_state_dir(&state).unwrap();
+        for look in [false, true] {
+            assert!(!guard_held(&state, look).unwrap());
+        }
+        assert!(!file.exists());
+        for (held, look) in [(false, false), (false, true), (true, false), (true, true)] {
+            let guard = take_guard(&state, held).unwrap().unwrap();
+            let found = guard_held(&state, look).unwrap();
+            assert_eq!(found, !(held && look), "{held} {look}");
+            drop(guard);
+            assert!(!guard_held(&state, look).unwrap(), "{held} {look}");
+        }
+        assert!(take_guard(&state, false).unwrap().is_some());
+    }
+
+    // The look gives the guard back with LOCK_UN, not as its descriptor
+    // closes: kept open here, as a copy that a child forked meanwhile would
+    // keep, it holds no lock after.
+    #[test]
+    fn a_look_gives_the_guard_back_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        drop(take_guard(state, false).unwrap().unwrap());
+        let file = std::fs::File::open(state.join(".instance-handoff.lock")).unwrap();
+        for shared in [false, true] {
+            assert!(!look_at_guard(file.as_fd(), shared).unwrap(), "{shared}");
+            assert!(take_guard(state, false).unwrap().is_some(), "{shared}");
+        }
+    }
+
     /// What the owner's upkeep finds at `guard`'s paths, by name.
     fn look(guard: &mut Guard) -> &'static str {
         match guard.look() {
@@ -2867,6 +2985,29 @@ mod tests {
         let err = take_guard(&state, false).unwrap_err();
         assert!(matches!(err, Reason::StateInUse { .. }), "{err}");
         drop((a, b));
+    }
+
+    // A launch with no runtime folder that looks at the new guard file
+    // holds it for a moment: the owner looks again for a while, and locks
+    // it once the launch gives it back, rather than end.
+    #[test]
+    fn a_new_guard_file_a_launch_looks_at_is_locked_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        let file = state.join(".instance-handoff.lock");
+        for ours in [false, true] {
+            let mut guard = take_guard(state, ours).unwrap().unwrap();
+            std::fs::remove_file(&file).unwrap();
+            let looking = std::fs::File::create(&file).unwrap();
+            assert!(flock_nb(looking.as_fd(), libc::LOCK_EX).unwrap());
+            let gives_back = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                drop(looking);
+            });
+            assert_eq!(look(&mut guard), "retaken", "{ours}");
+            gives_back.join().unwrap();
+            drop(guard);
+        }
     }
 
     // Another owner that locks the new guard file first, in a mode that
@@ -2933,7 +3074,8 @@ mod tests {
     }
 
     // Opened without blocking, a FIFO in the guard's place is refused at
-    // once rather than waited on.
+    // once rather than waited on, by an owner and by a launch that only
+    // looks.
     #[test]
     fn a_guard_that_isnt_a_file_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2945,6 +3087,10 @@ mod tests {
             matches!(err, Reason::Lock { .. }) && err.to_string().contains("not a file"),
             "{err}"
         );
+        for shared in [false, true] {
+            let err = guard_held(tmp.path(), shared).unwrap_err();
+            assert!(err.to_string().contains("not a file"), "{err}");
+        }
     }
 
     // A state folder that exists keeps its mode, and whatever is at the
