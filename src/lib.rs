@@ -132,16 +132,24 @@
 //!
 //! - Linux in a Flatpak sandbox: `$XDG_RUNTIME_DIR/app/$FLATPAK_ID/<id>`;
 //!   in a snap: `$XDG_RUNTIME_DIR/<id>`.
-//! - Linux with systemd: `/run/user/<uid>/<id>`, which exists while the
-//!   user has a session (or lingers). Without it, launches run alone with
-//!   [`Reason::NoSession`]; see "Daemons, services and cron".
-//! - Linux without systemd, and the BSDs and illumos: `/tmp/<id>-<uid>`,
-//!   created private. If another user created it first, launches run alone
-//!   with [`Reason::RuntimeDir`]. (CI checks FreeBSD, NetBSD and illumos;
-//!   OpenBSD and DragonFly share their code but aren't checked.)
+//! - Root: `/run/instance-handoff/<id>` on Linux (outside those sandboxes),
+//!   and `/var/run/instance-handoff/<id>` on the BSDs and illumos, whether
+//!   or not root is logged in. The crate creates `instance-handoff` for
+//!   root alone when it is missing, but not `/run` or `/var/run`. It must
+//!   be a real folder, root's, and writable by nobody else, or launches run
+//!   alone with [`Reason::RuntimeDir`].
+//! - Other users on Linux with systemd: `/run/user/<uid>/<id>`, which
+//!   exists while the user has a session (or lingers). Without it,
+//!   launches run alone with [`Reason::NoSession`]; see "Daemons, services
+//!   and cron".
+//! - Other users on Linux without systemd, the BSDs and illumos:
+//!   `/tmp/<id>-<uid>`, created private. If another user created it first,
+//!   launches run alone with [`Reason::RuntimeDir`]. (CI checks FreeBSD,
+//!   NetBSD and illumos; OpenBSD and DragonFly share their code but aren't
+//!   checked.)
 //! - macOS: `<id>` in the per-user temporary folder
-//!   (`confstr(_CS_DARWIN_USER_TEMP_DIR)`, not `$TMPDIR`), the same for GUI
-//!   apps, agents, ssh and cron.
+//!   (`confstr(_CS_DARWIN_USER_TEMP_DIR)` with its links resolved, not
+//!   `$TMPDIR`), the same for GUI apps, agents, ssh and cron.
 //! - Windows: `<id>\run` in the Local AppData known folder, and
 //!   `<id>\run-high` for a process run as administrator; see
 //!   [Privileges](#privileges).
@@ -173,11 +181,10 @@
 //!   library, so `fakeroot` doesn't change them: a launch under `fakeroot`
 //!   is still its user's, and hands off to that user's owner. Root (`sudo`,
 //!   `su`, `doas`, `pkexec`) is another user, with its own folder and
-//!   owner, and so is the user a setuid program runs as. On Linux with
-//!   systemd, root has `/run/user/0` only while it is logged in somewhere
-//!   (a console, SSH): root's launches then meet one owner, like any
-//!   user's, and launches under `sudo` meet that owner too. Otherwise
-//!   launches under `sudo` run alone with [`Reason::NoSession`].
+//!   owner, and so is the user a setuid program runs as. On Linux, the BSDs
+//!   and illumos, root's folder is fixed, so root's own launches and
+//!   launches under `sudo` meet one owner, whether or not root is logged in
+//!   anywhere.
 //! - Windows: the level is the user and the integrity level. A launch run
 //!   as administrator (high) uses `<id>\run-high` and an owner of its own,
 //!   and never reaches the normal (medium) owner; nor does a normal launch
@@ -200,8 +207,13 @@
 //!
 //! # Daemons, services and cron
 //!
-//! A launch on Linux finds the owner only if both see the same folder. For
-//! a long-running owner that starts outside a login session:
+//! A launch on Linux finds the owner only if both see the same folder.
+//! Root's folder is fixed, so a service that runs as root meets root's
+//! launches as it is, unless its unit makes `/run` read-only, as
+//! `ProtectSystem=strict` does; then give it
+//! `RuntimeDirectory=instance-handoff`.
+//! For a long-running owner of another user that starts
+//! outside a login session:
 //!
 //! 1. Prefer a systemd user unit plus `loginctl enable-linger`, which keeps
 //!    `/run/user/<uid>` for good, so interactive launches and the service
@@ -222,10 +234,10 @@
 //!   `/run/user/<uid>` (toolbox does) meets the host's owner, which is
 //!   usually what you want, since it shares `$HOME`. But paths outside the
 //!   shared mounts may name other files there. A container without systemd
-//!   uses its own `/tmp`, and so runs its own owner: if it must meet the
-//!   host's, pass the bind-mounted folder to [`Builder::dir`] in both. Use
-//!   [`Builder::scope`] with the container's name for one owner per
-//!   container.
+//!   uses its own `/tmp`, and root in a container usually its own `/run`,
+//!   so each runs its own owner: if it must meet the host's, pass the
+//!   bind-mounted folder to [`Builder::dir`] in both. Use [`Builder::scope`]
+//!   with the container's name for one owner per container.
 //! - Windows: mapped drives and `SUBST` letters belong to one logon
 //!   session, and every logon session of a user at one integrity level (a
 //!   second RDP session, an OpenSSH login, a scheduled task) reaches the
@@ -255,10 +267,13 @@
 //!   inherited across `fork`, and released when the last copy closes;
 //! - the address. On Unix, `instance.sock` beside the lock. When that path
 //!   is too long for a socket address, Linux reaches it through
-//!   `/proc/self/fd`; other Unixes use `<base>/<hash>.sock`, where the base
-//!   is the per-user temporary folder on macOS and `/tmp/ih-<uid>`
-//!   elsewhere, and the hash is 16 hex digits of the FNV-1a 64 hash of the
-//!   folder's device and inode (each a little-endian u64). On Windows, a
+//!   `/proc/self/fd`; otherwise, and on other Unixes, it uses
+//!   `<base>/<hash>.sock`, where the base is the per-user temporary folder
+//!   on macOS, root's own folder (`/run/instance-handoff` on Linux,
+//!   `/var/run/instance-handoff` on the BSDs and illumos) for root, and
+//!   `/tmp/ih-<uid>` elsewhere, and
+//!   the hash is 16 hex digits of the FNV-1a 64 hash of the folder's device
+//!   and inode (each a little-endian u64). On Windows, a
 //!   named pipe `\\.\pipe\instance-handoff.<id>.<secret>`, where the
 //!   secret is 32 random lowercase hex digits, published as
 //!   `<id> <secret>` and a newline in `instance.pipe` beside the lock;

@@ -263,9 +263,9 @@ pub enum Reason {
     },
     /// On Linux with systemd: this process has no login session, so the
     /// user's runtime folder (`/run/user/<uid>`) doesn't exist. Launches
-    /// from cron, `@reboot`, `su`, `sudo` or a system service land here. Run
-    /// `loginctl enable-linger` to keep the folder for good, or see the
-    /// crate docs on daemons.
+    /// from cron, `@reboot` or a system service land here. Run `loginctl
+    /// enable-linger` to keep the folder for good, or see the crate docs on
+    /// daemons. Never returned to root, whose folder is fixed.
     #[non_exhaustive]
     NoSession {},
     /// There is no runtime folder to use (Windows without a Local AppData

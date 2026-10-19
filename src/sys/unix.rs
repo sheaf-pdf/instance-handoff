@@ -86,6 +86,9 @@ pub(crate) enum Base {
     /// [`Builder::dir`](crate::Builder::dir): created when missing, and
     /// must be private.
     Create,
+    /// Root's own base: created when missing, though never its parent, and
+    /// must be a real folder, root's, and writable by nobody else.
+    System,
 }
 
 /// A runtime folder: a base, and the subfolders this crate makes in it.
@@ -158,6 +161,16 @@ pub(crate) fn linux_rule(env: &LinuxEnv, id: &AppId) -> Result<Place, Reason> {
             .ok_or(Reason::NoRuntimeDir {})?;
         return Ok(trusted(xdg.clone()));
     }
+    // Root has one folder, whether or not it is logged in, so every root
+    // launch meets one owner. /run/user/0 exists only while root has a
+    // session somewhere.
+    if env.euid == 0 {
+        return Ok(Place {
+            base: naming::ROOT_BASE_RUN.into(),
+            kind: Base::System,
+            subs: vec![id.as_str().into()],
+        });
+    }
     if env.systemd {
         return env
             .run_user
@@ -218,14 +231,33 @@ pub(crate) fn default_place(id: &AppId) -> Result<Place, Reason> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
+        let uid = euid();
+        if uid == 0 {
+            return Ok(Place {
+                base: naming::ROOT_BASE_VAR_RUN.into(),
+                kind: Base::System,
+                subs: vec![id.as_str().into()],
+            });
+        }
         Ok(Place {
             base: "/tmp".into(),
             kind: Base::Shared,
-            subs: vec![format!("{id}-{}", euid()).into()],
+            subs: vec![format!("{id}-{uid}").into()],
         })
     }
 }
 
+/// Root's own base, where it has one: on Linux, the BSDs and illumos.
+const ROOT_BASE: Option<&str> = if cfg!(target_os = "linux") {
+    Some(naming::ROOT_BASE_RUN)
+} else if cfg!(any(target_os = "android", target_os = "macos")) {
+    None
+} else {
+    Some(naming::ROOT_BASE_VAR_RUN)
+};
+
+/// The per-user temporary folder, with its links resolved: the path
+/// `confstr` gives goes through `/var`, a link to `/private/var`.
 #[cfg(target_os = "macos")]
 fn darwin_temp_dir() -> Option<PathBuf> {
     let mut buf = vec![0u8; libc::PATH_MAX as usize];
@@ -241,7 +273,7 @@ fn darwin_temp_dir() -> Option<PathBuf> {
         return None;
     }
     buf.truncate(n - 1);
-    Some(PathBuf::from(OsString::from_vec(buf)))
+    std::fs::canonicalize(OsString::from_vec(buf)).ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -365,6 +397,27 @@ fn check_private(fd: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
+/// Makes one folder, private, unless something is there already. Its
+/// parent must exist.
+fn make_dir(path: &Path) -> io::Result<()> {
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Opens root's base, creating it when `create` is set. Only root uses it,
+/// so the user it must belong to is root.
+fn open_system(path: &Path, create: bool) -> io::Result<OwnedFd> {
+    if create {
+        make_dir(path)?;
+    }
+    let fd = open_dir(None, path, true)?;
+    check_trusted(fd.as_fd())?;
+    Ok(fd)
+}
+
 /// Opens the runtime folder, creating it when `create` is set. `None` when
 /// it doesn't exist and `create` isn't set: nobody owns the app.
 pub(crate) fn open_folder(place: &Place, create: bool) -> Result<Option<Folder>, Reason> {
@@ -382,8 +435,12 @@ pub(crate) fn open_folder(place: &Place, create: bool) -> Result<Option<Folder>,
             open_dir(None, &path, true).and_then(|fd| check_private(fd.as_fd()).map(|()| fd))
         }
         Base::Trusted => {
-            open_dir(None, &path, false).and_then(|fd| check_trusted(fd.as_fd()).map(|()| fd))
+            // On macOS the base's links were resolved, so a link there now
+            // is a swap.
+            let nofollow = cfg!(target_os = "macos");
+            open_dir(None, &path, nofollow).and_then(|fd| check_trusted(fd.as_fd()).map(|()| fd))
         }
+        Base::System => open_system(&path, create),
         Base::Shared => open_dir(None, &path, false),
     };
     let mut fd = match opened {
@@ -659,21 +716,23 @@ fn fits(path: &Path) -> bool {
     path.as_os_str().len() < sun_path_len()
 }
 
-/// A short private folder for sockets whose folder's path is too long:
-/// the per-user temporary folder on macOS, `/tmp/ih-<uid>` elsewhere. Only
-/// an owner binding its socket creates it.
+/// A short folder for sockets whose folder's path is too long: the
+/// per-user temporary folder on macOS, root's own base for root where it
+/// has one, and the private `/tmp/ih-<uid>` elsewhere. Only an owner
+/// binding its socket creates it.
 fn short_base(create: bool) -> io::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     if let Some(dir) = darwin_temp_dir() {
         return Ok(dir);
     }
-    let base = PathBuf::from(format!("/tmp/ih-{}", euid()));
+    let uid = euid();
+    if let Some(root) = ROOT_BASE.filter(|_| uid == 0) {
+        open_system(Path::new(root), create)?;
+        return Ok(root.into());
+    }
+    let base = PathBuf::from(format!("/tmp/ih-{uid}"));
     if create {
-        match std::fs::DirBuilder::new().mode(0o700).create(&base) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
-        }
+        make_dir(&base)?;
     }
     let fd = open_dir(None, &base, true)?;
     check_private(fd.as_fd())?;
@@ -1517,18 +1576,41 @@ mod tests {
             ))
         );
 
-        // sudo -E keeps the user's XDG_RUNTIME_DIR; it's never looked at.
-        let sudo = LinuxEnv {
-            xdg_runtime_dir: Some("/run/user/1000".into()),
-            run_user: Some("/run/user/0".into()),
+        // Outside a snap or Flatpak, root has one folder, logged in or not,
+        // whatever its environment says: sudo -E keeps the user's
+        // XDG_RUNTIME_DIR, and a stale one names a folder that is gone.
+        let root = LinuxEnv {
             systemd: true,
             euid: 0,
             ..env()
         };
-        assert_eq!(
-            base(linux_rule(&sudo, &ID)).unwrap().0,
-            PathBuf::from("/run/user/0")
-        );
+        let sudo = LinuxEnv {
+            xdg_runtime_dir: Some("/run/user/1000".into()),
+            ..root.clone()
+        };
+        let stale = LinuxEnv {
+            xdg_runtime_dir: Some("/run/user/0".into()),
+            ..root.clone()
+        };
+        let logged_in = LinuxEnv {
+            run_user: Some("/run/user/0".into()),
+            ..stale.clone()
+        };
+        let without_systemd = LinuxEnv {
+            systemd: false,
+            ..root.clone()
+        };
+        for launch in [root, sudo, stale, logged_in, without_systemd] {
+            assert_eq!(
+                base(linux_rule(&launch, &ID)),
+                Ok((
+                    "/run/instance-handoff".into(),
+                    Base::System,
+                    vec!["app.test".into()]
+                )),
+                "{launch:?}"
+            );
+        }
 
         // cron, @reboot, a system service: no session, no folder, no
         // fallback.
@@ -1586,6 +1668,69 @@ mod tests {
             base(linux_rule(&snap, &ID)).unwrap().0,
             PathBuf::from("/run/user/1000/snap.app")
         );
+
+        // The sandboxes set the runtime folder, for root too.
+        let root_snap = LinuxEnv {
+            xdg_runtime_dir: Some("/run/user/0/snap.app".into()),
+            euid: 0,
+            ..snap
+        };
+        assert_eq!(
+            base(linux_rule(&root_snap, &ID)).unwrap().0,
+            PathBuf::from("/run/user/0/snap.app")
+        );
+    }
+
+    // Root's base: made only where its parent exists, and refused when it
+    // is a link or others can write to it. Any user can run this, since the
+    // owner it must have is this process's user.
+    #[test]
+    fn the_root_base_is_made_and_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let set_mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let system = |base: PathBuf| Place {
+            base,
+            kind: Base::System,
+            subs: vec!["app.test".into()],
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let err = open_folder(&system(tmp.path().join("no").join("base")), true).unwrap_err();
+        assert!(matches!(err, Reason::RuntimeDir { .. }), "{err}");
+
+        let base = tmp.path().join("base");
+        assert!(open_folder(&system(base.clone()), false).unwrap().is_none());
+        assert!(open_folder(&system(base.clone()), true).unwrap().is_some());
+        let mode = std::fs::metadata(&base).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        // Others may read it, but not write to it.
+        set_mode(&base, 0o755);
+        assert!(open_folder(&system(base.clone()), true).unwrap().is_some());
+        for mode in [0o775, 0o757] {
+            set_mode(&base, mode);
+            let err = open_folder(&system(base.clone()), true).unwrap_err();
+            assert!(matches!(err, Reason::RuntimeDir { .. }), "{mode:o}: {err}");
+        }
+
+        set_mode(&base, 0o700);
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        let err = open_folder(&system(link), true).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_base_is_resolved() {
+        let place = default_place(&ID).unwrap();
+        assert_eq!(std::fs::canonicalize(&place.base).unwrap(), place.base);
+        let base = Place {
+            subs: Vec::new(),
+            ..place
+        };
+        assert!(open_folder(&base, false).unwrap().is_some());
     }
 
     // Outside fakeroot, the system calls and the C library agree.

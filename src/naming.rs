@@ -74,6 +74,15 @@ pub(crate) fn scope_folder(scope: &OsStr) -> String {
     hex16(fnv1a64(&os_key(scope)))
 }
 
+/// Root's base on Linux: the same for every root launch, whether or not
+/// root is logged in.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) const ROOT_BASE_RUN: &str = "/run/instance-handoff";
+
+/// Root's base on the BSDs and illumos.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) const ROOT_BASE_VAR_RUN: &str = "/var/run/instance-handoff";
+
 /// The Windows runtime folder for an integrity level, the last RID of its
 /// mandatory label: `run` at medium, the normal level, and one of its own
 /// at every other, so that each level has its own owner.
@@ -119,6 +128,12 @@ mod tests {
         assert_eq!(level_folder(0x4000), "run-system");
         assert_eq!(level_folder(0x1000), "run-low");
         assert_eq!(level_folder(0x2100), "run-2100");
+    }
+
+    #[test]
+    fn root_bases_are_frozen() {
+        assert_eq!(ROOT_BASE_RUN, "/run/instance-handoff");
+        assert_eq!(ROOT_BASE_VAR_RUN, "/var/run/instance-handoff");
     }
 
     #[test]
