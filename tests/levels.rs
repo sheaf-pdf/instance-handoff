@@ -27,8 +27,9 @@ use std::time::Duration;
 
 use instance_handoff::{AppId, Args, Builder, Claim, Reason, Started};
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
+    ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_NO_SUCH_LOGON_SESSION, GENERIC_READ,
+    GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
+    SetHandleInformation, SetLastError,
 };
 use windows_sys::Win32::Security::AppLocker::{
     SAFER_LEVEL_OPEN, SAFER_LEVELID_NORMALUSER, SAFER_SCOPEID_USER, SaferCloseLevel,
@@ -40,26 +41,33 @@ use windows_sys::Win32::Security::Authorization::{
     SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    CheckTokenMembership, CreateWellKnownSid, GetLengthSid, GetSidSubAuthority,
-    GetSidSubAuthorityCount, GetTokenInformation, LABEL_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE,
-    SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL,
-    TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenOwner, TokenUser,
+    CheckTokenMembership, CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetLengthSid,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsTokenRestricted,
+    LABEL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID,
+    SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SetTokenInformation,
+    TOKEN_ELEVATION_TYPE, TOKEN_INFORMATION_CLASS, TOKEN_LINKED_TOKEN, TOKEN_MANDATORY_LABEL,
+    TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenElevationType, TokenElevationTypeDefault,
+    TokenElevationTypeFull, TokenElevationTypeLimited, TokenIntegrityLevel, TokenIsAppContainer,
+    TokenLinkedToken, TokenOwner, TokenRestrictedSids, TokenSessionId, TokenUser,
     WinBuiltinAdministratorsSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-    LockFileEx, READ_CONTROL,
+    LockFileEx, READ_CONTROL, UnlockFileEx,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::StationsAndDesktops::{
+    GetProcessWindowStation, GetUserObjectInformationW, UOI_FLAGS, UOI_NAME, USEROBJECTFLAGS,
+};
 use windows_sys::Win32::System::SystemServices::SE_GROUP_INTEGRITY;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
     OpenProcessToken, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW,
     TerminateProcess, WaitForSingleObject,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::WSF_VISIBLE;
 
 const APP: AppId = AppId::new("test.levels");
 /// Which `child_*` test a child runs as.
@@ -89,6 +97,10 @@ const FOLDERS: [(&str, Option<&str>); 2] = [
     ("folder-no-label", None),
     ("folder-high-label-nr", Some("S:(ML;;NWNR;;;HI)")),
 ];
+/// The labels of the level folders in a key folder, as 0015 lays one out:
+/// protected, so that they don't also inherit the key folder's.
+const RUN: &str = "S:P(ML;OICI;NWNR;;;ME)";
+const RUN_HIGH: &str = "S:P(ML;OICI;NWNR;;;HI)";
 
 // ---------------------------------------------------------------------------
 // The tests
@@ -202,7 +214,8 @@ fn a_folder_made_at_one_level_is_refused_at_the_other() {
 
 /// What a medium process may do with files, folders and locks a high one
 /// made, and the reverse: the facts a lock shared across levels (0015)
-/// would rest on.
+/// would rest on. Each level also reports its token, session and window
+/// station, and tries 0015's layout as the other level made it.
 #[test]
 #[ignore = "a probe that reports rather than checks: `just levels` runs it"]
 fn what_each_level_may_do_with_the_others_files() {
@@ -211,20 +224,23 @@ fn what_each_level_may_do_with_the_others_files() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    let mut facts = vec![("high: token".to_owned(), token_facts())];
+    let mut facts: Vec<(String, String)> = token_facts()
+        .into_iter()
+        .map(|(name, value)| (format!("high: {name}"), value))
+        .collect();
 
     for (name, sddl) in FILES {
         let made = create(&dir.join(name), sddl, false).map(drop);
         facts.push((
             format!("{name}: made by high"),
-            made_as(&dir.join(name), &made),
+            made_as(&dir.join(name), &made, security),
         ));
     }
     for (name, sddl) in FOLDERS {
         let made = create(&dir.join(name), sddl, true).map(drop);
         facts.push((
             format!("{name}: made by high"),
-            made_as(&dir.join(name), &made),
+            made_as(&dir.join(name), &made, security),
         ));
     }
     // A lock file as 0015 proposes: labelled medium, with high holding the
@@ -232,23 +248,26 @@ fn what_each_level_may_do_with_the_others_files() {
     let guard = create(&dir.join("guard"), Some("S:(ML;;NW;;;ME)"), false)
         .unwrap()
         .unwrap();
-    lock(&guard, GUARD, true).unwrap();
-    lock(&guard, u64::from(HIGH), true).unwrap();
+    lock(&guard, GUARD, 1, true).unwrap();
+    lock(&guard, u64::from(HIGH), 1, true).unwrap();
     facts.push(("guard: made by high".into(), security(&dir.join("guard"))));
+    // 0015's layout, owned by high: the key folder and instance.lock, with
+    // high's own folder in it.
+    let key = dir.join("key-by-high");
+    let _owned = make_key(&key, "high", HIGH, &mut facts);
+    make_level_folder(&key, "run-high", RUN_HIGH, "high", &mut facts);
 
     let mut child = medium("child_probe", &[(DIR, dir.as_os_str())]);
     let lines = child.finish();
     if !lines.iter().any(|l| l == "done") {
         panic!("the medium probe didn't finish:\n{}", lines.join("\n"));
     }
-    facts.extend(lines.iter().filter_map(|l| {
-        let (name, value) = l.strip_prefix("fact ")?.split_once(" = ")?;
-        Some((name.to_owned(), value.to_owned()))
-    }));
+    facts.extend(parse_facts(&lines));
 
-    // The reverse: medium holds a lock file it made, and high tries it.
+    // The reverse: medium holds a lock file and a layout it made, and high
+    // tries them.
     let mut holder = medium("child_holder", &[(DIR, dir.as_os_str())]);
-    holder.expect("ready");
+    let reported = holder.until("ready");
     let held = dir.join("made-by-medium");
     facts.push(("made-by-medium: made by medium".into(), security(&held)));
     let file = OpenOptions::new().read(true).write(true).open(&held);
@@ -260,10 +279,16 @@ fn what_each_level_may_do_with_the_others_files() {
             ("shared lock on high's byte", u64::from(HIGH), false),
         ];
         for (what, offset, exclusive) in probes {
-            let got = result(&lock(file, offset, exclusive));
+            let got = result(&lock(file, offset, 1, exclusive));
             facts.push((format!("made-by-medium: high's {what}"), got));
         }
     }
+    // The layout medium owns: high finds the owner's level, and makes its
+    // own folder in the key folder.
+    facts.extend(parse_facts(&reported));
+    let key = dir.join("key-by-medium");
+    try_key(&key, "high", &mut facts);
+    make_level_folder(&key, "run-high", RUN_HIGH, "high", &mut facts);
     holder.finish();
 
     let width = facts.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -313,14 +338,16 @@ fn child_launch() {
     }
 }
 
-/// Tries what high made in the probe's folder.
+/// Reports its token, and tries what high made in the probe's folder.
 #[test]
 fn child_probe() {
     if !is_role("child_probe") {
         return;
     }
     let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
-    fact("medium: token", token_facts());
+    for (name, value) in token_facts() {
+        fact(&format!("medium: {name}"), value);
+    }
     for name in FILES.map(|(name, _)| name).into_iter().chain(["guard"]) {
         let path = dir.join(name);
         let read = OpenOptions::new().read(true).open(&path);
@@ -339,13 +366,13 @@ fn child_probe() {
             for (what, offset, exclusive) in probes {
                 fact(
                     &format!("guard: medium's {what}"),
-                    result(&lock(file, offset, exclusive)),
+                    result(&lock(file, offset, 1, exclusive)),
                 );
             }
         } else {
             fact(
                 &format!("{name}: medium's exclusive lock"),
-                result(&lock(file, 0, true)),
+                result(&lock(file, 0, 1, true)),
             );
         }
     }
@@ -359,11 +386,32 @@ fn child_probe() {
             result(&made),
         );
     }
+
+    // The layout high owns: medium opens the key folder, makes its own
+    // folder in it, tries the lock as a launch would, and tries to list
+    // high's folder.
+    let key = dir.join("key-by-high");
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&key);
+    let mut facts = vec![("key-by-high: medium opens it".to_owned(), result(&opened))];
+    make_level_folder(&key, "run", RUN, "medium", &mut facts);
+    try_key(&key, "medium", &mut facts);
+    let listed = std::fs::read_dir(key.join("run-high"));
+    facts.push((
+        r"key-by-high\run-high: medium lists it".into(),
+        result(&listed),
+    ));
+    for (name, value) in facts {
+        fact(&name, value);
+    }
     println!("done");
 }
 
-/// Makes a lock file, holds the state byte and medium's byte, and waits
-/// for stdin to close.
+/// Makes a lock file and holds the state byte and medium's byte. Then
+/// makes a key folder with instance.lock in it, and holds bytes 0 and
+/// medium's as an owner would. Waits for stdin to close.
 #[test]
 fn child_holder() {
     if !is_role("child_holder") {
@@ -373,8 +421,13 @@ fn child_holder() {
     let file = create(&dir.join("made-by-medium"), None, false)
         .unwrap()
         .unwrap();
-    lock(&file, GUARD, true).unwrap();
-    lock(&file, u64::from(MEDIUM), true).unwrap();
+    lock(&file, GUARD, 1, true).unwrap();
+    lock(&file, u64::from(MEDIUM), 1, true).unwrap();
+    let mut facts = Vec::new();
+    let _owned = make_key(&dir.join("key-by-medium"), "medium", MEDIUM, &mut facts);
+    for (name, value) in facts {
+        fact(&name, value);
+    }
     println!("ready");
     let _ = io::stdin().read_line(&mut String::new());
 }
@@ -393,6 +446,14 @@ fn child_builder() -> Builder {
 
 fn fact(name: &str, value: impl std::fmt::Display) {
     println!("fact {name} = {value}");
+}
+
+/// The facts among a child's lines.
+fn parse_facts(lines: &[String]) -> impl Iterator<Item = (String, String)> {
+    lines.iter().filter_map(|l| {
+        let (name, value) = l.strip_prefix("fact ")?.split_once(" = ")?;
+        Some((name.to_owned(), value.to_owned()))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -424,16 +485,22 @@ fn describe(started: &Started<Args>) -> String {
 fn result<T>(r: &io::Result<T>) -> String {
     match r {
         Ok(_) => "ok".into(),
-        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => "access denied".into(),
-        Err(e) if e.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) => "lock violation".into(),
-        Err(e) => e.to_string(),
+        Err(e) => error(e),
     }
 }
 
-/// `path`'s owner and label, or why it couldn't be made.
-fn made_as(path: &Path, made: &io::Result<()>) -> String {
+fn error(e: &io::Error) -> String {
+    match e.raw_os_error() {
+        Some(code) if code == ERROR_ACCESS_DENIED as i32 => "access denied".into(),
+        Some(code) if code == ERROR_LOCK_VIOLATION as i32 => "lock violation".into(),
+        _ => e.to_string(),
+    }
+}
+
+/// What `read` says of `path`, or why it couldn't be made.
+fn made_as<T>(path: &Path, made: &io::Result<T>, read: fn(&Path) -> String) -> String {
     match made {
-        Ok(()) => security(path),
+        Ok(_) => read(path),
         Err(_) => format!("not made: {}", result(made)),
     }
 }
@@ -474,14 +541,39 @@ fn own_token() -> OwnedHandle {
 
 /// A token's information of one class, in a buffer aligned for it.
 fn token_info(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> Vec<u64> {
+    try_token_info(token, class).unwrap_or_else(|e| panic!("GetTokenInformation: {e}"))
+}
+
+/// A token's information of one class, in a buffer aligned for it, or why
+/// it couldn't be read.
+fn try_token_info(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<u64>> {
     let mut len = 0;
     // SAFETY: a size query.
     unsafe { GetTokenInformation(token, class, null_mut(), 0, &mut len) };
-    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
-    // SAFETY: `buf` holds `len` bytes.
-    let ok = unsafe { GetTokenInformation(token, class, buf.as_mut_ptr().cast(), len, &mut len) };
-    assert_ne!(ok, 0, "GetTokenInformation: {}", io::Error::last_os_error());
-    buf
+    // At least one word, so that a class of up to 8 bytes, such as the
+    // u32 ones read here, fits even when the size query gives no size.
+    let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+    let size = (buf.len() * 8) as u32;
+    // SAFETY: `buf` holds `size` bytes.
+    let ok = unsafe { GetTokenInformation(token, class, buf.as_mut_ptr().cast(), size, &mut len) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(buf)
+}
+
+/// A token's information of one class, read as the `T` it starts with.
+///
+/// # Safety
+///
+/// The class's information starts with a `T`, which is valid for any bytes
+/// and needs no more than 8-byte alignment.
+unsafe fn token_value<T: Copy>(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<T> {
+    let info = try_token_info(token, class)?;
+    // SAFETY: the call wrote the class's information, which starts with a
+    // `T`, into a buffer aligned to 8 bytes; per the contract, that is
+    // enough.
+    Ok(unsafe { *(info.as_ptr() as *const T) })
 }
 
 fn token_level(token: HANDLE) -> u32 {
@@ -517,12 +609,15 @@ fn names(sddl: &str) -> String {
         .replace("S-1-5-32-544", "Administrators")
 }
 
-/// This process's level, who owns what it creates, and whether its
-/// Administrators group is enabled.
-fn token_facts() -> String {
-    let token = own_token();
-    let level = token_level(token.as_raw_handle());
-    let owner = token_info(token.as_raw_handle(), TokenOwner);
+/// This process's token, session and window station, and the machine's
+/// UAC settings: the facts 0015's rules for who may own would rest on.
+/// The first, `token`, is the level, who owns what it creates, and whether
+/// its Administrators group is enabled.
+fn token_facts() -> Vec<(&'static str, String)> {
+    let owned = own_token();
+    let token = owned.as_raw_handle();
+    let level = token_level(token);
+    let owner = token_info(token, TokenOwner);
     // SAFETY: a TOKEN_OWNER whose SID points into the buffer.
     let owner = sid_string(unsafe { (*(owner.as_ptr() as *const TOKEN_OWNER)).Owner });
     let mut admins = [0u32; (SECURITY_MAX_SID_SIZE as usize).div_ceil(4)];
@@ -546,7 +641,7 @@ fn token_facts() -> String {
         "CheckTokenMembership: {}",
         io::Error::last_os_error()
     );
-    format!(
+    let summary = format!(
         "level {level:#x}; what it makes is owned by {}; Administrators {}",
         names(&owner),
         if member != 0 {
@@ -554,20 +649,185 @@ fn token_facts() -> String {
         } else {
             "not enabled"
         }
-    )
+    );
+
+    // SAFETY, for each `token_value`: the class's information starts with
+    // the type read, a plain number or a handle. TokenRestrictedSids gives
+    // a TOKEN_GROUPS, which starts with its count.
+    let elevation = match unsafe { token_value::<TOKEN_ELEVATION_TYPE>(token, TokenElevationType) }
+    {
+        Ok(t) if t == TokenElevationTypeDefault => "default".into(),
+        Ok(t) if t == TokenElevationTypeFull => "full".into(),
+        Ok(t) if t == TokenElevationTypeLimited => "limited".into(),
+        Ok(t) => format!("unknown ({t})"),
+        Err(e) => error(&e),
+    };
+    let linked = match unsafe { token_value::<TOKEN_LINKED_TOKEN>(token, TokenLinkedToken) } {
+        Ok(linked) => {
+            // SAFETY: a handle the call opened, for the caller to close.
+            drop(unsafe { OwnedHandle::from_raw_handle(linked.LinkedToken) });
+            "yes".into()
+        }
+        Err(e) if e.raw_os_error() == Some(ERROR_NO_SUCH_LOGON_SESSION as i32) => "no".into(),
+        Err(e) => error(&e),
+    };
+    // IsTokenRestricted returns 0 both for "no" and for a failure, which
+    // only the last error tells apart.
+    // SAFETY: no preconditions.
+    unsafe { SetLastError(0) };
+    // SAFETY: a token open for query.
+    let restricted = match unsafe { IsTokenRestricted(token) } {
+        0 => match io::Error::last_os_error() {
+            e if e.raw_os_error() == Some(0) => "no".to_owned(),
+            e => error(&e),
+        },
+        _ => "yes".to_owned(),
+    };
+    let restricting = match unsafe { token_value::<u32>(token, TokenRestrictedSids) } {
+        Ok(count) => count.to_string(),
+        Err(e) => error(&e),
+    };
+    let app_container = match unsafe { token_value::<u32>(token, TokenIsAppContainer) } {
+        Ok(0) => "no".into(),
+        Ok(_) => "yes".into(),
+        Err(e) => error(&e),
+    };
+    let session = match unsafe { token_value::<u32>(token, TokenSessionId) } {
+        Ok(session) => session.to_string(),
+        Err(e) => error(&e),
+    };
+    vec![
+        ("token", summary),
+        ("elevation type", elevation),
+        ("linked token", linked),
+        (
+            "restricted",
+            format!("{restricted}; restricting SIDs: {restricting}"),
+        ),
+        ("AppContainer", app_container),
+        ("session", session),
+        ("window station", window_station()),
+        ("UAC", uac()),
+    ]
+}
+
+/// This process's window station: its name, and whether it is visible,
+/// as only the interactive one is.
+fn window_station() -> String {
+    // SAFETY: no arguments. The handle it returns is never to be closed,
+    // and isn't.
+    let station = unsafe { GetProcessWindowStation() };
+    if station.is_null() {
+        return format!(
+            "GetProcessWindowStation: {}",
+            error(&io::Error::last_os_error())
+        );
+    }
+    let mut name = [0u16; 256];
+    let mut len = 0;
+    // SAFETY: an open window station, and a buffer of the size given.
+    let ok = unsafe {
+        GetUserObjectInformationW(
+            station,
+            UOI_NAME,
+            name.as_mut_ptr().cast(),
+            std::mem::size_of_val(&name) as u32,
+            &mut len,
+        )
+    };
+    let name = if ok == 0 {
+        format!("UOI_NAME: {}", error(&io::Error::last_os_error()))
+    } else {
+        let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        String::from_utf16_lossy(&name[..end])
+    };
+    let mut flags = USEROBJECTFLAGS::default();
+    // SAFETY: as above.
+    let ok = unsafe {
+        GetUserObjectInformationW(
+            station,
+            UOI_FLAGS,
+            (&mut flags as *mut USEROBJECTFLAGS).cast(),
+            std::mem::size_of::<USEROBJECTFLAGS>() as u32,
+            &mut len,
+        )
+    };
+    let visible = if ok == 0 {
+        format!("UOI_FLAGS: {}", error(&io::Error::last_os_error()))
+    } else if flags.dwFlags & WSF_VISIBLE as u32 != 0 {
+        "visible".into()
+    } else {
+        "not visible".into()
+    };
+    format!("{name}, {visible}")
+}
+
+/// `EnableLUA` and `FilterAdministratorToken`, as `reg query` shows them.
+fn uac() -> String {
+    const KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+    let out = {
+        // Under SPAWN, as children at medium are, so that neither child can
+        // inherit the other's pipes.
+        let _spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        std::process::Command::new("reg")
+            .args(["query", KEY])
+            .output()
+    };
+    let out = match out {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => return format!("reg: {}", String::from_utf8_lossy(&out.stderr).trim()),
+        Err(e) => return format!("reg: {}", error(&e)),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    ["EnableLUA", "FilterAdministratorToken"]
+        .map(|name| {
+            // A value's line: its name, its type, then its data.
+            let data = text.lines().find_map(|line| {
+                let mut words = line.split_whitespace();
+                // Registry value names ignore case.
+                let found = words.next().is_some_and(|w| w.eq_ignore_ascii_case(name));
+                found.then(|| words.last()).flatten()
+            });
+            format!("{name} {}", data.unwrap_or("not set"))
+        })
+        .join("; ")
 }
 
 /// `path`'s owner and label, as SDDL.
 fn security(path: &Path) -> String {
+    let info = OWNER_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+    match sddl(path, info) {
+        Ok(sddl) if sddl.contains("S:") => sddl,
+        Ok(sddl) => format!("{sddl} (no label: medium)"),
+        Err(e) => e,
+    }
+}
+
+/// `path`'s owner, access list and label, as SDDL, and how many label
+/// ACEs it has. A protected label should be its only one.
+fn full_security(path: &Path) -> String {
+    let info = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+    match sddl(path, info) {
+        Ok(sddl) => {
+            let labels = sddl.matches("(ML;").count();
+            let s = if labels == 1 { "" } else { "s" };
+            format!("{sddl} ({labels} label ACE{s})")
+        }
+        Err(e) => e,
+    }
+}
+
+/// The parts of `path`'s security that `info` names, as SDDL, or why they
+/// couldn't be read.
+fn sddl(path: &Path, info: OBJECT_SECURITY_INFORMATION) -> Result<String, String> {
     let file = match OpenOptions::new()
         .access_mode(READ_CONTROL)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
     {
         Ok(file) => file,
-        Err(e) => return format!("can't read its security: {}", result(&Err::<(), _>(e))),
+        Err(e) => return Err(format!("can't read its security: {}", error(&e))),
     };
-    let info = OWNER_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
     let mut sd = null_mut();
     // SAFETY: an open handle; `sd` receives a LocalAlloc'd descriptor.
     let err = unsafe {
@@ -583,10 +843,10 @@ fn security(path: &Path) -> String {
         )
     };
     if err != 0 {
-        return format!(
+        return Err(format!(
             "GetSecurityInfo: {}",
             io::Error::from_raw_os_error(err as i32)
-        );
+        ));
     }
     let mut text = null_mut();
     // SAFETY: the descriptor from above; `text` receives a LocalAlloc'd string.
@@ -602,15 +862,11 @@ fn security(path: &Path) -> String {
     let err = io::Error::last_os_error();
     unsafe { LocalFree(sd) };
     if ok == 0 {
-        return format!("ConvertSecurityDescriptorToStringSecurityDescriptorW: {err}");
+        return Err(format!(
+            "ConvertSecurityDescriptorToStringSecurityDescriptorW: {err}"
+        ));
     }
-    let sddl = unsafe { take_wide(text) };
-    let sddl = if sddl.contains("S:") {
-        sddl
-    } else {
-        format!("{sddl} (no label: medium)")
-    };
-    names(&sddl)
+    Ok(names(&unsafe { take_wide(text) }))
 }
 
 /// Creates the file or folder `path` with the owner and label in `sddl`
@@ -671,22 +927,172 @@ fn create(path: &Path, sddl: Option<&str>, folder: bool) -> io::Result<Option<Fi
     made
 }
 
-/// One byte at `offset`, without waiting.
-fn lock(file: &File, offset: u64, exclusive: bool) -> io::Result<()> {
-    // SAFETY: plain data.
-    let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
-    ov.Anonymous.Anonymous.Offset = offset as u32;
-    ov.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+/// `len` bytes from `offset`, without waiting.
+fn lock(file: &File, offset: u64, len: u64, exclusive: bool) -> io::Result<()> {
+    let mut ov = at(offset);
     let mut flags = LOCKFILE_FAIL_IMMEDIATELY;
     if exclusive {
         flags |= LOCKFILE_EXCLUSIVE_LOCK;
     }
     // SAFETY: an open, synchronous handle; the call completes before it
     // returns, so `ov` outlives it.
-    if unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut ov) } == 0 {
+    let ok = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            flags,
+            0,
+            len as u32,
+            (len >> 32) as u32,
+            &mut ov,
+        )
+    };
+    if ok == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Gives back the range that `lock` took.
+fn unlock(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    let mut ov = at(offset);
+    // SAFETY: as in `lock`.
+    let ok = unsafe {
+        UnlockFileEx(
+            file.as_raw_handle(),
+            0,
+            len as u32,
+            (len >> 32) as u32,
+            &mut ov,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// An `OVERLAPPED` that names `offset`, for a synchronous call.
+fn at(offset: u64) -> OVERLAPPED {
+    // SAFETY: plain data.
+    let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+    ov.Anonymous.Anonymous.Offset = offset as u32;
+    ov.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+    ov
+}
+
+/// The marker a launch would find in a held instance.lock: the bytes in
+/// [1, 0x10000) that another handle holds exclusively. Shared range locks,
+/// each given back at once, halve the range around a conflict. Also says
+/// how many it tried.
+fn marker(file: &File) -> String {
+    let mut tries = 0;
+    match held(file, 1, 0x10000, &mut tries) {
+        Ok(bytes) if bytes.is_empty() => format!("none, after {tries} range locks"),
+        Ok(bytes) => {
+            let bytes: Vec<String> = bytes.iter().map(|b| format!("{b:#x}")).collect();
+            format!("{}, after {tries} range locks", bytes.join(" and "))
+        }
+        Err(e) => error(&e),
+    }
+}
+
+/// The bytes in `start..end` that another handle holds exclusively.
+fn held(file: &File, start: u64, end: u64, tries: &mut u32) -> io::Result<Vec<u64>> {
+    *tries += 1;
+    match lock(file, start, end - start, false) {
+        Ok(()) => return unlock(file, start, end - start).map(|()| Vec::new()),
+        Err(e) if e.raw_os_error() != Some(ERROR_LOCK_VIOLATION as i32) => return Err(e),
+        Err(_) => {}
+    }
+    if end - start == 1 {
+        return Ok(vec![start]);
+    }
+    let mid = start + (end - start) / 2;
+    let mut bytes = held(file, start, mid, tries)?;
+    bytes.extend(held(file, mid, end, tries)?);
+    Ok(bytes)
+}
+
+// ---------------------------------------------------------------------------
+// 0015's layout, made by hand
+// ---------------------------------------------------------------------------
+
+/// The security 0015 gives the key folder (`inherit` "OICI") and
+/// instance.lock (""): an access list for this user and SYSTEM and a
+/// medium label, both explicit and protected.
+fn layout_sddl(inherit: &str) -> String {
+    let user = user();
+    format!("D:P(A;{inherit};FA;;;{user})(A;{inherit};FA;;;SY)S:P(ML;{inherit};NWNR;;;ME)")
+}
+
+/// Makes the key folder `key` with instance.lock in it, and holds the
+/// lock's byte 0 and then the byte at `level`, as an owner would. Reports
+/// as `who`, and returns the lock, held until it is dropped.
+fn make_key(key: &Path, who: &str, level: u32, facts: &mut Vec<(String, String)>) -> Option<File> {
+    let name = key.file_name().unwrap().to_string_lossy();
+    let made = create(key, Some(&layout_sddl("OICI")), true);
+    facts.push((
+        format!("{name}: made by {who}"),
+        made_as(key, &made, full_security),
+    ));
+    let path = key.join("instance.lock");
+    let made = create(&path, Some(&layout_sddl("")), false);
+    facts.push((
+        format!(r"{name}\instance.lock: made by {who}"),
+        made_as(&path, &made, full_security),
+    ));
+    let file = made.ok().flatten()?;
+    for (what, offset) in [("byte 0", 0), ("its level's byte", level)] {
+        let got = result(&lock(&file, offset.into(), 1, true));
+        facts.push((
+            format!(r"{name}\instance.lock: {who}'s exclusive lock on {what}"),
+            got,
+        ));
+    }
+    Some(file)
+}
+
+/// Makes the level folder `folder` in the key folder `key`, labelled
+/// `label`, and reports as `who`.
+fn make_level_folder(
+    key: &Path,
+    folder: &str,
+    label: &str,
+    who: &str,
+    facts: &mut Vec<(String, String)>,
+) {
+    let name = key.file_name().unwrap().to_string_lossy();
+    let path = key.join(folder);
+    let made = create(&path, Some(label), true);
+    facts.push((
+        format!(r"{name}\{folder}: made by {who}"),
+        made_as(&path, &made, full_security),
+    ));
+}
+
+/// Tries the instance.lock that another level holds in `key`, as a launch
+/// would: opens it to write, tries byte 0, and looks for the marker.
+/// Reports as `who`.
+fn try_key(key: &Path, who: &str, facts: &mut Vec<(String, String)>) {
+    let name = key.file_name().unwrap().to_string_lossy();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(key.join("instance.lock"));
+    facts.push((
+        format!(r"{name}\instance.lock: {who} opens to write"),
+        result(&file),
+    ));
+    if let Ok(file) = &file {
+        facts.push((
+            format!(r"{name}\instance.lock: {who}'s exclusive lock on byte 0"),
+            result(&lock(file, 0, 1, true)),
+        ));
+        facts.push((
+            format!(r"{name}\instance.lock: the marker {who} finds"),
+            marker(file),
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +1121,18 @@ impl Child {
             seen.push(line);
         }
         panic!("no `{prefix}` line from the child:\n{}", seen.join("\n"));
+    }
+
+    /// The lines before the first that is `end`.
+    fn until(&self, end: &str) -> Vec<String> {
+        let mut seen = Vec::new();
+        while let Ok(line) = self.lines.recv_timeout(Duration::from_secs(30)) {
+            if line == end {
+                return seen;
+            }
+            seen.push(line);
+        }
+        panic!("no `{end}` line from the child:\n{}", seen.join("\n"));
     }
 
     /// Closes its stdin, waits for it to exit, and returns the lines it

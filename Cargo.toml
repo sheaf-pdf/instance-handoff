@@ -51,8 +51,8 @@ tokio = { version = "1.38", features = ["rt", "sync", "macros", "signal"] }
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2.170"
 
-# tests/levels.rs starts children at medium integrity and probes labels and
-# locks.
+# tests/levels.rs starts children at medium integrity and probes labels,
+# locks, tokens and window stations.
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -62,8 +62,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Pipes",
+    "Win32_System_StationsAndDesktops",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [package.metadata.docs.rs]
