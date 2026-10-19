@@ -82,7 +82,8 @@ pub enum Mode {
     /// [`Claim::decline_all`] if it must not receive the user's launches.
     /// One that may not own runs alone at once with [`Reason::MayNotOwn`],
     /// and one that takes the lock but finds the state folder's
-    /// [guard](Guard) held runs alone with [`Reason::StateInUse`].
+    /// [guard](Guard) held by an owner it can't share it with runs alone
+    /// with [`Reason::StateInUse`].
     ///
     /// [`Claim::decline_all`]: crate::Claim::decline_all
     Separate,
@@ -100,6 +101,11 @@ pub enum Mode {
 /// at once with [`Reason::StateInUse`], rather than own the state folder
 /// beside the first.
 ///
+/// An owner with a [scope](Builder::scope) takes the guard shared. Owners
+/// with scopes then hold it side by side, whatever their scopes and
+/// runtime folders, but never beside an owner without one: whichever of
+/// the two comes second runs alone with [`Reason::StateInUse`].
+///
 /// `start` makes the guard file (mode 0600) in the state folder, which it
 /// has created if it was missing (see [`Builder::new`]). The file is never
 /// written. Like the lock, the guard is held until the process exits, or
@@ -107,9 +113,10 @@ pub enum Mode {
 /// child forked from the owner holds it too until it exits.
 ///
 /// No guard is taken, and no guard file made, under [`Guard::Off`], for
-/// [`State::none`], for an owner with a [scope](Builder::scope), and on
-/// Windows. Nor is one held where the file system can't lock files.
-/// [`Claim::guarded`] says whether the owner holds it.
+/// [`State::none`], and on Windows. Nor is one held where the file system
+/// can't lock files. An owner that holds none doesn't keep out launches in
+/// other runtime folders, with a scope or without. [`Claim::guarded`] says
+/// whether the owner holds it.
 ///
 /// [`Owner::release`]: crate::Owner::release
 /// [`Claim::release`]: crate::Claim::release
@@ -206,7 +213,8 @@ impl Builder {
     /// folder, the [guard](Guard), so a launch that finds another runtime
     /// folder, as in another container, runs alone with
     /// [`Reason::StateInUse`] rather than become a second owner of that
-    /// state folder.
+    /// state folder. Owners with a scope share the guard with one another,
+    /// never with an owner without one.
     ///
     /// Before [`start`](Builder::start) creates anything, it checks whose
     /// the state folder is, or, while it is missing, whose the nearest
@@ -252,6 +260,13 @@ impl Builder {
     /// only when both match. Owners of one state folder under two scopes
     /// run side by side, so the app must keep their writes to it safe.
     ///
+    /// On Unix, owners with a scope take the state folder's [guard](Guard)
+    /// shared, so they hold it side by side, whatever their scopes. An owner
+    /// without one holds it alone: while it runs, a launch with a scope that
+    /// would own runs alone with [`Reason::StateInUse`], and while owners
+    /// with scopes run, so does a launch without one. So pass a scope to
+    /// every launch of a state folder, or to none.
+    ///
     /// The scope is a key, compared byte for byte, not a path: `cfg`,
     /// `./cfg/` and a symlink to it are three scopes, and a relative path
     /// means one scope for every folder of that name. To key on a folder,
@@ -275,12 +290,14 @@ impl Builder {
     ///
     /// Every launch that should meet must pass the same folder: one given
     /// another folder, with the same state folder, runs alone with
-    /// [`Reason::StateInUse`] while this owner holds the [guard](Guard). A
-    /// folder serves one privilege level: on Windows, one made at another
-    /// integrity level is refused with [`Reason::RuntimeDir`], so elevated
-    /// and normal launches given the same folder don't share it. For tests,
-    /// a fresh temporary folder and state folder per test keep a panicking
-    /// test's lock and guard from blocking the next.
+    /// [`Reason::StateInUse`] while this owner holds the [guard](Guard),
+    /// unless both have a [scope](Builder::scope), since owners with scopes
+    /// share the guard. A folder serves one privilege level: on Windows,
+    /// one made at another integrity level is refused with
+    /// [`Reason::RuntimeDir`], so elevated and normal launches given the
+    /// same folder don't share it. For tests, a fresh temporary folder and
+    /// state folder per test keep a panicking test's lock and guard from
+    /// blocking the next.
     pub fn dir(mut self, dir: impl Into<PathBuf>) -> Builder {
         self.dir = Some(dir.into());
         self

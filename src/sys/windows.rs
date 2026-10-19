@@ -884,7 +884,7 @@ pub(crate) fn make_state_dir(_state: &Path) -> io::Result<()> {
 
 /// Windows owners take no guard: nothing is made or locked in the state
 /// folder.
-pub(crate) fn take_guard(_state: &Path) -> Result<Option<Guard>, Reason> {
+pub(crate) fn take_guard(_state: &Path, _shared: bool) -> Result<Option<Guard>, Reason> {
     Ok(None)
 }
 

@@ -779,12 +779,11 @@ fn a_second_runtime_folder_finds_the_state_folder_in_use() {
 }
 
 // Guard::Off takes no guard and makes no guard file, so an owner in
-// another runtime folder starts beside it. Like a keyed owner, it still
-// makes the missing state folder, private. State::none has no folder to
-// guard.
+// another runtime folder starts beside it. It still makes the missing state
+// folder, private. State::none has no folder to guard.
 #[cfg(unix)]
 #[test]
-fn guard_off_keyed_and_no_state_take_no_guard() {
+fn guard_off_and_no_state_take_no_guard() {
     use std::os::unix::fs::PermissionsExt;
     let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     let dir = dir();
@@ -803,18 +802,6 @@ fn guard_off_keyed_and_no_state_take_no_guard() {
     beside.release();
     off.release();
 
-    let keyed_state = dir.tmp.path().join("keyed");
-    let keyed = claim(
-        Builder::new(APP, keyed_state.as_path())
-            .dir(&dir.path)
-            .scope("a")
-            .start(&Args::default()),
-    );
-    assert!(!keyed.guarded());
-    assert_eq!(mode(&keyed_state), 0o700);
-    assert!(!keyed_state.join(".instance-handoff.lock").exists());
-    keyed.release();
-
     let none = claim(
         Builder::new(APP, State::none())
             .dir(&dir.path)
@@ -822,6 +809,51 @@ fn guard_off_keyed_and_no_state_take_no_guard() {
     );
     assert!(!none.guarded());
     none.release();
+}
+
+// Keyed owners take the guard shared: two scopes of one state folder both
+// own, but an owner without a scope never starts beside them, nor one with
+// a scope beside it. The launch turned away lets go of its lock at once. A
+// keyed start makes the missing state folder, private.
+#[cfg(unix)]
+#[test]
+fn keyed_owners_share_the_guard() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let dir = dir();
+    let a = claim(builder(&dir).scope("a").start(&Args::default()));
+    assert_eq!(mode(&dir.tmp.path().join("state")), 0o700);
+    let b = claim(builder(&dir).scope("b").start(&Args::default()));
+    assert!(a.guarded() && b.guarded());
+    let unkeyed = builder(&dir);
+    let t = Instant::now();
+    let reason = alone(unkeyed.start(&args(&["x"])));
+    let guard = canonical(dir.tmp.path())
+        .join("state")
+        .join(".instance-handoff.lock");
+    assert!(
+        matches!(&reason, Reason::StateInUse { path, .. } if *path == guard),
+        "{reason}"
+    );
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    let reason = unkeyed.probe().unwrap_err();
+    assert!(matches!(reason, Reason::NoOwner { .. }), "{reason}");
+    b.release();
+    let reason = alone(unkeyed.start(&args(&["x"])));
+    assert!(matches!(reason, Reason::StateInUse { .. }), "{reason}");
+    a.release();
+
+    let owner = claim(unkeyed.start(&Args::default()));
+    assert!(owner.guarded());
+    let keyed = builder(&dir).scope("a");
+    let t = Instant::now();
+    let reason = alone(keyed.start(&args(&["x"])));
+    assert!(matches!(reason, Reason::StateInUse { .. }), "{reason}");
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    let reason = keyed.probe().unwrap_err();
+    assert!(matches!(reason, Reason::NoOwner { .. }), "{reason}");
+    owner.release();
+    claim(keyed.start(&Args::default())).release();
 }
 
 #[test]

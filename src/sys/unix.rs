@@ -699,10 +699,12 @@ pub(crate) fn open_folder(place: &Place, create: bool) -> Result<Option<Folder>,
 #[derive(Debug)]
 pub(crate) struct Lock(OwnedFd);
 
-fn flock_nb(fd: BorrowedFd<'_>) -> io::Result<bool> {
+/// Takes an `flock` without waiting: `op` is `LOCK_EX` or `LOCK_SH`.
+/// `false` when another open file holds a lock that conflicts.
+fn flock_nb(fd: BorrowedFd<'_>, op: libc::c_int) -> io::Result<bool> {
     loop {
         // SAFETY: flock on an open descriptor.
-        match cvt(unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }) {
+        match cvt(unsafe { libc::flock(fd.as_raw_fd(), op | libc::LOCK_NB) }) {
             Ok(_) => return Ok(true),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -742,14 +744,14 @@ impl Folder {
     /// holds it.
     pub(crate) fn lock(&self) -> io::Result<Option<Lock>> {
         let fd = self.open_lock(true)?;
-        Ok(flock_nb(fd.as_fd())?.then_some(Lock(fd)))
+        Ok(flock_nb(fd.as_fd(), libc::LOCK_EX)?.then_some(Lock(fd)))
     }
 
     /// Whether another process holds the lock, without creating anything.
     /// The lock is taken and dropped at once to find out.
     pub(crate) fn lock_held(&self) -> io::Result<bool> {
         match self.open_lock(false) {
-            Ok(fd) => flock_nb(fd.as_fd()).map(|got| !got),
+            Ok(fd) => flock_nb(fd.as_fd(), libc::LOCK_EX).map(|got| !got),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e),
         }
@@ -1225,23 +1227,28 @@ pub(crate) fn make_state_dir(state: &Path) -> io::Result<()> {
 }
 
 /// The held guard: an `flock` on `.instance-handoff.lock` in the state
-/// folder. Like [`Lock`], it is released when the last descriptor closes
-/// and never unlocked explicitly, so a forked child that keeps a copy keeps
-/// the guard.
+/// folder, exclusive or shared. Like [`Lock`], it is released when the
+/// last descriptor closes and never unlocked explicitly, so a forked child
+/// that keeps a copy keeps the guard.
 #[derive(Debug)]
 pub(crate) struct Guard(#[allow(dead_code)] OwnedFd);
 
 /// Takes the guard in the canonical `state` folder, which
-/// [`make_state_dir`] has made. [`Reason::StateInUse`] when another process
-/// holds it. `None` where the file system can't lock files: the owner goes
-/// unguarded.
-pub(crate) fn take_guard(state: &Path) -> Result<Option<Guard>, Reason> {
+/// [`make_state_dir`] has made: `shared` (`LOCK_SH`) for a keyed owner, so
+/// keyed owners hold it side by side, and otherwise exclusive (`LOCK_EX`).
+/// Each owner opens the file afresh, so its lock is its own: a second
+/// `flock` on one open file would only convert the first.
+/// [`Reason::StateInUse`] when another owner holds it in a mode that
+/// conflicts. `None` where the file system can't lock files: the owner
+/// goes unguarded.
+pub(crate) fn take_guard(state: &Path, shared: bool) -> Result<Option<Guard>, Reason> {
     let path = state.join(naming::GUARD_FILE);
     let fd = match open_guard(state) {
         Ok(fd) => fd,
         Err(source) => return Err(Reason::Lock { path, source }),
     };
-    match flock_nb(fd.as_fd()) {
+    let op = if shared { libc::LOCK_SH } else { libc::LOCK_EX };
+    match flock_nb(fd.as_fd(), op) {
         Ok(true) => Ok(Some(Guard(fd))),
         Ok(false) => Err(Reason::StateInUse { path }),
         Err(e) if locks_unsupported(&e) => {
@@ -1283,7 +1290,8 @@ fn open_guard(state: &Path) -> io::Result<OwnedFd> {
 /// Linux and FreeBSD, and a number of its own elsewhere. `EBADF`, on a
 /// descriptor just opened, is NFS: its client emulates `flock` with POSIX
 /// locks on the server, and an exclusive one needs a descriptor open for
-/// writing (flock(2)), which the guard's isn't.
+/// writing (flock(2)), which the guard's isn't. A shared one needs only
+/// reading, so a keyed owner there holds the guard.
 fn locks_unsupported(e: &io::Error) -> bool {
     e.raw_os_error().is_some_and(|code| {
         [libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOTSUP, libc::EBADF].contains(&code)
@@ -2273,7 +2281,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("missing").join("state");
         make_state_dir(&state).unwrap();
-        let guard = take_guard(&state).unwrap().expect("a local folder locks");
+        let guard = take_guard(&state, false)
+            .unwrap()
+            .expect("a local folder locks");
         let file = state.join(".instance-handoff.lock");
         assert_eq!(mode(&state), 0o700);
         assert_eq!(mode(&file), 0o600);
@@ -2281,14 +2291,46 @@ mod tests {
         // SAFETY: flock on an open file.
         let shared = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
         assert_eq!(shared, -1);
-        let err = take_guard(&state).unwrap_err();
+        let err = take_guard(&state, false).unwrap_err();
         assert!(
             matches!(&err, Reason::StateInUse { path } if *path == file),
             "{err}"
         );
         drop(guard);
-        assert!(take_guard(&state).unwrap().is_some());
+        assert!(take_guard(&state, false).unwrap().is_some());
         assert_eq!(std::fs::metadata(&file).unwrap().len(), 0);
+    }
+
+    // Frozen with the guard's modes: a keyed owner's flock is shared, so
+    // other keyed owners and any other shared flock hold beside it, but no
+    // exclusive one. An exclusive guard keeps keyed owners out in turn.
+    #[test]
+    fn a_keyed_guard_is_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        let file = state.join(".instance-handoff.lock");
+        let a = take_guard(state, true).unwrap();
+        let b = take_guard(state, true).unwrap();
+        assert!(a.is_some() && b.is_some(), "a local folder locks");
+        let other = std::fs::File::open(&file).unwrap();
+        // SAFETY: flock on an open file.
+        let flock = |op| unsafe { libc::flock(other.as_raw_fd(), op | libc::LOCK_NB) };
+        assert_eq!(flock(libc::LOCK_EX), -1);
+        assert_eq!(flock(libc::LOCK_SH), 0);
+        drop(other);
+        let err = take_guard(state, false).unwrap_err();
+        assert!(
+            matches!(&err, Reason::StateInUse { path } if *path == file),
+            "{err}"
+        );
+        drop(a);
+        assert!(take_guard(state, false).is_err());
+        drop(b);
+        let unkeyed = take_guard(state, false).unwrap().unwrap();
+        let err = take_guard(state, true).unwrap_err();
+        assert!(matches!(err, Reason::StateInUse { .. }), "{err}");
+        drop(unkeyed);
+        assert!(take_guard(state, true).unwrap().is_some());
     }
 
     // A lock needs no write, so a guard file that exists is locked in a
@@ -2307,12 +2349,12 @@ mod tests {
         let state = tmp.path().join("state");
         std::fs::create_dir(&state).unwrap();
         set_mode(&state, 0o500);
-        let err = take_guard(&state).unwrap_err();
+        let err = take_guard(&state, false).unwrap_err();
         assert!(matches!(err, Reason::Lock { .. }), "{err}");
         set_mode(&state, 0o700);
-        drop(take_guard(&state).unwrap().unwrap());
+        drop(take_guard(&state, false).unwrap().unwrap());
         set_mode(&state, 0o500);
-        assert!(take_guard(&state).unwrap().is_some());
+        assert!(take_guard(&state, false).unwrap().is_some());
         set_mode(&state, 0o700);
     }
 
@@ -2324,7 +2366,7 @@ mod tests {
         let fifo = cstr(tmp.path().join(".instance-handoff.lock").as_os_str()).unwrap();
         // SAFETY: `fifo` is a valid C string.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let err = take_guard(tmp.path()).unwrap_err();
+        let err = take_guard(tmp.path(), false).unwrap_err();
         assert!(
             matches!(err, Reason::Lock { .. }) && err.to_string().contains("not a file"),
             "{err}"
@@ -2347,7 +2389,7 @@ mod tests {
         std::fs::write(&file, b"").unwrap();
         make_state_dir(&file).unwrap();
         assert!(file.is_file());
-        assert!(matches!(take_guard(&file), Err(Reason::Lock { .. })));
+        assert!(matches!(take_guard(&file, false), Err(Reason::Lock { .. })));
         assert!(make_state_dir(&file.join("state")).is_err());
     }
 

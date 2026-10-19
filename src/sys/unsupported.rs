@@ -110,7 +110,7 @@ pub(crate) fn make_state_dir(_: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn take_guard(_: &Path) -> Result<Option<Guard>, Reason> {
+pub(crate) fn take_guard(_: &Path, _: bool) -> Result<Option<Guard>, Reason> {
     Ok(None)
 }
 

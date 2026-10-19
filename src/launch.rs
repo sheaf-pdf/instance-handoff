@@ -329,17 +329,18 @@ fn take_state(b: &Builder, state: Option<&Path>) -> Result<Option<sys::Guard>, R
 }
 
 /// Takes the guard of the canonical `state` folder, which exists, for a
-/// launch that holds the lock. `None` when no guard is taken: see
-/// [`Guard`]. A keyed owner takes none. Still held after [`GUARD_RETRY`],
-/// it gives [`Reason::StateInUse`].
+/// launch that holds the lock: shared for a keyed owner, so keyed owners of
+/// one state folder hold it side by side, and otherwise exclusive. `None`
+/// when no guard is taken: see [`Guard`]. Still held after
+/// [`GUARD_RETRY`], it gives [`Reason::StateInUse`].
 fn take_guard(b: &Builder, state: Option<&Path>) -> Result<Option<sys::Guard>, Reason> {
-    let guarded = b.guard == Guard::Local && b.scope.is_none();
-    let Some(state) = state.filter(|_| guarded) else {
+    let Some(state) = state.filter(|_| b.guard == Guard::Local) else {
         return Ok(None);
     };
+    let shared = b.scope.is_some();
     let until = Instant::now() + GUARD_RETRY;
     loop {
-        match sys::take_guard(state) {
+        match sys::take_guard(state, shared) {
             Err(Reason::StateInUse { .. }) if Instant::now() < until => {
                 std::thread::sleep(Duration::from_millis(5));
             }

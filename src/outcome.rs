@@ -366,7 +366,9 @@ pub enum Reason {
     /// reach it: an owner in another container, one given another
     /// [`Builder::dir`], an owner of another app id given the same state
     /// folder, or one whose runtime folder was deleted and isn't made again
-    /// yet. This launch let go of its lock before anyone could connect.
+    /// yet. Or one of the two has a [scope](crate::Builder::scope) and the
+    /// other hasn't: owners with scopes share the guard only with one
+    /// another. This launch let go of its lock before anyone could connect.
     /// Only [`Builder::start`] takes the guard.
     ///
     /// [`Builder::dir`]: crate::Builder::dir

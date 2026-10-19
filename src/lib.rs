@@ -48,12 +48,13 @@
 //!   launch that took the lock in another runtime folder (another
 //!   container, another [`Builder::dir`], another app id) doesn't own that
 //!   state folder too: it runs alone at once with [`Reason::StateInUse`].
-//!   A process that gets [`Started::Alone`] must not write the state the
-//!   owner owns. If the runtime folder is deleted under a running owner and
-//!   another process takes the lock there before this one re-creates it (a
-//!   new owner, or a launch that finds this owner's guard and lets go
-//!   again), this one is told ([`End::LostLock`]) within a minute, and
-//!   gives its guard up.
+//!   Two owners that both have a [scope](Builder::scope) share the guard,
+//!   and own the state folder side by side. A process that gets
+//!   [`Started::Alone`] must not write the state the owner owns. If the
+//!   runtime folder is deleted under a running owner and another process
+//!   takes the lock there before this one re-creates it (a new owner, or a
+//!   launch that finds this owner's guard and lets go again), this one is
+//!   told ([`End::LostLock`]) within a minute, and gives its guard up.
 //! - Each launch ends one of three ways, whatever the timing (stopped
 //!   processes, slow handlers, expired timeouts):
 //!   - it hands off ([`Started::HandedOff`]): an owner's handler takes its
@@ -192,8 +193,10 @@
 //! under two [`Builder::dir`] folders, or as two app ids (an app and a
 //! companion tool that share its folder), say. The guard keeps the second
 //! from owning the state beside the first: it runs alone at once with
-//! [`Reason::StateInUse`]. A `start` that takes the lock makes the state
-//! folder first if it is missing, whether or not it takes the guard.
+//! [`Reason::StateInUse`]. Owners with a [scope](Builder::scope) take the
+//! guard shared, so they own one state folder side by side, but never
+//! beside an owner without one. A `start` that takes the lock makes the
+//! state folder first if it is missing, whether or not it takes the guard.
 //! Windows owners take no guard, and make nothing in the state folder.
 //!
 //! # Privileges
@@ -290,8 +293,11 @@
 //!   Whichever owns a state folder they share first holds its guard, and
 //!   the other's launches run alone with [`Reason::StateInUse`]. To have
 //!   them meet instead, pass the bind-mounted folder to [`Builder::dir`] in
-//!   both, with a state folder both see at one path. Use [`Builder::scope`]
-//!   with the container's name for one owner per container.
+//!   both, with a state folder both see at one path. For one owner per
+//!   container, give the launches in each container, and the host's, a
+//!   [scope](Builder::scope) of their own, such as the container's name:
+//!   owners with scopes share the guard, so the app must keep their writes
+//!   to the state safe.
 //! - Windows: mapped drives and `SUBST` letters belong to one logon
 //!   session, and every logon session of a user at one integrity level (a
 //!   second RDP session, an OpenSSH login, a scheduled task) reaches the
@@ -346,8 +352,9 @@
 //!   open file,
 //!   inherited across `fork`, and released when the last copy closes;
 //! - the guard, on Unix: `flock(LOCK_EX | LOCK_NB)` on
-//!   `.instance-handoff.lock` in the state folder, held as the lock is, and
-//!   never written;
+//!   `.instance-handoff.lock` in the state folder, or
+//!   `flock(LOCK_SH | LOCK_NB)` for an owner with a scope, held as the lock
+//!   is, and never written;
 //! - the address. On Unix, `instance.sock` beside the lock. When that path
 //!   is too long for a socket address, Linux reaches it through
 //!   `/proc/self/fd`; otherwise, and on other Unixes, it uses
