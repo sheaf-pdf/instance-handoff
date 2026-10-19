@@ -23,7 +23,9 @@ pub struct Claim<T> {
     claimed: Option<Box<sys::Claimed>>,
     place: sys::Place,
     state: Option<PathBuf>,
-    ctx: Ctx,
+    /// Boxed, so that [`Started::Owner`](crate::Started::Owner) isn't much
+    /// larger than the other outcomes.
+    ctx: Box<Ctx>,
     on_end: Mutex<Option<OnEnd>>,
     _payload: PhantomData<fn() -> T>,
 }
@@ -39,23 +41,29 @@ impl<T> fmt::Debug for Claim<T> {
 }
 
 impl<T> Claim<T> {
+    /// `instance_key` is the key the launch made for `state` and its scope
+    /// ([`Builder::instance_key`]) and compared in each HELLO. The owner
+    /// sends it as it is, never made again, so it can't differ from what
+    /// launches of the same state compare.
     pub(crate) fn new(
         b: &Builder,
         place: sys::Place,
         folder: sys::Folder,
         lock: sys::Lock,
         state: Option<PathBuf>,
+        instance_key: Vec<u8>,
     ) -> Claim<T> {
         Claim {
             claimed: Some(Box::new(sys::Claimed::new(folder, lock, &b.app_id))),
             place,
             state,
-            ctx: Ctx {
+            ctx: Box::new(Ctx {
                 app_id: b.app_id.clone(),
+                instance_key,
                 payload_version: b.payload_version,
                 nonce: nonce(),
                 upkeep: b.upkeep,
-            },
+            }),
             on_end: Mutex::new(None),
             _payload: PhantomData,
         }
@@ -132,7 +140,7 @@ impl<T> Claim<T> {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         spawn(
-            Core::new(handler, on_end, shared.clone(), self.ctx.clone()),
+            Core::new(handler, on_end, shared.clone(), Ctx::clone(&self.ctx)),
             listener,
             self.place.clone(),
         );
@@ -203,7 +211,7 @@ impl<T> Drop for Claim<T> {
         // process exits: nothing ever closes it.
         let shared = Shared::new(held);
         if !spawn(
-            Core::<()>::new(None, None, shared.clone(), self.ctx.clone()),
+            Core::<()>::new(None, None, shared.clone(), Ctx::clone(&self.ctx)),
             listener,
             self.place.clone(),
         ) {

@@ -81,7 +81,7 @@ pub(crate) fn instance_folder(state: Option<&Path>, scope: Option<&OsStr>) -> St
 /// folder, then the scope, each as `tag u8 | length u32 LE | bytes` (tag 1
 /// for the state, 2 for the scope), and left out when there is none. So
 /// `State::none()` differs from an empty path, and no scope from an empty
-/// one.
+/// one. The owner sends these bytes in HELLO's STATE record.
 pub(crate) fn instance_key(state: Option<&Path>, scope: Option<&OsStr>) -> Vec<u8> {
     let mut key = Vec::new();
     for (tag, part) in [(1u8, state.map(Path::as_os_str)), (2, scope)] {

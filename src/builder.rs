@@ -307,6 +307,13 @@ impl Builder {
         self.state.dir.as_deref().map(state::canonical)
     }
 
+    /// What the instance folder's name is hashed from, for the canonical
+    /// `state` and the scope. The owner sends it in HELLO, and a launch
+    /// compares it with its own.
+    pub(crate) fn instance_key(&self, state: Option<&Path>) -> Vec<u8> {
+        naming::instance_key(state, self.scope.as_deref())
+    }
+
     /// The runtime folder for the canonical `state`: the base, and in it
     /// the instance folder that `state` and the scope name.
     pub(crate) fn place(&self, state: Option<&Path>) -> Result<sys::Place, Reason> {

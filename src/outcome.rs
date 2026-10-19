@@ -228,7 +228,11 @@ pub enum Reason {
         waited: Duration,
     },
     /// The lock holder is another app: the same id of the other [`Kind`],
-    /// or another id that shares the folder.
+    /// another id that shares the folder, or the owner of another state
+    /// folder or scope whose instance folder has the same name, which only
+    /// a hash collision makes. The owner names its app, kind and state when
+    /// a launch connects, so the launch learns this at once and sends
+    /// nothing.
     ///
     /// [`Kind`]: crate::Kind
     #[non_exhaustive]
@@ -393,9 +397,10 @@ impl fmt::Display for Reason {
             Reason::Unresponsive { waited } => {
                 write!(f, "an instance is running but didn't answer in {waited:?}")
             }
-            Reason::OtherApp {} => {
-                f.write_str("another app, or this one of the other kind, holds the runtime folder")
-            }
+            Reason::OtherApp {} => f.write_str(
+                "another app, or this one of the other kind or of another state, holds the \
+                 runtime folder",
+            ),
             Reason::WireVersion { ours, theirs } => write!(
                 f,
                 "the running instance speaks handoff protocol {theirs}, this one {ours}"

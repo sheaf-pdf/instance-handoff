@@ -400,16 +400,14 @@ fn an_old_json_launch_is_refused_and_nothing_is_delivered() {
     owner.release();
 }
 
-// An owner that won't serve the launch's user says so in place of HELLO.
-// The owner here is this test, so the launch's own check of the owner
-// passes and only the owner's refusal is left.
+/// An owner played by the test, for `builder(dir)`: the runtime folder,
+/// its lock held, and a listener on its socket. The owner is this process,
+/// so the launch's own check of the owner passes.
 #[cfg(unix)]
-#[test]
-fn an_owner_that_refuses_the_launchs_user_says_so_at_once() {
+fn fake_owner(dir: &Dir) -> (std::fs::File, std::os::unix::net::UnixListener) {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::DirBuilderExt;
-    let dir = dir();
-    let run = builder(&dir).runtime_dir().unwrap();
+    let run = builder(dir).runtime_dir().unwrap();
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -420,6 +418,16 @@ fn an_owner_that_refuses_the_launchs_user_says_so_at_once() {
     let locked = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     assert_eq!(locked, 0);
     let listener = std::os::unix::net::UnixListener::bind(run.join("instance.sock")).unwrap();
+    (lock, listener)
+}
+
+// An owner that won't serve the launch's user says so in place of HELLO.
+// Only the owner's refusal is left to fail the launch.
+#[cfg(unix)]
+#[test]
+fn an_owner_that_refuses_the_launchs_user_says_so_at_once() {
+    let dir = dir();
+    let (_lock, listener) = fake_owner(&dir);
     // REPLY: not delivered, refused, cause PEER.
     #[rustfmt::skip]
     let refused = [
@@ -438,6 +446,61 @@ fn an_owner_that_refuses_the_launchs_user_says_so_at_once() {
     assert!(matches!(reason, Reason::Peer { .. }), "{reason}");
     let reason = builder(&dir).hand_off(&args(&["x"])).unwrap_err();
     assert!(matches!(reason, Reason::Peer { .. }), "{reason}");
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    owner.join().unwrap();
+}
+
+// Two state folders whose instance folders share a name, as a hash
+// collision would make them: the owner's HELLO names its state folder, and
+// a launch of the other runs alone at once and sends nothing.
+#[cfg(unix)]
+#[test]
+fn an_owner_of_another_state_in_the_same_folder_is_another_app() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = dir();
+    let (_lock, listener) = fake_owner(&dir);
+    let record =
+        |tag: u8, bytes: &[u8]| [&[tag][..], &(bytes.len() as u32).to_le_bytes(), bytes].concat();
+    // HELLO from an owner of this app, serving, whose state folder is
+    // `state` in the temporary folder, and with no scope.
+    let hello = |state: &str| {
+        let state = canonical(dir.tmp.path()).join(state);
+        let body = [
+            record(1, &[1, 0, 1, 0]),
+            record(2, &[&[1][..], APP.as_str().as_bytes()].concat()),
+            record(3, &[7; 8]),
+            record(4, &[0; 4]),
+            record(5, &(4u32 << 20).to_le_bytes()),
+            record(6, &[0]),
+            record(9, &record(1, state.as_os_str().as_bytes())),
+        ]
+        .concat();
+        [&b"IHND\x01"[..], &(body.len() as u32).to_le_bytes(), &body].concat()
+    };
+    // First the launch's own state, which it accepts, then another.
+    let hellos = [
+        hello("state"),
+        hello("elsewhere"),
+        hello("elsewhere"),
+        hello("elsewhere"),
+    ];
+    let owner = std::thread::spawn(move || {
+        for (hello, stream) in hellos.into_iter().zip(listener.incoming()) {
+            let mut stream = stream.unwrap();
+            stream.write_all(&hello).unwrap();
+            let mut got = Vec::new();
+            stream.read_to_end(&mut got).unwrap();
+            assert!(got.is_empty(), "the launch sent {got:?}");
+        }
+    });
+    builder(&dir).probe().unwrap();
+    let t = Instant::now();
+    let reason = builder(&dir).probe().unwrap_err();
+    assert!(matches!(reason, Reason::OtherApp { .. }), "{reason}");
+    let reason = builder(&dir).hand_off(&args(&["x"])).unwrap_err();
+    assert!(matches!(reason, Reason::OtherApp { .. }), "{reason}");
+    let reason = alone(builder(&dir).start(&args(&["x"])));
+    assert!(matches!(reason, Reason::OtherApp { .. }), "{reason}");
     assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     owner.join().unwrap();
 }
@@ -641,6 +704,10 @@ fn launches_that_name_one_state_folder_through_a_link_meet() {
     };
     assert!(info.confirmed());
     assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["x"]));
+    Builder::new(APP, link.join("app"))
+        .dir(&dir.path)
+        .probe()
+        .unwrap();
     owner.release();
 }
 
@@ -656,6 +723,28 @@ fn scopes_make_separate_owners() {
     );
     a.release();
     b.release();
+}
+
+// The owner's HELLO names its state folder and scope, and a launch checks
+// them against its own, which it resolves itself. A scope of 5000 bytes
+// makes a HELLO past the 4096 bytes of its other records: a launch makes
+// room for its own STATE, so its owner is still reached.
+#[test]
+fn launches_of_the_owners_state_and_scope_pass_its_check() {
+    let dir = dir();
+    for b in [
+        builder(&dir),
+        builder(&dir).scope("work"),
+        builder(&dir).scope("x".repeat(5000)),
+        Builder::new(APP, State::none()).dir(&dir.path),
+        Builder::new(APP, State::none()).dir(&dir.path).scope(""),
+    ] {
+        let (owner, rx) = serve(claim(b.start(&Args::default())));
+        assert!(b.probe().unwrap().confirmed());
+        b.hand_off(&args(&["x"])).unwrap();
+        assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["x"]));
+        owner.release();
+    }
 }
 
 #[cfg(unix)]

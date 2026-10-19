@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::wire::{self, Hello, Reply, refusal, state, status};
+use crate::wire::{self, Hello, Reply, refusal, serving, status};
 use crate::{Activation, Answer, AppId, End, Payload, Request, sys};
 
 /// From accepting a connection to reading its REQUEST.
@@ -46,13 +46,18 @@ impl Default for Upkeep {
 #[derive(Debug, Clone)]
 pub(crate) struct Ctx {
     pub(crate) app_id: AppId,
+    /// The state folder and scope, framed as the instance folder's name is
+    /// hashed from them ([`naming::instance_key`]): HELLO's STATE.
+    ///
+    /// [`naming::instance_key`]: crate::naming::instance_key
+    pub(crate) instance_key: Vec<u8>,
     pub(crate) payload_version: u32,
     pub(crate) nonce: u64,
     pub(crate) upkeep: Upkeep,
 }
 
 impl Ctx {
-    fn hello(&self, state: u8) -> Vec<u8> {
+    fn hello(&self, serving: u8) -> Vec<u8> {
         Hello {
             wire_min: wire::WIRE_MIN,
             wire_max: wire::WIRE_MAX,
@@ -61,7 +66,8 @@ impl Ctx {
             nonce: self.nonce,
             payload_version: self.payload_version,
             max_request: wire::MAX_REQUEST,
-            state,
+            serving,
+            state: self.instance_key.clone(),
             features: wire::features::REFUSALS,
         }
         .encode()
@@ -145,17 +151,18 @@ impl<T: Payload> Core<T> {
         }
     }
 
-    /// The state later launches are told. A stop counts from the moment
-    /// it's asked for, not from the next [`Core::poll_control`]: an accept
-    /// pass that began before the stop still tells later connections busy.
-    pub(crate) fn state(&self) -> u8 {
+    /// The serving value later launches are told. A stop counts from the
+    /// moment it's asked for, not from the next [`Core::poll_control`]: an
+    /// accept pass that began before the stop still tells later connections
+    /// busy.
+    pub(crate) fn serving_value(&self) -> u8 {
         match self.serving {
             Serving::Taking | Serving::Declining if self.shared.stop.load(Ordering::SeqCst) => {
-                state::BUSY
+                serving::BUSY
             }
-            Serving::Taking => state::TAKING,
-            Serving::Stopped => state::BUSY,
-            Serving::Declining | Serving::Panicked => state::DECLINING,
+            Serving::Taking => serving::TAKING,
+            Serving::Stopped => serving::BUSY,
+            Serving::Declining | Serving::Panicked => serving::DECLINING,
         }
     }
 
@@ -276,7 +283,7 @@ impl<T: Payload> Session<T> {
         Session {
             phase: Phase::Request,
             inbuf: Vec::new(),
-            out: core.ctx.hello(core.state()),
+            out: core.ctx.hello(core.serving_value()),
             sent: 0,
             deadline: now + REQUEST_WAIT,
             pending: None,
@@ -434,9 +441,9 @@ impl<T: Payload> Session<T> {
                 return self.reply(Reply::refused(refusal::UNDECODABLE), now);
             }
         };
-        match core.state() {
-            state::TAKING => {}
-            state::DECLINING => return self.reply(Reply::new(false, status::DECLINED), now),
+        match core.serving_value() {
+            serving::TAKING => {}
+            serving::DECLINING => return self.reply(Reply::new(false, status::DECLINED), now),
             _ => return self.reply(Reply::new(false, status::BUSY), now),
         }
         let cwd = req
@@ -512,6 +519,7 @@ mod tests {
     fn ctx(app_id: AppId) -> Ctx {
         Ctx {
             app_id,
+            instance_key: b"\x02\x01\0\0\0k".to_vec(),
             payload_version: 3,
             nonce: 7,
             upkeep: Upkeep::default(),
@@ -559,14 +567,16 @@ mod tests {
     // Only the HELLO, with no owner behind it, so the windowed app needs
     // no display.
     #[test]
-    fn hello_names_the_app_and_its_kind() {
+    fn hello_names_the_app_its_kind_and_its_state() {
         for (app_id, byte) in [(AppId::windowed("test"), 0), (AppId::headless("test"), 1)] {
-            let hello = frames(&ctx(app_id.clone()).hello(state::TAKING));
+            let ctx = ctx(app_id.clone());
+            let hello = frames(&ctx.hello(serving::TAKING));
             assert_eq!(hello[0].0, wire::HELLO);
             let hello = Hello::decode(&hello[0].1).unwrap();
             assert_eq!(hello.app_id, "test");
             assert_eq!(hello.app_kind, wire::app_kind(app_id.kind()));
             assert_eq!(hello.app_kind, byte, "{app_id:?}");
+            assert_eq!(hello.state, ctx.instance_key);
         }
     }
 
@@ -578,7 +588,7 @@ mod tests {
         let hello = take_out(&mut s);
         assert_eq!(hello[0].0, wire::HELLO);
         let hello = Hello::decode(&hello[0].1).unwrap();
-        assert_eq!(hello.state, state::TAKING);
+        assert_eq!(hello.serving, serving::TAKING);
         assert_eq!(hello.features, wire::features::REFUSALS);
 
         let args = Args::new(["a.pdf"]);
@@ -701,14 +711,17 @@ mod tests {
         let now = Instant::now();
         let mut s = Session::new(&c, Peer::default(), now);
         let hello = take_out(&mut s);
-        assert_eq!(Hello::decode(&hello[0].1).unwrap().state, state::BUSY);
+        assert_eq!(Hello::decode(&hello[0].1).unwrap().serving, serving::BUSY);
         s.read(&request(3, Args::default().encode().unwrap()), &c, now);
         assert_eq!(reply(&take_out(&mut s)).status, status::BUSY);
 
         let declining = core(None);
         let mut s = Session::new(&declining, Peer::default(), now);
         let hello = take_out(&mut s);
-        assert_eq!(Hello::decode(&hello[0].1).unwrap().state, state::DECLINING);
+        assert_eq!(
+            Hello::decode(&hello[0].1).unwrap().serving,
+            serving::DECLINING
+        );
         assert_eq!(declining.shared.ended(), None);
     }
 
@@ -721,7 +734,7 @@ mod tests {
         assert_eq!(c.deliver(Request::local(Args::default())), None);
         assert_eq!(c.shared.ended(), Some(End::Panicked));
         assert_eq!(*ended.lock().unwrap(), Some(End::Panicked));
-        assert_eq!(c.state(), state::DECLINING);
+        assert_eq!(c.serving_value(), serving::DECLINING);
         // Later launches are turned away without reaching the handler.
         assert_eq!(
             c.deliver(Request::local(Args::default())),
@@ -745,12 +758,7 @@ mod tests {
             Some(Box::new(|_| Answer::Take)),
             None,
             shared,
-            Ctx {
-                app_id: AppId::headless("test"),
-                payload_version: 3,
-                nonce: 7,
-                upkeep: Upkeep::default(),
-            },
+            ctx(AppId::headless("test")),
         );
         let now = Instant::now();
         let mut s = Session::new(&core, Peer::default(), now);
@@ -758,7 +766,7 @@ mod tests {
         s.read(&request(3, vec![1]), &core, now);
         let r = reply(&take_out(&mut s));
         assert_eq!(r.refusal, Some(refusal::UNDECODABLE));
-        assert_eq!(core.state(), state::TAKING);
+        assert_eq!(core.serving_value(), serving::TAKING);
     }
 
     #[test]
@@ -766,7 +774,7 @@ mod tests {
         let mut c = core(None);
         c.shared.stop.store(true, Ordering::SeqCst);
         assert!(c.poll_control());
-        assert_eq!(c.state(), state::BUSY);
+        assert_eq!(c.serving_value(), serving::BUSY);
         assert_eq!(c.shared.ended(), Some(End::Stopped));
         c.end(End::LostLock);
         assert_eq!(c.shared.ended(), Some(End::LostLock));
@@ -779,7 +787,7 @@ mod tests {
         let now = Instant::now();
         let mut s = Session::new(&c, Peer::default(), now);
         let hello = take_out(&mut s);
-        assert_eq!(Hello::decode(&hello[0].1).unwrap().state, state::BUSY);
+        assert_eq!(Hello::decode(&hello[0].1).unwrap().serving, serving::BUSY);
         s.read(&request(3, Args::default().encode().unwrap()), &c, now);
         assert_eq!(reply(&take_out(&mut s)).status, status::BUSY);
         assert_eq!(c.shared.ended(), None);

@@ -162,9 +162,12 @@
 //! hex digits of a hash of the state folder, with its links resolved as
 //! [`State::dir`] says, and of the [scope](Builder::scope). So launches
 //! that name one state folder meet one owner, and launches that name two
-//! get two. In Local AppData on Windows, the lock is one folder further
-//! down: in `run`, or in `run-high` for a process run as administrator; see
-//! [Privileges](#privileges).
+//! get two. Should two hash alike, a launch of one that reaches the
+//! other's owner gets [`Reason::OtherApp`]: [`start`](Builder::start) runs
+//! alone with it, and [`hand_off`](Builder::hand_off) and
+//! [`probe`](Builder::probe) return it. In Local AppData on Windows, the
+//! lock is one folder further down: in `run`, or in `run-high` for a
+//! process run as administrator; see [Privileges](#privileges).
 //!
 //! [`Builder::dir`] replaces the app's folder. It is never a config folder:
 //! on Windows that roams and may be a network share, where a lock would
@@ -333,16 +336,19 @@
 //!   secret is 32 random lowercase hex digits, published as
 //!   `<id> <secret>` and a newline in `instance.pipe` beside the lock;
 //! - the exchange. The owner sends HELLO (its app id and kind, the protocol
-//!   versions it speaks, a random nonce, its payload version, its state and
-//!   its features). The launch checks it and sends REQUEST. The owner answers
-//!   READY. The launch, if still inside its timeout, sends COMMIT, and only
-//!   then does the owner call the handler and send REPLY. An owner that
-//!   refuses a launch never just closes the connection: it sends REPLY
-//!   with the cause at once, in place of READY, or in place of HELLO when
-//!   an owner on Unix refuses the launch's user. Feature bit 0 in HELLO
-//!   says so, and every owner of this release sets it. A launch reads a
-//!   cause it doesn't know as a decline, and a close before HELLO as a
-//!   sign to try again. Every message is
+//!   versions it speaks, a random nonce, its payload version, whether it
+//!   serves, its state folder and scope, and its features). The state
+//!   folder and scope are the bytes the instance folder's name is hashed
+//!   from, compared byte for byte, so a launch tells apart the owner of
+//!   another state whose hash collides with its own. The launch checks it
+//!   all and sends REQUEST. The owner answers READY. The launch, if still
+//!   inside its timeout, sends COMMIT, and only then does the owner call
+//!   the handler and send REPLY. An owner that refuses a launch never just
+//!   closes the connection: it sends REPLY with the cause at once, in place
+//!   of READY, or in place of HELLO when an owner on Unix refuses the
+//!   launch's user. Feature bit 0 in HELLO says so, and every owner of this
+//!   release sets it. A launch reads a cause it doesn't know as a decline,
+//!   and a close before HELLO as a sign to try again. Every message is
 //!   `"IHND" | kind u8 | length u32 LE | records`, and a record is
 //!   `tag u8 | length u32 LE | bytes`. Peers skip records they don't know,
 //!   so later releases add to the exchange without breaking it, unless the

@@ -11,7 +11,9 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
 2. **REQUEST.** 0x8A HAND_DOWN: a variant byte, then two RIDs as u32 LE. It is critical, so an older owner refuses it. *Recommended.*
 3. **Refusal codes.** 8 PRIVILEGE, 10 PEER; 9, 11 and 12 reserved. *Recommended.*
 4. **APP.** One kind byte, then the id. *Recommended.*
-5. **STATE** carries the exact framed bytes the instance folder's hash is computed from. *Recommended.*
+5. **STATE** carries the exact framed bytes the instance folder's hash is computed from. *Recommended.* Slice 13 settled two cases this leaves open. *Our call (slice 13).*
+   - Every HELLO must carry STATE, even an empty one (`State::none()` with no scope). A HELLO without it is malformed, and a launch reads it as not this protocol.
+   - A launch reads a HELLO body of up to 4096 bytes more than its own STATE, so an owner of the same state always fits, however long the path or scope. A longer one isn't from its owner, and reads as not this protocol too.
 6. **The owner's level in REPLY** travels in the next free REPLY tag, chosen in slice 17 and pinned by its frozen test. Unix owners don't send LEVEL. *Our call; Unix part recommended.*
 7. **Refusing before HELLO.** On Unix, a REPLY REFUSED PEER is the first and only frame, and launches handle both shapes. A Windows owner can refuse only after HELLO, because impersonation needs a read, so it never refuses a probe. *Recommended.*
 8. **FEATURES** ships in 0.1, though no 0.1 launch reads bit 0 yet. *Recommended.*

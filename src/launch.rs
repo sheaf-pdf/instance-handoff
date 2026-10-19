@@ -4,7 +4,7 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use crate::wire::{self, Hello, Reply, refusal, state, status};
+use crate::wire::{self, Hello, Reply, refusal, serving, status};
 use crate::{
     Activation, AppId, Builder, Claim, ElevatedOwner, Ineligible, Kind, Mode, OwnerInfo, Payload,
     Reason, Started, sys,
@@ -204,6 +204,7 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
         Ok(place) => place,
         Err(reason) => return Started::Alone(reason),
     };
+    let key = b.instance_key(state.as_deref());
     let open = |place| match sys::open_folder(place, true) {
         Ok(Some(folder)) => Ok(folder),
         Ok(None) => Err(Reason::NoRuntimeDir {}),
@@ -220,7 +221,9 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
     let mut waiting: Option<Waiting> = None;
     loop {
         match folder.lock() {
-            Ok(Some(lock)) => return Started::Owner(Claim::new(b, place, folder, lock, state)),
+            Ok(Some(lock)) => {
+                return Started::Owner(Claim::new(b, place, folder, lock, state, key));
+            }
             Ok(None) => {}
             // The folder was deleted under this launch (a cleaner, `rm`):
             // open it afresh and keep going.
@@ -249,7 +252,7 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
                 std::thread::sleep(Duration::from_millis(5));
                 match try_own(&folder) {
                     Ok(Some(lock)) => {
-                        return Started::Owner(Claim::new(b, place, folder, lock, state));
+                        return Started::Owner(Claim::new(b, place, folder, lock, state, key));
                     }
                     Ok(None) => {}
                     Err(reason) => return Started::Alone(reason),
@@ -266,15 +269,15 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
                 Err(reason) => return Started::Alone(reason),
             },
         };
-        match exchange(&folder, b, Some(bytes), &limits, None) {
+        match exchange(&folder, b, &key, Some(bytes), &limits, None) {
             Exchange::Taken(info) | Exchange::Unconfirmed(info) => return Started::HandedOff(info),
             Exchange::Fail(reason) => return Started::Alone(reason),
             Exchange::Retry(w) => waiting = Some(w.after(waiting, deadline)),
             Exchange::SameOwner => unreachable!("no commit to compare with"),
             Exchange::Lost(nonce) => {
-                return match after_commit(&folder, b, bytes, nonce, true, &limits) {
+                return match after_commit(&folder, b, &key, bytes, nonce, true, &limits) {
                     AfterCommit::Own(lock) => {
-                        Started::Owner(Claim::new(b, place, folder, lock, state))
+                        Started::Owner(Claim::new(b, place, folder, lock, state, key))
                     }
                     AfterCommit::Info(info) => Started::HandedOff(info),
                 };
@@ -296,7 +299,9 @@ pub(crate) fn hand_off<T: Payload>(b: &Builder, payload: Option<&T>) -> Result<O
     if !sys::SUPPORTED {
         return Err(Reason::Unsupported {});
     }
-    let place = b.place(b.canonical_state().as_deref())?;
+    let state = b.canonical_state();
+    let place = b.place(state.as_deref())?;
+    let key = b.instance_key(state.as_deref());
     let Some(folder) = sys::open_folder(&place, false)? else {
         return Err(Reason::NoOwner {});
     };
@@ -319,14 +324,14 @@ pub(crate) fn hand_off<T: Payload>(b: &Builder, payload: Option<&T>) -> Result<O
         if let Some(w) = waiting.filter(|_| past(deadline)) {
             return Err(w.reason(began.elapsed()));
         }
-        match exchange(&folder, b, request.as_deref(), &limits, None) {
+        match exchange(&folder, b, &key, request.as_deref(), &limits, None) {
             Exchange::Taken(info) | Exchange::Unconfirmed(info) => return Ok(info),
             Exchange::Fail(reason) => return Err(reason),
             Exchange::Retry(w) => waiting = Some(w.after(waiting, deadline)),
             Exchange::SameOwner => unreachable!("no commit to compare with"),
             Exchange::Lost(nonce) => {
                 let bytes = request.as_deref().expect("only a request commits");
-                return match after_commit(&folder, b, bytes, nonce, false, &limits) {
+                return match after_commit(&folder, b, &key, bytes, nonce, false, &limits) {
                     AfterCommit::Info(info) => Ok(info),
                     AfterCommit::Own(_) => unreachable!("a handoff never owns"),
                 };
@@ -350,6 +355,7 @@ enum AfterCommit {
 fn after_commit(
     folder: &sys::Folder,
     b: &Builder,
+    key: &[u8],
     bytes: &[u8],
     mut nonce: u64,
     may_own: bool,
@@ -376,7 +382,7 @@ fn after_commit(
         } else if !folder.lock_held().unwrap_or(true) {
             return AfterCommit::Info(unconfirmed);
         }
-        match exchange(folder, b, Some(bytes), &inner, Some(nonce)) {
+        match exchange(folder, b, key, Some(bytes), &inner, Some(nonce)) {
             Exchange::Taken(info) | Exchange::Unconfirmed(info) => return AfterCommit::Info(info),
             Exchange::SameOwner | Exchange::Fail(_) => return AfterCommit::Info(unconfirmed),
             Exchange::Lost(n) => nonce = n,
@@ -389,19 +395,25 @@ fn after_commit(
     }
 }
 
-/// Whether `hello` comes from an owner of `app_id`: the same id and kind.
-/// The two kinds of an id share its folder, so an owner of the other kind
-/// is another app.
-fn same_app(hello: &Hello, app_id: &AppId) -> bool {
-    hello.app_id == app_id.as_str() && hello.app_kind == wire::app_kind(app_id.kind())
+/// Whether `hello` comes from an owner of `app_id` and of this launch's
+/// state folder and scope (`key`, as [`Builder::instance_key`] makes it):
+/// the same id, kind and STATE. The two kinds of an id share its folder,
+/// and so do two keys whose hashes collide, so such an owner is another
+/// app.
+fn same_app(hello: &Hello, app_id: &AppId, key: &[u8]) -> bool {
+    hello.app_id == app_id.as_str()
+        && hello.app_kind == wire::app_kind(app_id.kind())
+        && hello.state == key
 }
 
 /// One connection: HELLO, checks, REQUEST, READY, COMMIT, REPLY. Without a
-/// request (a probe), it ends after HELLO. `committed_to` is the nonce of
-/// an owner this launch already committed to.
+/// request (a probe), it ends after HELLO. `key` is this launch's instance
+/// key, which HELLO's STATE must match. `committed_to` is the nonce of an
+/// owner this launch already committed to.
 fn exchange(
     folder: &sys::Folder,
     b: &Builder,
+    key: &[u8],
     request: Option<&[u8]>,
     limits: &Limits,
     committed_to: Option<u64>,
@@ -421,7 +433,7 @@ fn exchange(
     let mut reader = Reader::default();
     // The owner speaks first, and only once it serves: until then this
     // waits in its backlog.
-    let hello = match reader.frame(&mut conn, wire::SMALL, deadline) {
+    let hello = match reader.frame(&mut conn, wire::hello_limit(key), deadline) {
         Ok((wire::HELLO, body)) => match Hello::decode(&body) {
             Ok(hello) => hello,
             Err(_) => return Exchange::Fail(not_ours()),
@@ -439,7 +451,7 @@ fn exchange(
             return Exchange::Retry(Waiting::Unresponsive);
         }
     };
-    if !same_app(&hello, &b.app_id) {
+    if !same_app(&hello, &b.app_id, key) {
         return Exchange::Fail(Reason::OtherApp {});
     }
     if hello.wire_max < wire::WIRE_MIN || hello.wire_min > wire::WIRE_MAX {
@@ -457,10 +469,10 @@ fn exchange(
     if committed_to == Some(hello.nonce) {
         return Exchange::SameOwner;
     }
-    match hello.state {
-        state::TAKING => {}
-        state::DECLINING => return Exchange::Fail(Reason::Declined {}),
-        // Busy, and states this build doesn't know: a later release that
+    match hello.serving {
+        serving::TAKING => {}
+        serving::DECLINING => return Exchange::Fail(Reason::Declined {}),
+        // Busy, and values this build doesn't know: a later release that
         // wants old launches to send their request advertises TAKING and
         // lets its REPLY decide.
         _ => return Exchange::Retry(Waiting::Busy),
@@ -646,7 +658,8 @@ mod tests {
             nonce: 7,
             payload_version: 2,
             max_request: 100,
-            state: state::TAKING,
+            serving: serving::TAKING,
+            state: Vec::new(),
             features: wire::features::REFUSALS,
         }
     }
@@ -673,13 +686,40 @@ mod tests {
             (Kind::Headless, Kind::Windowed),
         ] {
             owner.app_kind = wire::app_kind(kind);
-            assert!(same_app(&owner, &app(kind)), "{kind:?}");
-            assert!(!same_app(&owner, &app(other)), "{kind:?}");
+            assert!(same_app(&owner, &app(kind), &[]), "{kind:?}");
+            assert!(!same_app(&owner, &app(other), &[]), "{kind:?}");
         }
         owner.app_kind = 2;
-        assert!(!same_app(&owner, &app(Kind::Windowed)));
-        assert!(!same_app(&owner, &app(Kind::Headless)));
-        assert!(!same_app(&hello(), &AppId::headless("other")));
+        assert!(!same_app(&owner, &app(Kind::Windowed), &[]));
+        assert!(!same_app(&owner, &app(Kind::Headless), &[]));
+        assert!(!same_app(&hello(), &AppId::headless("other"), &[]));
+    }
+
+    // Two state folders or scopes whose instance folders share a name, as
+    // a hash collision would make them: the owner of one is another app to
+    // a launch of the other. STATE is compared byte for byte.
+    #[test]
+    fn an_owner_of_another_state_is_another_app() {
+        use std::path::Path;
+        let app = AppId::headless("test");
+        let b = Builder::new(app.clone(), crate::State::none());
+        let key = b.instance_key(Some(Path::new("/a")));
+        let owner = Hello {
+            state: key.clone(),
+            ..hello()
+        };
+        assert!(same_app(&owner, &app, &key));
+        for other in [
+            b.instance_key(None),
+            b.instance_key(Some(Path::new("/b"))),
+            b.instance_key(Some(Path::new("/a/"))),
+            b.clone().scope("").instance_key(Some(Path::new("/a"))),
+            b.clone().scope("/a").instance_key(None),
+            key[..key.len() - 1].to_vec(),
+            [&key[..], b"\0"].concat(),
+        ] {
+            assert!(!same_app(&owner, &app, &other), "{other:?}");
+        }
     }
 
     // Raised: rights raised from a login. Above normal: root, on Unix.

@@ -16,7 +16,8 @@ pub(crate) const HEADER: usize = 9;
 /// The wire versions this build speaks.
 pub(crate) const WIRE_MIN: u16 = 1;
 pub(crate) const WIRE_MAX: u16 = 1;
-/// The largest HELLO, READY, COMMIT or REPLY body.
+/// The largest READY, COMMIT or REPLY body, and the room in HELLO beside
+/// its STATE record: see [`hello_limit`].
 pub(crate) const SMALL: usize = 4096;
 /// The largest REQUEST an owner takes.
 pub(crate) const MAX_REQUEST: u32 = 4 << 20;
@@ -31,6 +32,14 @@ pub(crate) const REPLY: u8 = 5;
 
 const CRITICAL: u8 = 0x80;
 
+/// The largest HELLO body a launch reads, given its own STATE. An owner of
+/// the same state folder and scope sends the same STATE, so its HELLO
+/// fits. A longer one isn't from this launch's owner, and reads as not
+/// this protocol.
+pub(crate) fn hello_limit(state: &[u8]) -> usize {
+    SMALL.saturating_add(state.len())
+}
+
 /// HELLO record tags.
 mod hello {
     pub const WIRE: u8 = 1;
@@ -38,13 +47,14 @@ mod hello {
     pub const NONCE: u8 = 3;
     pub const PAYLOAD_VERSION: u8 = 4;
     pub const MAX_REQUEST: u8 = 5;
-    pub const STATE: u8 = 6;
-    // 7 to 10 are kept for records that come later.
+    pub const SERVING: u8 = 6;
+    // 7, 8 and 10 are kept for records that come later.
+    pub const STATE: u8 = 9;
     pub const FEATURES: u8 = 11;
 }
 
-/// The owner's state, in HELLO.
-pub(crate) mod state {
+/// Whether the owner serves, in HELLO's SERVING record.
+pub(crate) mod serving {
     pub const TAKING: u8 = 0;
     pub const BUSY: u8 = 1;
     pub const DECLINING: u8 = 2;
@@ -246,7 +256,14 @@ pub(crate) struct Hello {
     pub(crate) nonce: u64,
     pub(crate) payload_version: u32,
     pub(crate) max_request: u32,
-    pub(crate) state: u8,
+    /// A [`serving`] value.
+    pub(crate) serving: u8,
+    /// The state folder and scope the owner's instance folder is named
+    /// from, as [`naming::instance_key`] frames them. A launch compares it
+    /// with its own, so two whose hashes collide never hand off.
+    ///
+    /// [`naming::instance_key`]: crate::naming::instance_key
+    pub(crate) state: Vec<u8>,
     /// [`features`] bits; none from an owner that predates them.
     pub(crate) features: u32,
 }
@@ -264,7 +281,8 @@ impl Hello {
             .bytes(hello::NONCE, &self.nonce.to_le_bytes())
             .bytes(hello::PAYLOAD_VERSION, &self.payload_version.to_le_bytes())
             .bytes(hello::MAX_REQUEST, &self.max_request.to_le_bytes())
-            .bytes(hello::STATE, &[self.state])
+            .bytes(hello::SERVING, &[self.serving])
+            .bytes(hello::STATE, &self.state)
             .bytes(hello::FEATURES, &self.features.to_le_bytes())
             .finish()
     }
@@ -279,6 +297,7 @@ impl Hello {
                 NONCE,
                 PAYLOAD_VERSION,
                 MAX_REQUEST,
+                SERVING,
                 STATE,
                 FEATURES,
             ],
@@ -300,7 +319,8 @@ impl Hello {
             nonce: u64::from_le_bytes(r.required(NONCE)?),
             payload_version: u32::from_le_bytes(r.required(PAYLOAD_VERSION)?),
             max_request: u32::from_le_bytes(r.required(MAX_REQUEST)?),
-            state: r.fixed::<1>(STATE)?.map_or(state::TAKING, |[s]| s),
+            serving: r.fixed::<1>(SERVING)?.map_or(serving::TAKING, |[s]| s),
+            state: r.get(STATE).ok_or(Error::Malformed)?.to_vec(),
             features: r.fixed(FEATURES)?.map_or(0, u32::from_le_bytes),
         })
     }
@@ -474,7 +494,10 @@ pub(crate) fn os_from_bytes(b: &[u8]) -> Result<OsString, BoxError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+    use crate::naming;
 
     // The exact bytes of each message are the contract between builds that
     // use different releases of this crate. These tests write them out as
@@ -489,30 +512,65 @@ mod tests {
             nonce: 0x0102_0304_0506_0708,
             payload_version: 7,
             max_request: MAX_REQUEST,
-            state: state::BUSY,
+            serving: serving::BUSY,
+            state: naming::instance_key(Some(Path::new("/s")), Some(OsStr::new("k"))),
             features: features::REFUSALS,
         };
         let bytes = hello.encode();
         #[rustfmt::skip]
         assert_eq!(bytes, [
-            b'I', b'H', b'N', b'D', 1, 62, 0, 0, 0,
+            b'I', b'H', b'N', b'D', 1, 80, 0, 0, 0,
             1, 4, 0, 0, 0, 1, 0, 1, 0,
             2, 2, 0, 0, 0, 1, b'a',
             3, 8, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1,
             4, 4, 0, 0, 0, 7, 0, 0, 0,
             5, 4, 0, 0, 0, 0, 0, 0x40, 0,
             6, 1, 0, 0, 0, 1,
+            9, 13, 0, 0, 0, 1, 2, 0, 0, 0, b'/', b's', 2, 1, 0, 0, 0, b'k',
             11, 4, 0, 0, 0, 1, 0, 0, 0,
         ]);
         let (kind, body, used) = split(&bytes, SMALL).unwrap().unwrap();
         assert_eq!((kind, used), (HELLO, bytes.len()));
         assert_eq!(Hello::decode(body).unwrap(), hello);
-        // The other app kind and states, which the bytes above don't show.
+        // The other app kind and serving values, which the bytes above
+        // don't show.
         assert_eq!(app_kind(Kind::Windowed), 0);
-        assert_eq!((state::TAKING, state::DECLINING), (0, 2));
+        assert_eq!((serving::TAKING, serving::DECLINING), (0, 2));
         // An owner from before FEATURES has none.
         let old = Hello::decode(&body[..body.len() - 9]).unwrap();
         assert_eq!(old.features, 0);
+    }
+
+    // A launch reads a HELLO of up to SMALL bytes beside its own STATE, so
+    // an owner of the same state is read however long the state is. With
+    // the room for an empty STATE alone, the same HELLO is too large.
+    #[test]
+    fn a_hello_fits_beside_the_launchs_own_state() {
+        let hello = Hello {
+            wire_min: 1,
+            wire_max: 1,
+            app_id: "a".into(),
+            app_kind: app_kind(Kind::Headless),
+            nonce: 1,
+            payload_version: 0,
+            max_request: MAX_REQUEST,
+            serving: serving::TAKING,
+            state: vec![b'x'; 5000],
+            features: features::REFUSALS,
+        };
+        let bytes = hello.encode();
+        let len = bytes.len() - HEADER;
+        assert!(len > SMALL, "{len}");
+        let (kind, body, used) = split(&bytes, hello_limit(&hello.state)).unwrap().unwrap();
+        assert_eq!((kind, used), (HELLO, bytes.len()));
+        assert_eq!(Hello::decode(body).unwrap(), hello);
+        assert_eq!(
+            split(&bytes, hello_limit(&[])),
+            Err(Error::TooLarge {
+                size: len,
+                limit: SMALL
+            })
+        );
     }
 
     #[test]
@@ -671,16 +729,22 @@ mod tests {
         let bytes = Writer::new(REPLY).bytes(1, &[1]).bytes(1, &[0]).finish();
         let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
         assert_eq!(Reply::decode(body), Err(Error::Malformed));
-        // A HELLO whose APP record has no kind byte.
-        let with_app = |app: &[u8]| {
+        // A HELLO with every record it must have but STATE, and one with an
+        // empty STATE too: State::none() and no scope.
+        let bare = |app: &[u8]| {
             Writer::new(HELLO)
                 .bytes(hello::WIRE, &[1, 0, 1, 0])
                 .bytes(hello::APP, app)
                 .bytes(hello::NONCE, &[0; 8])
                 .bytes(hello::PAYLOAD_VERSION, &[0; 4])
                 .bytes(hello::MAX_REQUEST, &[0; 4])
-                .finish()
         };
+        let with_app = |app: &[u8]| bare(app).bytes(hello::STATE, &[]).finish();
+        // Without STATE: an owner that doesn't say what it holds.
+        let bytes = bare(&[0]).finish();
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(Hello::decode(body), Err(Error::Malformed));
+        // A HELLO whose APP record has no kind byte.
         let bytes = with_app(&[]);
         let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
         assert_eq!(Hello::decode(body), Err(Error::Malformed));
