@@ -23,9 +23,15 @@ fmt:
 clippy:
     cargo clippy --locked --all-targets --all-features -- -D warnings
 
-# Unit, integration and doc tests. The cross-process tests need Unix.
+# Unit, integration and doc tests.
 test:
     cargo test --locked --all-features
+
+# CI's Windows runner is an administrator with UAC off, so `test` runs
+# elevated there; this covers an ordinary, unelevated launch.
+# Windows only: run the unit and integration tests at medium integrity.
+test-medium:
+    pwsh -NoProfile -File .github/scripts/test-at-medium.ps1
 
 # Build the API docs, failing on warnings.
 doc:
