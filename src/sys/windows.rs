@@ -341,8 +341,26 @@ fn sandbox(token: HANDLE) -> io::Result<Sandbox> {
 /// Whether UAC split a token, and if so which half it is. Only this
 /// process's own token is read so: an owner doesn't ask it of a client.
 fn elevation_type(token: HANDLE) -> io::Result<TOKEN_ELEVATION_TYPE> {
-    // The class's information is one TOKEN_ELEVATION_TYPE, an i32.
-    Ok(token_u32(token, TokenElevationType)? as TOKEN_ELEVATION_TYPE)
+    // Not through `token_info`: this class takes a buffer of its exact
+    // size, and a larger one fails with ERROR_BAD_LENGTH.
+    let mut elevation: TOKEN_ELEVATION_TYPE = 0;
+    let mut len = 0;
+    // SAFETY: a token open for query. The class's information is one
+    // TOKEN_ELEVATION_TYPE, and `elevation` is valid for writes of its
+    // size.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevationType,
+            (&mut elevation as *mut TOKEN_ELEVATION_TYPE).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION_TYPE>() as u32,
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(elevation)
 }
 
 /// This process's token, as read once.
