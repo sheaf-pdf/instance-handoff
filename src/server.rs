@@ -143,9 +143,14 @@ impl<T: Payload> Core<T> {
         }
     }
 
-    /// The state later launches are told.
+    /// The state later launches are told. A stop counts from the moment
+    /// it's asked for, not from the next [`Core::poll_control`]: an accept
+    /// pass that began before the stop still tells later connections busy.
     pub(crate) fn state(&self) -> u8 {
         match self.serving {
+            Serving::Taking | Serving::Declining if self.shared.stop.load(Ordering::SeqCst) => {
+                state::BUSY
+            }
             Serving::Taking => state::TAKING,
             Serving::Stopped => state::BUSY,
             Serving::Declining | Serving::Panicked => state::DECLINING,
@@ -667,6 +672,19 @@ mod tests {
         assert_eq!(c.shared.ended(), Some(End::Stopped));
         c.end(End::LostLock);
         assert_eq!(c.shared.ended(), Some(End::LostLock));
+    }
+
+    #[test]
+    fn a_stop_is_told_before_the_server_acts_on_it() {
+        let c = core(Some(Box::new(|_| Answer::Take)));
+        c.shared.stop.store(true, Ordering::SeqCst);
+        let now = Instant::now();
+        let mut s = Session::new(&c, None, now);
+        let hello = take_out(&mut s);
+        assert_eq!(Hello::decode(&hello[0].1).unwrap().state, state::BUSY);
+        s.read(&request(3, Args::default().encode().unwrap()), &c, now);
+        assert_eq!(reply(&take_out(&mut s)).status, status::BUSY);
+        assert_eq!(c.shared.ended(), None);
     }
 
     #[test]
