@@ -59,10 +59,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
-    FILE_WRITE_EA, GetFileInformationByHandle, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-    LockFileEx, PIPE_ACCESS_DUPLEX, READ_CONTROL, ReadFile, SECURITY_IDENTIFICATION, SYNCHRONIZE,
-    WRITE_DAC, WRITE_OWNER, WriteFile,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, GetFileInformationByHandle,
+    GetFinalPathNameByHandleW, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    PIPE_ACCESS_DUPLEX, READ_CONTROL, ReadFile, SECURITY_IDENTIFICATION, SYNCHRONIZE,
+    VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER, WriteFile,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
@@ -327,6 +328,71 @@ pub(crate) fn default_place(id: &AppId) -> Result<Place, Reason> {
         subs: vec![id.as_str().into(), level_folder(level).into()],
         shared: 1,
     })
+}
+
+/// `path` with its links and junctions resolved, from
+/// `GetFinalPathNameByHandleW`. A `SUBST` letter becomes the real drive and
+/// a mapped drive the share it maps, so launches in every logon session
+/// agree on it.
+pub(crate) fn final_path(path: &Path) -> io::Result<PathBuf> {
+    // No access asked and all sharing allowed, so nothing the app holds open
+    // gets in the way.
+    let file = OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let mut buf = vec![0u16; 260];
+    loop {
+        // SAFETY: an open handle, and a buffer valid for writes of its
+        // length.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if n == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            return Ok(plain_path(buf));
+        }
+        // Too small: `n` is the length it needs, the NUL included.
+        buf.resize(n, 0);
+    }
+}
+
+/// A final path in the form launches compare: `C:\…` on a drive and
+/// `\\server\share\…` on a share, without the `\\?\` that
+/// `GetFinalPathNameByHandleW` puts before both. Other forms are kept.
+fn plain_path(mut path: Vec<u16>) -> PathBuf {
+    if starts_with(&path, r"\\?\UNC\") {
+        // `\\?\UNC\server` becomes `\\server`.
+        path.drain(2..8);
+    } else if starts_with(&path, r"\\?\") && is_drive(&path[4..]) {
+        path.drain(..4);
+    }
+    PathBuf::from(OsString::from_wide(&path))
+}
+
+/// Whether `path` starts with the ASCII `prefix`.
+fn starts_with(path: &[u16], prefix: &str) -> bool {
+    path.len() >= prefix.len()
+        && path
+            .iter()
+            .zip(prefix.bytes())
+            .all(|(&u, b)| u == u16::from(b))
+}
+
+/// Whether `path` starts with a drive: a letter, a colon and a backslash.
+fn is_drive(path: &[u16]) -> bool {
+    path.first()
+        .is_some_and(|&l| u8::try_from(l).is_ok_and(|l| l.is_ascii_alphabetic()))
+        && starts_with(&path[1..], r":\")
 }
 
 // ---------------------------------------------------------------------------
@@ -1749,5 +1815,84 @@ mod tests {
         folder.unpublish();
         std::fs::write(&file, "x \\\\evil\\pipe\n").unwrap();
         assert!(folder.address().is_err());
+    }
+
+    #[test]
+    fn final_paths_drop_the_verbatim_prefix_of_drives_and_shares() {
+        let table = [
+            (r"\\?\C:\Users\me", r"C:\Users\me"),
+            (r"\\?\C:\", r"C:\"),
+            (r"\\?\UNC\server\share\me", r"\\server\share\me"),
+            (r"\\?\Volume{0}\me", r"\\?\Volume{0}\me"),
+            (r"\\?\GLOBALROOT\Device\X\me", r"\\?\GLOBALROOT\Device\X\me"),
+        ];
+        for (verbatim, plain) in table {
+            let path = plain_path(OsStr::new(verbatim).encode_wide().collect());
+            assert_eq!(path, Path::new(plain), "{verbatim}");
+        }
+    }
+
+    // The runner's temporary folder is named with 8.3 names, which the final
+    // path spells out.
+    #[test]
+    fn a_final_path_is_canonicalize_without_the_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let verbatim = std::fs::canonicalize(tmp.path()).unwrap();
+        let want = verbatim.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+        assert_eq!(final_path(tmp.path()).unwrap(), Path::new(want));
+    }
+
+    #[test]
+    fn a_junction_is_resolved_to_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert_eq!(final_path(&link).unwrap(), final_path(&real).unwrap());
+    }
+
+    /// A `SUBST` letter, removed on drop.
+    struct Subst(char);
+
+    impl Drop for Subst {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("subst")
+                .arg(format!("{}:", self.0))
+                .arg("/D")
+                .status();
+        }
+    }
+
+    // SUBST needs no elevation, so this runs at high and at medium. A
+    // mapping is per logon session; the final path is what every session
+    // sees.
+    #[test]
+    fn a_subst_letter_becomes_the_real_drive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let subst = ('Q'..='Z')
+            .filter(|l| !Path::new(&format!(r"{l}:\")).exists())
+            .find_map(|l| {
+                let made = std::process::Command::new("subst")
+                    .arg(format!("{l}:"))
+                    .arg(tmp.path())
+                    .status()
+                    .unwrap();
+                made.success().then_some(Subst(l))
+            })
+            .expect("no free drive letter from Q to Z");
+        let root = PathBuf::from(format!(r"{}:\", subst.0));
+        let real = final_path(tmp.path()).unwrap();
+        assert_eq!(final_path(&root).unwrap(), real);
+        assert_eq!(
+            crate::state::canonical(&root.join("missing")),
+            real.join("missing")
+        );
     }
 }

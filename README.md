@@ -5,14 +5,16 @@ Make your program single-instance, whatever it's built with: GPUI, winit, egui, 
 The first launch takes a lock in a private, per-user runtime folder and becomes the *owner*. Every later launch connects to the owner, hands over its request (its arguments and working directory, or any payload you define), gets an answer, and exits. Only one process ever holds the lock, so the owner can keep your app's state to itself. The OS releases the lock when the owner exits, crash included, so there's never a stale lock to clean up. Only the same user can connect, and when a launch can't hand over, it tells you why.
 
 ```rust
-use instance_handoff::{AppId, Args, Builder, Request, Started};
+use instance_handoff::{AppId, Args, Builder, Request, Started, State};
 
 const APP: AppId = AppId::windowed("org.example.Viewer");
 
 fn main() {
     let args = Args::from_env();
+    // The folder the viewer keeps its state in, from your storage code.
+    let state = State::dir(data_dir());
     // Decide first, before any window, event loop or runtime exists.
-    let claim = match Builder::new(APP).start(&args) {
+    let claim = match Builder::new(APP, state).start(&args) {
         Started::Owner(claim) => claim,
         Started::HandedOff(_) => return, // the owner has it; exit
         Started::Alone(reason) => panic!("{reason}"), // or run without state

@@ -7,9 +7,10 @@
 //! included, so a lock is never stale.
 //!
 //! ```no_run
-//! use instance_handoff::{AppId, Args, Builder, Request, Started};
+//! use instance_handoff::{AppId, Args, Builder, Request, Started, State};
 //!
 //! const APP: AppId = AppId::windowed("org.example.Player");
+//! # fn library_dir() -> std::path::PathBuf { unimplemented!() }
 //!
 //! // Hand over only what the owner needs: here, the files. A flag is not a
 //! // path, and `Request::resolve` would make one of it.
@@ -17,8 +18,9 @@
 //!     .into_iter()
 //!     .filter(|arg| !arg.to_string_lossy().starts_with('-'))
 //!     .collect();
-//! // Decide first, before any window, event loop or runtime exists.
-//! let claim = match Builder::new(APP).start(&files) {
+//! // Decide first, before any window, event loop or runtime exists. The
+//! // state is the folder the player keeps its library in.
+//! let claim = match Builder::new(APP, State::dir(library_dir())).start(&files) {
 //!     Started::Owner(claim) => claim,
 //!     Started::HandedOff(_) => return, // the owner has them; exit
 //!     Started::Alone(reason) => panic!("can't run as the only instance: {reason}"),
@@ -330,6 +332,7 @@ mod owner;
 mod payload;
 mod request;
 mod server;
+mod state;
 mod wire;
 
 #[cfg_attr(
@@ -362,7 +365,7 @@ mod wire;
 )]
 mod sys;
 
-pub use builder::{Builder, Mode};
+pub use builder::{Builder, Mode, State};
 pub use id::{AppId, InvalidAppId, Kind};
 pub use level::{Level, Rights};
 pub use outcome::{End, OwnerInfo, Reason, Started};
@@ -384,6 +387,7 @@ mod bounds {
         send_sync::<Owner>();
         send_sync::<Claim<Args>>();
         send_sync::<Builder>();
+        send_sync::<State>();
         send_sync::<Reason>();
         send_sync::<Request<Args>>();
         send_sync::<OwnerInfo>();

@@ -13,7 +13,7 @@ use std::error::Error;
 use std::pin::pin;
 use std::sync::Arc;
 
-use instance_handoff::{AppId, Args, Builder, End, Request, Started};
+use instance_handoff::{AppId, Args, Builder, End, Request, Started, State};
 #[cfg(any(unix, windows))]
 use tokio::sync::{Notify, mpsc};
 
@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Blocks for a few milliseconds, and at most the timeout plus a few
     // seconds: before the runtime, not on a worker. Inside a runtime, use
     // spawn_blocking.
-    let claim = match Builder::new(APP).start(&args) {
+    let claim = match Builder::new(APP, State::none()).start(&args) {
         Started::Owner(claim) => claim,
         Started::HandedOff(_) => return Ok(()),
         // A service must not run twice; Reason is an Error.

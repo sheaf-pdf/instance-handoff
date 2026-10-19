@@ -144,6 +144,7 @@ pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
     if !sys::SUPPORTED {
         return Started::Alone(Reason::Unsupported {});
     }
+    let state = b.canonical_state();
     let place = match b.place() {
         Ok(place) => place,
         Err(reason) => return Started::Alone(reason),
@@ -164,7 +165,7 @@ pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
     let mut waiting: Option<Waiting> = None;
     loop {
         match folder.lock() {
-            Ok(Some(lock)) => return Started::Owner(Claim::new(b, place, folder, lock)),
+            Ok(Some(lock)) => return Started::Owner(Claim::new(b, place, folder, lock, state)),
             Ok(None) => {}
             // The folder was deleted under this launch (a cleaner, `rm`):
             // open it afresh and keep going.
@@ -192,7 +193,9 @@ pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
             while Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(5));
                 match try_own(&folder) {
-                    Ok(Some(lock)) => return Started::Owner(Claim::new(b, place, folder, lock)),
+                    Ok(Some(lock)) => {
+                        return Started::Owner(Claim::new(b, place, folder, lock, state));
+                    }
                     Ok(None) => {}
                     Err(reason) => return Started::Alone(reason),
                 }
@@ -215,7 +218,9 @@ pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
             Exchange::SameOwner => unreachable!("no commit to compare with"),
             Exchange::Lost(nonce) => {
                 return match after_commit(&folder, b, bytes, nonce, true, &limits) {
-                    AfterCommit::Own(lock) => Started::Owner(Claim::new(b, place, folder, lock)),
+                    AfterCommit::Own(lock) => {
+                        Started::Owner(Claim::new(b, place, folder, lock, state))
+                    }
                     AfterCommit::Info(info) => Started::HandedOff(info),
                 };
             }
@@ -595,7 +600,7 @@ mod tests {
     /// What this launch makes of REPLY REFUSED with `code`, after `hello`
     /// or in place of it.
     fn refused_with(code: Option<u8>, hello: Option<&Hello>) -> Reason {
-        let b = Builder::new(AppId::headless("test")).payload_version(3);
+        let b = Builder::new(AppId::headless("test"), crate::State::none()).payload_version(3);
         let reply = Reply {
             refusal: code,
             ..Reply::new(false, status::REFUSED)

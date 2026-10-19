@@ -10,7 +10,7 @@
 use std::process::ExitCode;
 use std::sync::mpsc;
 
-use instance_handoff::{AppId, Args, Builder, End, Reason, Request, Started};
+use instance_handoff::{AppId, Args, Builder, End, Reason, Request, Started, State};
 
 const APP: AppId = AppId::headless("com.example.notes");
 
@@ -20,7 +20,7 @@ fn main() -> ExitCode {
     if detach {
         args = Args::new(args.iter().skip(1));
     }
-    let builder = Builder::new(APP);
+    let builder = Builder::new(APP, State::none());
 
     // Remote control: talk to a running daemon, never become one.
     match args.first().and_then(|a| a.to_str()) {

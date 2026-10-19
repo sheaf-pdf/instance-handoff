@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use instance_handoff::{AppId, Args, Builder, Claim, Kind, Reason, Started};
+use instance_handoff::{AppId, Args, Builder, Claim, Kind, Reason, Started, State};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_NO_SUCH_LOGON_SESSION, GENERIC_READ,
     GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
@@ -76,6 +76,8 @@ const ROLE: &str = "INSTANCE_HANDOFF_LEVELS_ROLE";
 const ID: &str = "INSTANCE_HANDOFF_LEVELS_ID";
 /// The folder a child is given: `Builder::dir`, or where the probe works.
 const DIR: &str = "INSTANCE_HANDOFF_LEVELS_DIR";
+/// The state folder a child launches with. Without it, `State::none()`.
+const STATE: &str = "INSTANCE_HANDOFF_LEVELS_STATE";
 
 const MEDIUM: u32 = 0x2000;
 const HIGH: u32 = 0x3000;
@@ -117,7 +119,7 @@ fn a_medium_launch_never_hands_off_to_a_high_owner() {
         return;
     }
     let id = app("high-owner");
-    let claim = claim(Builder::new(id.clone()).start(&Args::default()));
+    let claim = claim(Builder::new(id.clone(), State::none()).start(&Args::default()));
     assert!(
         claim.dir().ends_with("run-high"),
         "{}",
@@ -152,7 +154,7 @@ fn a_high_launch_never_hands_off_to_a_medium_owner() {
     let dir = child.expect("owner ");
     assert!(dir.ends_with(r"\run"), "{dir}");
 
-    match Builder::new(id.clone()).start(&Args::new(["from-high"])) {
+    match Builder::new(id.clone(), State::none()).start(&Args::new(["from-high"])) {
         Started::Owner(claim) => {
             assert!(
                 claim.dir().ends_with("run-high"),
@@ -163,7 +165,7 @@ fn a_high_launch_never_hands_off_to_a_medium_owner() {
         }
         other => panic!("{}", describe(&other)),
     }
-    let reason = Builder::new(id)
+    let reason = Builder::new(id, State::none())
         .hand_off(&Args::new(["from-high"]))
         .unwrap_err();
     assert!(matches!(reason, Reason::NoOwner { .. }), "{reason}");
@@ -181,7 +183,11 @@ fn a_folder_made_at_one_level_is_refused_at_the_other() {
     let tmp = tempfile::tempdir().unwrap();
 
     let high = tmp.path().join("high");
-    let claim = claim(Builder::new(APP).dir(&high).start(&Args::default()));
+    let claim = claim(
+        Builder::new(APP, State::none())
+            .dir(&high)
+            .start(&Args::default()),
+    );
     let (tx, rx) = mpsc::channel();
     let owner = claim.serve(move |r| tx.send(r).is_ok());
     let mut child = medium(
@@ -206,7 +212,7 @@ fn a_folder_made_at_one_level_is_refused_at_the_other() {
         ],
     );
     child.expect("owner ");
-    match Builder::new(APP)
+    match Builder::new(APP, State::none())
         .dir(&made_at_medium)
         .start(&Args::new(["from-high"]))
     {
@@ -452,9 +458,10 @@ fn is_role(name: &str) -> bool {
 
 fn child_builder() -> Builder {
     let id = AppId::parse(std::env::var(ID).unwrap(), Kind::Headless).unwrap();
+    let state = std::env::var_os(STATE).map_or_else(State::none, State::dir);
     match std::env::var_os(DIR) {
-        Some(dir) => Builder::new(id).dir(PathBuf::from(dir)),
-        None => Builder::new(id),
+        Some(dir) => Builder::new(id, state).dir(PathBuf::from(dir)),
+        None => Builder::new(id, state),
     }
 }
 

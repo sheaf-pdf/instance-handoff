@@ -279,6 +279,11 @@ fn darwin_temp_dir() -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStringExt;
 
+/// `path` with its links resolved: `realpath`.
+pub(crate) fn final_path(path: &Path) -> io::Result<PathBuf> {
+    std::fs::canonicalize(path)
+}
+
 // ---------------------------------------------------------------------------
 // The folder
 // ---------------------------------------------------------------------------

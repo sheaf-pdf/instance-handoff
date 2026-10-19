@@ -42,6 +42,10 @@ pub(crate) fn default_place(_: &AppId) -> Result<Place, Reason> {
     Err(Reason::Unsupported {})
 }
 
+pub(crate) fn final_path(_: &Path) -> io::Result<PathBuf> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 pub(crate) fn open_folder(_: &Place, _: bool) -> Result<Option<Folder>, Reason> {
     Err(Reason::Unsupported {})
 }

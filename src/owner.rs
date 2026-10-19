@@ -22,6 +22,7 @@ use crate::{AppId, Builder, End, IntoAnswer, Payload, Request, sys};
 pub struct Claim<T> {
     claimed: Option<Box<sys::Claimed>>,
     place: sys::Place,
+    state: Option<PathBuf>,
     ctx: Ctx,
     on_end: Mutex<Option<OnEnd>>,
     _payload: PhantomData<fn() -> T>,
@@ -32,6 +33,7 @@ impl<T> fmt::Debug for Claim<T> {
         f.debug_struct("Claim")
             .field("app_id", &self.ctx.app_id)
             .field("dir", &self.dir())
+            .field("state_dir", &self.state_dir())
             .finish_non_exhaustive()
     }
 }
@@ -42,10 +44,12 @@ impl<T> Claim<T> {
         place: sys::Place,
         folder: sys::Folder,
         lock: sys::Lock,
+        state: Option<PathBuf>,
     ) -> Claim<T> {
         Claim {
             claimed: Some(Box::new(sys::Claimed::new(folder, lock, &b.app_id))),
             place,
+            state,
             ctx: Ctx {
                 app_id: b.app_id.clone(),
                 payload_version: b.payload_version,
@@ -90,6 +94,17 @@ impl<T> Claim<T> {
         self.claimed().folder.path()
     }
 
+    /// The state folder given to [`Builder::new`], with its links resolved
+    /// as [`State::dir`] says, or `None` for [`State::none`]. Write the
+    /// state through this path, and only while this process owns the app:
+    /// a launch that runs alone gets no `state_dir`.
+    ///
+    /// [`State::dir`]: crate::State::dir
+    /// [`State::none`]: crate::State::none
+    pub fn state_dir(&self) -> Option<&Path> {
+        self.state.as_deref()
+    }
+
     /// Why later launches can't reach this process, if they can't: the
     /// socket couldn't be made. This process still owns the lock; later
     /// launches wait out their timeout and run alone.
@@ -124,6 +139,7 @@ impl<T> Claim<T> {
         Owner {
             app_id: self.ctx.app_id.clone(),
             dir,
+            state: self.state.take(),
             listen_error,
             shared,
         }
@@ -246,6 +262,7 @@ fn nonce() -> u64 {
 pub struct Owner {
     app_id: AppId,
     dir: PathBuf,
+    state: Option<PathBuf>,
     listen_error: Option<io::Error>,
     shared: Arc<Shared>,
 }
@@ -255,6 +272,7 @@ impl fmt::Debug for Owner {
         f.debug_struct("Owner")
             .field("app_id", &self.app_id)
             .field("dir", &self.dir)
+            .field("state_dir", &self.state)
             .field("listen_error", &self.listen_error)
             .field("ended", &self.ended())
             .finish_non_exhaustive()
@@ -270,6 +288,11 @@ impl Owner {
     /// The runtime folder holding the lock.
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The state folder, as [`Claim::state_dir`] reported it.
+    pub fn state_dir(&self) -> Option<&Path> {
+        self.state.as_deref()
     }
 
     /// Stop delivering, once the app is certain to quit. Launches from now

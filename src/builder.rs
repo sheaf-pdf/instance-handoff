@@ -1,9 +1,67 @@
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::server::Upkeep;
-use crate::{AppId, OwnerInfo, Payload, Reason, Started, launch, naming, sys};
+use crate::{AppId, OwnerInfo, Payload, Reason, Started, launch, naming, state, sys};
+
+/// The folder an app keeps its state in: the files only the owner writes.
+/// [`Builder::new`] takes it, and the owner reports it, with its links
+/// resolved, as [`Claim::state_dir`] and [`Owner::state_dir`].
+///
+/// A `PathBuf` or a `&Path` converts to a `State::dir`.
+///
+/// [`Claim::state_dir`]: crate::Claim::state_dir
+/// [`Owner::state_dir`]: crate::Owner::state_dir
+#[derive(Debug, Clone)]
+pub struct State {
+    dir: Option<PathBuf>,
+}
+
+impl State {
+    /// The folder the app's storage layer writes, computed by the same
+    /// function. An app with several folders passes the one the others are
+    /// derived from. It needn't exist.
+    ///
+    /// Its links are resolved when a launch decides, not here. A relative
+    /// path is made absolute against the working directory. Then the
+    /// nearest folder on it that exists is resolved: with `realpath` on
+    /// Unix, and on Windows to its final path (`GetFinalPathNameByHandleW`),
+    /// where a `SUBST` letter becomes the real drive and a mapped drive
+    /// becomes `\\server\share`. The part that doesn't exist is appended as
+    /// given, except that a `..` in it drops the part before it, as it will
+    /// once those folders exist.
+    ///
+    /// A path that can't be resolved, such as one through a folder this user
+    /// can't search, is kept as given, made absolute. One that can't be made
+    /// absolute, such as an empty path, is kept as given too, so it stays
+    /// relative. Either way the launch goes on, with a warning in the log.
+    pub fn dir(path: impl Into<PathBuf>) -> State {
+        State {
+            dir: Some(path.into()),
+        }
+    }
+
+    /// No state folder: the app keeps no files of its own.
+    /// [`Claim::state_dir`] is then `None`.
+    ///
+    /// [`Claim::state_dir`]: crate::Claim::state_dir
+    pub fn none() -> State {
+        State { dir: None }
+    }
+}
+
+impl From<PathBuf> for State {
+    fn from(dir: PathBuf) -> State {
+        State::dir(dir)
+    }
+}
+
+impl From<&Path> for State {
+    fn from(dir: &Path) -> State {
+        State::dir(dir)
+    }
+}
 
 /// What a launch does when another process owns the app.
 #[non_exhaustive]
@@ -26,17 +84,23 @@ pub enum Mode {
 /// Configures and runs the decision: own, hand off, or run alone.
 ///
 /// ```
+/// use std::path::Path;
 /// use std::time::Duration;
 /// use instance_handoff::{AppId, Builder, Mode};
 ///
 /// const APP: AppId = AppId::windowed("org.example.Viewer");
-/// let builder = Builder::new(APP).mode(Mode::Separate).timeout(Duration::from_secs(1));
+///
+/// // `data` is the folder the viewer keeps its state in.
+/// fn builder(data: &Path) -> Builder {
+///     Builder::new(APP, data).mode(Mode::Separate).timeout(Duration::from_secs(1))
+/// }
 /// # let _ = builder;
 /// ```
 #[must_use = "a Builder does nothing until `start`, `hand_off` or `probe`"]
 #[derive(Debug, Clone)]
 pub struct Builder {
     pub(crate) app_id: AppId,
+    state: State,
     scope: Option<OsString>,
     dir: Option<PathBuf>,
     pub(crate) mode: Mode,
@@ -46,11 +110,14 @@ pub struct Builder {
 }
 
 impl Builder {
-    /// A builder for `app_id` with the defaults: the default runtime folder,
-    /// [`Mode::Join`], a 5 second timeout and payload version 0.
-    pub fn new(app_id: AppId) -> Builder {
+    /// A builder for `app_id`, whose state is in `state` ([`State::dir`]),
+    /// or which keeps none ([`State::none`]). The defaults: the default
+    /// runtime folder, [`Mode::Join`], a 5 second timeout and payload
+    /// version 0.
+    pub fn new(app_id: AppId, state: impl Into<State>) -> Builder {
         Builder {
             app_id,
+            state: state.into(),
             scope: None,
             dir: None,
             mode: Mode::Join,
@@ -146,6 +213,12 @@ impl Builder {
             return None;
         }
         self.place().ok().map(|p| p.path())
+    }
+
+    /// The state folder, canonical. Resolved as the launch decides, not in
+    /// `new`: the working directory and the links may change in between.
+    pub(crate) fn canonical_state(&self) -> Option<PathBuf> {
+        self.state.dir.as_deref().map(state::canonical)
     }
 
     pub(crate) fn place(&self) -> Result<sys::Place, Reason> {

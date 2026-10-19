@@ -33,6 +33,12 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
    - In the hash, a tag byte and a u32 length frame each part, so `State::none()`, an empty scope and no scope all differ.
 
    *Recommended.*
+
+   Slice 10 settled the cases this leaves open, and slice 12 freezes them into the hash. *Our call (slice 10).*
+   - A `..` in the missing tail drops the part before it, as `mkdir -p` will, so a folder has one form before and after it exists: `<real>/a/../b` is `<real>/b`. A `..` with no missing part before it drops the last part of the resolved folder. If folding brings a folder that exists onto the path, as `<real>/new/../link` does, that folder is resolved too. On Windows, making the path absolute already folds every `..`. This refines "kept as given".
+   - A path whose links can't be resolved (any error but not-found, such as a folder this user can't search, or a volume that reports no final path) is kept as given, made absolute. One that can't be made absolute (an empty path, or a relative one once the working directory is gone) is kept as given, so `state_dir()` is then relative. The launch goes on, with a warning in the log, since no `Reason` fits. Either case could instead get a `Reason` naming the state path, before slice 12.
+   - On Windows, a final path with no drive or share, `\\?\Volume{…}\…` or `\\?\GLOBALROOT\…`, keeps its verbatim prefix.
+   - A file where a folder should be, `<file>/state`, can't be resolved on Unix (`ENOTDIR`), so the whole path is kept as given. On Windows the open reports the path not found, so `state` counts as missing and the file's own path is resolved. Neither folder can be created.
 2. **ForeignState.** A non-root Unix launch trusts folders owned by itself or by root, and root trusts only root's. Windows keeps `trusted()`. Test the rule with a table, and end to end under bwrap. *Recommended.*
 3. **A missing state folder.** `start` and `exclusive` create a missing state folder after the ForeignState check and the runtime lock. They use `create_dir_all`; on Unix the last folder gets mode 0700, and on Windows an access list for the user and SYSTEM. ForeignState applies only to `start` and `exclusive`. *Recommended.*
 4. `Level` and `Rights` live in `src/level.rs`, re-exported. *Recommended.*

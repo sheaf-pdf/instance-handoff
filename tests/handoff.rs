@@ -11,14 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use instance_handoff::{
-    AppId, Args, Builder, Claim, End, Kind, Mode, Owner, Reason, Request, Started,
+    AppId, Args, Builder, Claim, End, Kind, Mode, Owner, Reason, Request, Started, State,
 };
 
 const APP: AppId = AppId::headless("test.handoff");
 const SHORT: Duration = Duration::from_millis(300);
 
 struct Dir {
-    _tmp: tempfile::TempDir,
+    tmp: tempfile::TempDir,
     path: PathBuf,
 }
 
@@ -27,13 +27,29 @@ struct Dir {
 fn dir() -> Dir {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("run");
-    Dir { _tmp: tmp, path }
+    Dir { tmp, path }
+}
+
+/// The test's state folder, beside its runtime folder. Nothing makes it.
+fn state(dir: &Dir) -> State {
+    State::dir(dir.tmp.path().join("state"))
 }
 
 fn builder(dir: &Dir) -> Builder {
-    Builder::new(APP)
+    Builder::new(APP, state(dir))
         .dir(&dir.path)
         .timeout(Duration::from_secs(3))
+}
+
+/// What the crate makes of a folder that exists: its links resolved, and
+/// on Windows without the `\\?\` that `canonicalize` puts first.
+fn canonical(path: &Path) -> PathBuf {
+    let real = std::fs::canonicalize(path).unwrap();
+    if cfg!(windows) {
+        PathBuf::from(real.to_str().unwrap().strip_prefix(r"\\?\").unwrap())
+    } else {
+        real
+    }
 }
 
 fn claim(started: Started<Args>) -> Claim<Args> {
@@ -227,7 +243,7 @@ fn mismatches_are_reported_at_once() {
         "{reason}"
     );
     let reason = alone(
-        Builder::new(AppId::headless("test.other"))
+        Builder::new(AppId::headless("test.other"), state(&dir))
             .dir(&dir.path)
             .start(&Args::default()),
     );
@@ -236,10 +252,13 @@ fn mismatches_are_reported_at_once() {
     // the kind differs.
     let t = Instant::now();
     let reason = alone(
-        Builder::new(AppId::parse(APP.as_str(), Kind::Windowed).unwrap())
-            .dir(&dir.path)
-            .payload_version(2)
-            .start(&Args::default()),
+        Builder::new(
+            AppId::parse(APP.as_str(), Kind::Windowed).unwrap(),
+            state(&dir),
+        )
+        .dir(&dir.path)
+        .payload_version(2)
+        .start(&Args::default()),
     );
     assert!(matches!(reason, Reason::OtherApp { .. }), "{reason}");
     assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
@@ -512,6 +531,48 @@ fn a_live_owners_folder_and_address_stay_put() {
     owner.release();
 }
 
+// The temporary folder exists, and the state folder in it doesn't: the
+// first is resolved (on macOS it is under /var, a link to /private/var;
+// on the Windows runner it is named with 8.3 names), and the rest is kept.
+#[test]
+fn the_owner_reports_its_state_folder_with_links_resolved() {
+    let dir = dir();
+    let want = canonical(dir.tmp.path()).join("state");
+    let claim = claim(builder(&dir).start(&Args::default()));
+    assert_eq!(claim.state_dir(), Some(want.as_path()));
+    let (owner, _rx) = serve(claim);
+    assert_eq!(owner.state_dir(), Some(want.as_path()));
+    owner.release();
+
+    let none = self::claim(
+        Builder::new(APP, State::none())
+            .dir(&dir.path)
+            .start(&Args::default()),
+    );
+    assert_eq!(none.state_dir(), None);
+    none.release();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_state_folder_named_through_a_link_is_reported_where_it_is() {
+    let dir = dir();
+    let real = dir.tmp.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let claim = claim(
+        Builder::new(APP, link.join("app"))
+            .dir(&dir.path)
+            .start(&Args::default()),
+    );
+    assert_eq!(
+        claim.state_dir(),
+        Some(canonical(&real).join("app").as_path())
+    );
+    claim.release();
+}
+
 #[test]
 fn scopes_make_separate_owners() {
     let dir = dir();
@@ -568,7 +629,10 @@ fn a_slow_handler_leaves_the_launch_handed_off_unconfirmed() {
 
 #[test]
 fn a_relative_folder_is_made_absolute() {
-    let dir = Builder::new(APP).dir("run").runtime_dir().unwrap();
+    let dir = Builder::new(APP, State::none())
+        .dir("run")
+        .runtime_dir()
+        .unwrap();
     assert!(dir.is_absolute(), "{}", dir.display());
     assert_eq!(dir, std::env::current_dir().unwrap().join("run"));
 }
