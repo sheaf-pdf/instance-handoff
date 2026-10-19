@@ -85,6 +85,22 @@ impl fmt::Display for Rights {
     }
 }
 
+/// The level of the owner that holds the lock, beside the launch's own, as
+/// the marker in its lock shows it. Only Windows owners mark a level, so
+/// elsewhere every owner is at the launch's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerLevel {
+    /// The launch's own level, or no level at all.
+    Same,
+    /// Another level.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Other(Level),
+    /// No marker yet: the owner is still starting, or a launch is testing
+    /// the lock.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Starting,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

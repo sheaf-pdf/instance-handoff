@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use crate::level::OwnerLevel;
 use crate::naming;
 use crate::server::{Core, Peer, Session};
 use crate::wire::refusal;
@@ -762,6 +763,12 @@ impl Folder {
         }
     }
 
+    /// The level of the owner that holds the lock: always this launch's,
+    /// since Unix has no integrity levels.
+    pub(crate) fn owner_level(&self) -> io::Result<OwnerLevel> {
+        Ok(OwnerLevel::Same)
+    }
+
     /// Whether the path still names the lock file `lock` holds.
     fn holds(&self, lock: &Lock) -> bool {
         let Ok(c) = cstr(self.lock_path().as_os_str()) else {
@@ -874,8 +881,13 @@ impl Folder {
         Ok((listener, self.socket_key()))
     }
 
-    /// Connects to the owner's socket and checks it is this user's.
-    pub(crate) fn connect(&self, deadline: Option<Instant>) -> Result<Conn, Connect> {
+    /// Connects to the owner's socket and checks it is this user's. Unix
+    /// has no integrity levels, so `_level` is always `None`.
+    pub(crate) fn connect(
+        &self,
+        deadline: Option<Instant>,
+        _level: Option<crate::Level>,
+    ) -> Result<Conn, Connect> {
         let path = self.address(false).map_err(Connect::Retry)?.into_path();
         let stream = connect(&path, deadline)?;
         let (uid, pid) = peer_cred(stream.as_fd()).map_err(Connect::Retry)?;
@@ -1839,7 +1851,7 @@ fn check_lock<T: Payload>(
             current.is_some()
                 && current != held.socket
                 && folder
-                    .connect(Some(Instant::now() + Duration::from_millis(200)))
+                    .connect(Some(Instant::now() + Duration::from_millis(200)), None)
                     .is_ok()
         };
         if !ours && !live() {
@@ -2645,7 +2657,7 @@ mod tests {
         let folder = open_folder(&Place::dir(dir), true).unwrap().unwrap();
         let _lock = folder.lock().unwrap().unwrap();
         let listener = folder.listen().unwrap();
-        let conn = folder.connect(None).ok().expect("connects");
+        let conn = folder.connect(None, None).ok().expect("connects");
         assert_eq!(conn.peer_pid(), Some(std::process::id()));
         drop(listener);
     }

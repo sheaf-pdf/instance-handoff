@@ -8,6 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::level::OwnerLevel;
 use crate::server::Core;
 use crate::{AppId, Payload, Reason};
 
@@ -91,7 +92,15 @@ impl Folder {
         unreachable!()
     }
 
-    pub(crate) fn connect(&self, _: Option<Instant>) -> Result<Conn, Connect> {
+    pub(crate) fn owner_level(&self) -> io::Result<OwnerLevel> {
+        unreachable!()
+    }
+
+    pub(crate) fn connect(
+        &self,
+        _: Option<Instant>,
+        _: Option<crate::Level>,
+    ) -> Result<Conn, Connect> {
         unreachable!()
     }
 }

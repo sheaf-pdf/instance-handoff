@@ -56,6 +56,18 @@
 //! share, which a mapped drive resolves to, or on a drive that Windows says
 //! is remote.
 //!
+//! A launch that finds byte 0 held reads the owner's level from its marker
+//! before it connects. It tries its own level's byte with a shared lock.
+//! If that is held, it looks for a higher marker, and otherwise for any,
+//! with shared locks on ranges of bytes 1 to 0xFFFF, halving a range that
+//! conflicts. It gives each lock back at once. The highest marker wins.
+//! Only an owner at the launch's own level is talked to. One at another
+//! level is answered at once from its marker: the launch or the owner has
+//! rights the other lacks, and a probe is told it runs. With no marker, the
+//! owner is still starting, and the launch looks again until its deadline.
+//! While each level locks in its own folder, a launch finds only its own
+//! level's marker.
+//!
 //! The pipe's controls, each against a threat:
 //! - its name is 128 random bits, published only after the pipe exists, in
 //!   a folder only this user can read: another user on a terminal server
@@ -67,7 +79,8 @@
 //!   lower level can't open it;
 //! - `PIPE_REJECT_REMOTE_CLIENTS`;
 //! - the launch connects for identification only, and checks that the pipe
-//!   is its own user's, at its own level, before it sends anything;
+//!   is its own user's, at the level the owner's marker shows (its own),
+//!   before it sends anything;
 //! - the owner checks the launch's token by impersonation: the same user at
 //!   the same level.
 
@@ -141,6 +154,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, WSF_VISIBLE};
 
 use crate::id::valid_id;
+use crate::level::OwnerLevel;
 use crate::naming::{GUARD_BYTE, GUARD_FILE, OWNER_BYTE, level_folder, level_marker};
 use crate::server::{Core, Peer, Session};
 use crate::wire::refusal;
@@ -1121,6 +1135,47 @@ fn unlock(file: &File, offset: u64, len: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Launches look for a marker below this byte, as every level's RID is.
+const MARKER_END: u64 = 0x10000;
+
+/// The level marker another handle holds in `file`, found as a launch
+/// looks for it: this process's own level's byte first, then the bytes in
+/// [1, `MARKER_END`) by shared range locks, each given back at once,
+/// halving the range around a conflict. The highest held byte wins. Byte 0
+/// is owning, never a marker, so at RID 0 only the search runs.
+fn marker(file: &File) -> io::Result<Option<u64>> {
+    let own = level_marker(me()?.integrity);
+    if own != OWNER_BYTE {
+        if !try_lock(file, own, 1, false)? {
+            return Ok(Some(
+                highest_held(file, own + 1, MARKER_END)?.unwrap_or(own),
+            ));
+        }
+        unlock(file, own, 1)?;
+    }
+    highest_held(file, 1, MARKER_END)
+}
+
+/// The highest byte in `start..end` that another handle holds
+/// exclusively. An empty range holds none.
+fn highest_held(file: &File, start: u64, end: u64) -> io::Result<Option<u64>> {
+    if start >= end {
+        return Ok(None);
+    }
+    if try_lock(file, start, end - start, false)? {
+        unlock(file, start, end - start)?;
+        return Ok(None);
+    }
+    if end - start == 1 {
+        return Ok(Some(start));
+    }
+    let mid = start + (end - start) / 2;
+    match highest_held(file, mid, end)? {
+        Some(byte) => Ok(Some(byte)),
+        None => highest_held(file, start, mid),
+    }
+}
+
 /// Takes the lock through `file`: byte 0, then `marker`, both exclusive.
 /// `false` when another handle holds byte 0, or when the marker can't be
 /// taken within `MARKER_RETRY`. When the marker isn't taken, after the
@@ -1215,6 +1270,25 @@ impl Folder {
             log::debug!("instance-handoff: giving back {LOCK_FILE}: {e}");
         }
         Ok(false)
+    }
+
+    /// The level of the owner that holds byte 0, from its marker, for a
+    /// launch that found byte 0 held. `Starting` when no marker is held, or
+    /// when the file has gone with its owner since: either way the launch
+    /// looks again.
+    pub(crate) fn owner_level(&self) -> io::Result<OwnerLevel> {
+        let own = level_marker(me()?.integrity);
+        let file = match self.open_lock(false) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(OwnerLevel::Starting),
+            Err(e) => return Err(e),
+        };
+        Ok(match marker(&file)? {
+            None => OwnerLevel::Starting,
+            Some(byte) if byte == own => OwnerLevel::Same,
+            // Below MARKER_END, so it fits.
+            Some(byte) => OwnerLevel::Other(crate::Level::from_rid(byte as u32)),
+        })
     }
 
     /// Writes `instance.pipe` in one step: written beside it, then renamed
@@ -1319,7 +1393,13 @@ impl Folder {
         })
     }
 
-    pub(crate) fn connect(&self, deadline: Option<Instant>) -> Result<Conn, Connect> {
+    /// Connects to the owner's pipe, which must be labelled at `level`, the
+    /// owner's level as its marker shows it.
+    pub(crate) fn connect(
+        &self,
+        deadline: Option<Instant>,
+        level: Option<crate::Level>,
+    ) -> Result<Conn, Connect> {
         let address = match self.address() {
             Ok(Some(a)) => a,
             Ok(None) => return Err(Connect::Retry(io::ErrorKind::NotFound.into())),
@@ -1347,7 +1427,7 @@ impl Folder {
                 Err(e) => return Err(Connect::Retry(e)),
             }
         };
-        check_pipe_owner(&file).map_err(Connect::Peer)?;
+        check_pipe_owner(&file, level).map_err(Connect::Peer)?;
         let mut pid = 0;
         // SAFETY: `pid` is valid for writes.
         let pid = (unsafe { GetNamedPipeServerProcessId(file.as_raw_handle(), &mut pid) } != 0
@@ -1376,11 +1456,13 @@ fn pipe_name(id: &str, secret: &str) -> OsString {
     format!(r"\\.\pipe\instance-handoff.{id}.{secret}").into()
 }
 
-/// The pipe a launch opened must be this user's, labelled at the launch's
-/// own integrity level, or it isn't an owner this launch may hand off to.
-/// A process can't label an object above its own level, so a lower
-/// process of the same user can't pass for the owner.
-fn check_pipe_owner(pipe: &File) -> io::Result<()> {
+/// The pipe a launch opened must be this user's, labelled at `expected`,
+/// the level the owner's marker shows, or it isn't the owner this launch
+/// read the level of. A launch talks only to an owner marked at its own
+/// level, and a process can't label an object above its own level, so a
+/// lower process of the same user can't pass for the owner. `None` matches
+/// no label.
+fn check_pipe_owner(pipe: &File, expected: Option<crate::Level>) -> io::Result<()> {
     let me = me()?;
     let mut owner: PSID = null_mut();
     let mut sacl: *mut ACL = null_mut();
@@ -1407,7 +1489,8 @@ fn check_pipe_owner(pipe: &File) -> io::Result<()> {
         return Err(denied("the pipe belongs to another user"));
     }
     // SAFETY: a valid (or null) SACL from the call above.
-    if unsafe { label(sacl) }.unwrap_or(MEDIUM) != me.integrity {
+    let level = unsafe { label(sacl) }.unwrap_or(MEDIUM);
+    if Some(level) != expected.map(crate::Level::rid) {
         return Err(denied("the owner runs at another integrity level"));
     }
     Ok(())
@@ -2732,43 +2815,6 @@ mod tests {
         assert_eq!(level, Some(me().unwrap().integrity), "{label}");
     }
 
-    /// The level marker another handle holds in `file`, found as a launch
-    /// will look for it: this process's own level's byte first, then the
-    /// bytes in [1, 0x10000) by shared range locks, each given back at
-    /// once, halving the range around a conflict. The highest held byte
-    /// wins. Byte 0 is owning, never a marker, so at RID 0 only the search
-    /// runs.
-    fn marker(file: &File) -> io::Result<Option<u64>> {
-        let own = level_marker(me()?.integrity);
-        if own != OWNER_BYTE {
-            if !try_lock(file, own, 1, false)? {
-                return Ok(Some(highest_held(file, own + 1, 0x10000)?.unwrap_or(own)));
-            }
-            unlock(file, own, 1)?;
-        }
-        highest_held(file, 1, 0x10000)
-    }
-
-    /// The highest byte in `start..end` that another handle holds
-    /// exclusively. An empty range holds none.
-    fn highest_held(file: &File, start: u64, end: u64) -> io::Result<Option<u64>> {
-        if start >= end {
-            return Ok(None);
-        }
-        if try_lock(file, start, end - start, false)? {
-            unlock(file, start, end - start)?;
-            return Ok(None);
-        }
-        if end - start == 1 {
-            return Ok(Some(start));
-        }
-        let mid = start + (end - start) / 2;
-        match highest_held(file, mid, end)? {
-            Some(byte) => Ok(Some(byte)),
-            None => highest_held(file, start, mid),
-        }
-    }
-
     // On disk: byte 0 of instance.lock is owning, and the byte at the
     // owner's level's RID marks its level. Only a major release may change
     // them. Every other byte stays free for launches to probe.
@@ -2793,6 +2839,56 @@ mod tests {
         drop(lock);
         assert_eq!(marker(&other).unwrap(), None);
         assert!(try_lock(&other, 0, 1, true).unwrap());
+    }
+
+    impl Folder {
+        /// Takes the lock as an owner at the level `rid` would, through a
+        /// handle of its own: an owner at another level, for tests, in
+        /// this level's folder.
+        pub(crate) fn lock_at(&self, rid: u32) -> io::Result<Option<Lock>> {
+            let file = self.open_lock(true)?;
+            Ok(take(&file, level_marker(rid))?.then_some(Lock(file)))
+        }
+
+        /// Holds byte 0 alone through a handle of its own, as an owner
+        /// still starting does before it takes its marker.
+        pub(crate) fn lock_starting(&self) -> io::Result<Option<Lock>> {
+            let file = self.open_lock(true)?;
+            Ok(try_lock(&file, OWNER_BYTE, 1, true)?.then_some(Lock(file)))
+        }
+    }
+
+    // A launch reads the owner's level from its marker: its own level's
+    // marker is its own level, and another is that level, the highest
+    // winning. Byte 0 held with no marker, or no file at all, is an owner
+    // still starting, and the search leaves nothing in its way.
+    #[test]
+    fn a_launch_reads_the_owners_level_from_its_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = open_folder(&Place::dir(tmp.path().join("run")), true)
+            .unwrap()
+            .unwrap();
+        let rid = me().unwrap().integrity;
+        let (below, above) = (rid - 0x1000, rid + 0x1000);
+        let other = |rid| OwnerLevel::Other(crate::Level::from_rid(rid));
+        assert_eq!(folder.owner_level().unwrap(), OwnerLevel::Starting);
+
+        let lock = folder.lock().unwrap().unwrap();
+        assert_eq!(folder.owner_level().unwrap(), OwnerLevel::Same);
+        let higher = folder.open_lock(false).unwrap();
+        assert!(try_lock(&higher, level_marker(above), 1, true).unwrap());
+        assert_eq!(folder.owner_level().unwrap(), other(above));
+        drop(higher);
+        drop(lock);
+        let lock = folder.lock_at(below).unwrap().unwrap();
+        assert_eq!(folder.owner_level().unwrap(), other(below));
+        drop(lock);
+
+        let starting = folder.open_lock(false).unwrap();
+        assert!(try_lock(&starting, OWNER_BYTE, 1, true).unwrap());
+        assert_eq!(folder.owner_level().unwrap(), OwnerLevel::Starting);
+        assert!(try_lock(&starting, level_marker(rid), 1, true).unwrap());
+        assert_eq!(folder.owner_level().unwrap(), OwnerLevel::Same);
     }
 
     // A launch may hold the marker's byte for a moment while it probes.

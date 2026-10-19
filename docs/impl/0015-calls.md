@@ -115,6 +115,12 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
    - Byte 0 is given back with `UnlockFileEx` at once, not left to the handle's close. A launch that takes byte 0 only to see whether it is held gives it back the same way.
    - An untrusted process (RID 0) would mark byte 0, the owning byte, so it never owns: its lock fails at once with an error (`Reason::Lock` from `start`). Slice 33 excludes it before it gets there.
    - When a launch's marker probe finds its own level's byte held, it still searches above it, and a higher marker wins over its own.
+
+   Slice 21 settled what this leaves open for launches. *Our call (slice 21).*
+   - A launch reads the marker once it finds byte 0 held, and before it sends anything. `start` reads it before it encodes its request, so nothing is encoded for an owner at another level. `hand_off` encodes its payload first, as before, so a payload that can't be encoded gives `Reason::Encode` before any answer the marker gives. A `Mode::Separate` launch doesn't read it: it never hands off, so until slice 30 it gets `OwnerRunning` at any level.
+   - Byte 0 held with no marker is retried as an owner that isn't listening yet is: past the deadline it gives `Unresponsive`, and after a commit an unconfirmed handoff (6.4). An `instance.lock` gone since byte 0 was found held counts the same, and the next look at the lock decides.
+   - A marker that can't be read gives `Reason::Lock`, naming `instance.lock`, as a lock that can't be taken does. After a commit it gives an unconfirmed handoff.
+   - A launch that can't read its own level, facing a marker at another, fails closed: it connects as to an owner at its own level, which no pipe's label matches, so it gets `Reason::Peer` and sends nothing. It can't happen yet, since reading the marker needs the launch's own level.
 2. A probe at another level is answered from the marker alone, unconfirmed. *Recommended.*
 3. `MoreRights` and `OwnerHasMoreRights` don't name the owner's pid, since `instance.lock` stays unwritten. *Recommended.*
 4. A committed launch whose owner died and that then finds the guard, or a lock at another level, held reports an unconfirmed handoff, never `Alone`. Running alone there would break 0004. *The critic's fix.*
