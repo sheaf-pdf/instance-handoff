@@ -2004,10 +2004,10 @@ mod tests {
         let err = open_folder(&Place::dir(link), true).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
 
-        // A scope subfolder someone swapped for a symlink.
+        // An instance folder someone swapped for a symlink.
         let mut scoped = Place::dir(dir.clone());
-        scoped.push("s");
-        std::os::unix::fs::symlink("/tmp", dir.join("s")).unwrap();
+        scoped.push("i-0123456789abcdef");
+        std::os::unix::fs::symlink("/tmp", dir.join("i-0123456789abcdef")).unwrap();
         assert!(open_folder(&scoped, true).is_err());
     }
 

@@ -128,9 +128,10 @@
 //!
 //! # Where the lock lives
 //!
-//! In a local, per-user folder that every launch of the same user finds.
-//! Each launch has exactly one right folder and never falls back to
-//! another, because a fallback is how two launches end up with two owners:
+//! In a local, per-user folder that every launch of the same user finds,
+//! and in it a folder named after the state. Each launch has exactly one
+//! right folder and never falls back to another, because a fallback is how
+//! two launches end up with two owners. The app's folder is:
 //!
 //! - Linux in a Flatpak sandbox: `$XDG_RUNTIME_DIR/app/$FLATPAK_ID/<id>`;
 //!   in a snap: `$XDG_RUNTIME_DIR/<id>`.
@@ -152,21 +153,27 @@
 //! - macOS: `<id>` in the per-user temporary folder
 //!   (`confstr(_CS_DARWIN_USER_TEMP_DIR)` with its links resolved, not
 //!   `$TMPDIR`), the same for GUI apps, agents, ssh and cron.
-//! - Windows: `<id>\run` in the Local AppData known folder, and
-//!   `<id>\run-high` for a process run as administrator; see
-//!   [Privileges](#privileges).
+//! - Windows: `<id>` in the Local AppData known folder.
 //! - Android: `$TMPDIR/<id>`.
 //! - Anywhere else: nothing; launches run alone with
 //!   [`Reason::Unsupported`].
 //!
-//! [`Builder::scope`] adds a subfolder (one owner per session, per profile,
-//! per container), and [`Builder::dir`] replaces the folder. It is never a
-//! config folder: on Windows that roams and may be a network share, where a
-//! lock would span machines. The owner touches its files every hour, so
-//! cleaners that go by age leave them alone, and checks every minute that
-//! its lock is still in place, re-creating it when something deleted it.
-//! On Windows nothing can: the owner holds its folder, its lock and
-//! `instance.pipe` open, sharing no delete.
+//! The lock is in the instance folder inside the app's folder: `i-` and 16
+//! hex digits of a hash of the state folder, with its links resolved as
+//! [`State::dir`] says, and of the [scope](Builder::scope). So launches
+//! that name one state folder meet one owner, and launches that name two
+//! get two. In Local AppData on Windows, the lock is one folder further
+//! down: in `run`, or in `run-high` for a process run as administrator; see
+//! [Privileges](#privileges).
+//!
+//! [`Builder::dir`] replaces the app's folder. It is never a config folder:
+//! on Windows that roams and may be a network share, where a lock would
+//! span machines. The instance folder is made in it, and on Windows the
+//! lock is then in the instance folder itself. The owner touches its files
+//! every hour, so cleaners that go by age leave them alone, and checks
+//! every minute that its lock is still in place, re-creating it when
+//! something deleted it. On Windows nothing can: the owner holds its
+//! folder, its lock and `instance.pipe` open, sharing no delete.
 //!
 //! # Privileges
 //!
@@ -188,12 +195,12 @@
 //!   launches under `sudo` meet one owner, whether or not root is logged in
 //!   anywhere.
 //! - Windows: the level is the user and the integrity level. A launch run
-//!   as administrator (high) uses `<id>\run-high` and an owner of its own,
-//!   and never reaches the normal (medium) owner; nor does a normal launch
-//!   reach an elevated one. Each level's folder is labelled at its level,
-//!   so lower levels can't read it or take its lock. Below medium (low
-//!   integrity, AppContainer), launches can't make or open their folder and
-//!   run alone with [`Reason::RuntimeDir`].
+//!   as administrator (high) uses `run-high` in the instance folder and an
+//!   owner of its own, and never reaches the normal (medium) owner; nor
+//!   does a normal launch reach an elevated one. Each level's folder is
+//!   labelled at its level, so lower levels can't read it or take its
+//!   lock. Below medium (low integrity, AppContainer), launches can't make
+//!   or open their folder and run alone with [`Reason::RuntimeDir`].
 //!
 //! A launch whose rights were raised from a login hands off to its level's
 //! owner, but by default never becomes it ([`Builder::elevated_owner`]):
@@ -253,13 +260,15 @@
 //!   own PID namespace, so [`OwnerInfo::pid`] and [`Request::launcher_pid`]
 //!   are usually `None`.
 //! - Containers: one that sees the host's `/run/systemd/system` and
-//!   `/run/user/<uid>` (toolbox does) meets the host's owner, which is
-//!   usually what you want, since it shares `$HOME`. But paths outside the
+//!   `/run/user/<uid>` (toolbox does) meets the host's owner of a state
+//!   folder in the `$HOME` they share, which is usually what you want. Both
+//!   must resolve the state folder to the same path. But paths outside the
 //!   shared mounts may name other files there. A container without systemd
 //!   uses its own `/tmp`, and root in a container usually its own `/run`,
 //!   so each runs its own owner: if it must meet the host's, pass the
-//!   bind-mounted folder to [`Builder::dir`] in both. Use [`Builder::scope`]
-//!   with the container's name for one owner per container.
+//!   bind-mounted folder to [`Builder::dir`] in both, with a state folder
+//!   both see at one path. Use [`Builder::scope`] with the container's name
+//!   for one owner per container.
 //! - Windows: mapped drives and `SUBST` letters belong to one logon
 //!   session, and every logon session of a user at one integrity level (a
 //!   second RDP session, an OpenSSH login, a scheduled task) reaches the
@@ -279,7 +288,12 @@
 //! Two builds of one app may use different releases of this crate, so what
 //! they share is fixed, and only a major release changes it:
 //!
-//! - the folder rule above, and the scope subfolder's name. On Windows the
+//! - the folder rule above, and the instance folder's name: `i-` and 16
+//!   lowercase hex digits of the FNV-1a 64 hash of the state folder, as
+//!   [`State::dir`] resolves it, then the scope. Each is written as
+//!   `tag u8 | length u32 LE | bytes` (tag 1 for the state, 2 for the
+//!   scope), and left out when there is none. A path or a scope is its
+//!   bytes on Unix, and the WTF-8 of its UTF-16 on Windows. On Windows the
 //!   folder for an integrity level other than medium is `run-low`,
 //!   `run-high`, `run-system`, or else `run-` and the level's RID in
 //!   lowercase hex;

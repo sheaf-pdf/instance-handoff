@@ -7,7 +7,9 @@ use crate::{AppId, OwnerInfo, Payload, Reason, Started, launch, naming, state, s
 
 /// The folder an app keeps its state in: the files only the owner writes.
 /// [`Builder::new`] takes it, and the owner reports it, with its links
-/// resolved, as [`Claim::state_dir`] and [`Owner::state_dir`].
+/// resolved, as [`Claim::state_dir`] and [`Owner::state_dir`]. Launches
+/// that name one state folder and one scope meet one owner: the two name
+/// their runtime folder ([`Builder::runtime_dir`]).
 ///
 /// A `PathBuf` or a `&Path` converts to a `State::dir`.
 ///
@@ -44,7 +46,8 @@ impl State {
 
     /// No state folder: the app keeps no files of its own.
     /// [`Claim::state_dir`] is then `None`, and nothing gives
-    /// [`Reason::ForeignState`].
+    /// [`Reason::ForeignState`]. Launches that pass it, with one scope,
+    /// meet one another, never the owner of a state folder.
     ///
     /// [`Claim::state_dir`]: crate::Claim::state_dir
     pub fn none() -> State {
@@ -151,6 +154,12 @@ impl Builder {
     /// runtime folder, [`Mode::Join`], [`ElevatedOwner::NotRaised`], a 5
     /// second timeout and payload version 0.
     ///
+    /// Launches of `app_id` that name one state folder, through whatever
+    /// links, and one [scope](Builder::scope) meet one owner. Launches that
+    /// name two folders get two owners. Each user, and on Windows each
+    /// integrity level, has owners of its own: see the crate docs on where
+    /// the lock lives.
+    ///
     /// Before [`start`](Builder::start) creates anything, it checks whose
     /// the state folder is, or, while it is missing, whose the nearest
     /// folder above it is. If that folder belongs to another user, the
@@ -183,26 +192,32 @@ impl Builder {
         }
     }
 
-    /// One owner per `scope` rather than one per user: per login session
-    /// (`XDG_SESSION_ID`), per profile, per container, per scratch
-    /// configuration. The scope names a subfolder of the runtime folder:
-    /// 16 hex digits of the FNV-1a 64 hash of its bytes.
+    /// One owner per state folder and `scope`, rather than one per state
+    /// folder: per container, say, or per project. The scope is hashed with
+    /// the state folder into the runtime folder's name, so launches meet
+    /// only when both match. Owners of one state folder under two scopes
+    /// run side by side, so the app must keep their writes to it safe.
     ///
     /// The scope is a key, compared byte for byte, not a path: `cfg`,
     /// `./cfg/` and a symlink to it are three scopes, and a relative path
     /// means one scope for every folder of that name. To key on a folder,
     /// create it and pass [`std::fs::canonicalize`] of it.
+    ///
+    /// A scope only names where launches meet. Never derive a state folder
+    /// from a session id: Windows reuses session ids, and macOS gives a new
+    /// one at every login.
     pub fn scope(mut self, scope: impl AsRef<OsStr>) -> Builder {
         self.scope = Some(scope.as_ref().to_os_string());
         self
     }
 
-    /// Use `dir` instead of the default runtime folder ([`Builder::scope`]
-    /// still adds its subfolder). It must be on a local disk. It is created
-    /// private when missing. A folder that isn't the user's alone (on Unix:
-    /// a symlink, another user's, or open to group or others; on Windows: a
-    /// link, or one that others may change or read) is refused with
-    /// [`Reason::RuntimeDir`].
+    /// Use `dir` in place of the app's default folder. The runtime folder is
+    /// still the instance folder inside it, which the state folder and the
+    /// scope name ([`Builder::runtime_dir`]). It must be on a local disk.
+    /// It is created private when missing, and so is the instance folder. A
+    /// folder that isn't the user's alone (on Unix: a symlink, another
+    /// user's, or open to group or others; on Windows: a link, or one that
+    /// others may change or read) is refused with [`Reason::RuntimeDir`].
     ///
     /// Every launch that should meet must pass the same folder. A folder
     /// serves one privilege level: on Windows, one made at another
@@ -268,15 +283,22 @@ impl Builder {
         self
     }
 
-    /// The runtime folder `start` would use, without creating anything. For
-    /// diagnostics and tests. `None` when there is none to use: see
+    /// The runtime folder `start` would use, without creating anything: the
+    /// instance folder that the state folder and the [scope](Builder::scope)
+    /// name (`i-` and 16 hex digits), in the app's folder or in
+    /// [`Builder::dir`]. In Local AppData on Windows, it is the folder of
+    /// this process's integrity level inside the instance folder. The state
+    /// folder's links are resolved as `start` resolves them. For diagnostics
+    /// and tests. `None` when there is none to use: see
     /// [`Reason::NoSession`], [`Reason::NoRuntimeDir`] and
     /// [`Reason::Unsupported`].
     pub fn runtime_dir(&self) -> Option<PathBuf> {
         if !sys::SUPPORTED {
             return None;
         }
-        self.place().ok().map(|p| p.path())
+        self.place(self.canonical_state().as_deref())
+            .ok()
+            .map(|p| p.path())
     }
 
     /// The state folder, canonical. Resolved as the launch decides, not in
@@ -285,7 +307,9 @@ impl Builder {
         self.state.dir.as_deref().map(state::canonical)
     }
 
-    pub(crate) fn place(&self) -> Result<sys::Place, Reason> {
+    /// The runtime folder for the canonical `state`: the base, and in it
+    /// the instance folder that `state` and the scope name.
+    pub(crate) fn place(&self, state: Option<&Path>) -> Result<sys::Place, Reason> {
         let mut place = match &self.dir {
             // Absolute now: a later change of working directory must not
             // move the owner's folder.
@@ -294,9 +318,7 @@ impl Builder {
             }
             None => sys::default_place(&self.app_id)?,
         };
-        if let Some(scope) = &self.scope {
-            place.push(naming::scope_folder(scope));
-        }
+        place.push(naming::instance_folder(state, self.scope.as_deref()));
         Ok(place)
     }
 

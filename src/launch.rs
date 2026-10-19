@@ -183,7 +183,7 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
     if let Some(path) = state.as_deref().and_then(crate::state::foreign) {
         return Started::Alone(Reason::ForeignState { path });
     }
-    let place = match b.place() {
+    let place = match b.place(state.as_deref()) {
         Ok(place) => place,
         Err(reason) => return Started::Alone(reason),
     };
@@ -279,7 +279,7 @@ pub(crate) fn hand_off<T: Payload>(b: &Builder, payload: Option<&T>) -> Result<O
     if !sys::SUPPORTED {
         return Err(Reason::Unsupported {});
     }
-    let place = b.place()?;
+    let place = b.place(b.canonical_state().as_deref())?;
     let Some(folder) = sys::open_folder(&place, false)? else {
         return Err(Reason::NoOwner {});
     };

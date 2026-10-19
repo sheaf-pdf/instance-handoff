@@ -287,10 +287,12 @@ enum Base {
 pub(crate) struct Place {
     base: PathBuf,
     kind: Base,
+    /// The folders this crate makes in the base. Every integrity level
+    /// shares them when there is a level folder below them. Without one,
+    /// they belong to this process's level, and so does the base.
     subs: Vec<OsString>,
-    /// How many of `subs` every integrity level shares. The folders below
-    /// them belong to this process's level, and so does a created base.
-    shared: usize,
+    /// The folder of this process's integrity level, last in the path.
+    level: Option<OsString>,
 }
 
 impl Place {
@@ -299,7 +301,7 @@ impl Place {
             base: dir,
             kind: Base::Create,
             subs: Vec::new(),
-            shared: 0,
+            level: None,
         }
     }
 
@@ -310,6 +312,7 @@ impl Place {
     pub(crate) fn path(&self) -> PathBuf {
         let mut p = self.base.clone();
         p.extend(&self.subs);
+        p.extend(&self.level);
         p
     }
 }
@@ -338,8 +341,8 @@ pub(crate) fn default_place(id: &AppId) -> Result<Place, Reason> {
     Ok(Place {
         base,
         kind: Base::Known,
-        subs: vec![id.as_str().into(), level_folder(level).into()],
-        shared: 1,
+        subs: vec![id.as_str().into()],
+        level: Some(level_folder(level).into()),
     })
 }
 
@@ -624,8 +627,11 @@ pub(crate) fn open_folder(place: &Place, create: bool) -> Result<Option<Folder>,
         Err(e) if missing(&e) => return Ok(None),
         Err(e) => return Err(Reason::runtime_dir(&path, e)),
     };
-    for (i, sub) in place.subs.iter().enumerate() {
-        let level = i >= place.shared;
+    // Each folder below the base, and whether it belongs to this process's
+    // level.
+    let shared = place.level.is_some();
+    let subs = place.subs.iter().map(|sub| (sub, !shared));
+    for (sub, level) in subs.chain(place.level.iter().map(|sub| (sub, true))) {
         path.push(sub);
         if create {
             create_private_dir(&path, level).map_err(|e| Reason::runtime_dir(&path, e))?;
@@ -1807,19 +1813,30 @@ fn check_address<T: Payload>(core: &Core<T>, listener: Option<&mut PipeListener>
 mod tests {
     use super::*;
 
+    // The level folder comes last, below the instance folder that every
+    // level shares.
     #[test]
     fn the_default_folder_passes_the_check() {
-        let place = default_place(&AppId::headless("test.windows")).unwrap();
+        let mut place = default_place(&AppId::headless("test.windows")).unwrap();
         let base = open_dir(&place.base).unwrap();
         check_dir(&base, false, false).unwrap();
-        assert_eq!(place.subs[1], *level_folder(me().unwrap().integrity));
+        let level = level_folder(me().unwrap().integrity);
+        place.push("i-0123456789abcdef");
+        assert_eq!(
+            place.path(),
+            place
+                .base
+                .join("test.windows")
+                .join("i-0123456789abcdef")
+                .join(level)
+        );
     }
 
     #[test]
     fn folders_this_crate_makes_are_private_and_labelled() {
         let tmp = tempfile::tempdir().unwrap();
         let mut place = Place::dir(tmp.path().join("run"));
-        place.push("scope");
+        place.push("i-0123456789abcdef");
         let folder = open_folder(&place, true).unwrap().unwrap();
         check_dir(&open_dir(folder.path()).unwrap(), true, true).unwrap();
         check_dir(&open_dir(&tmp.path().join("run")).unwrap(), true, true).unwrap();

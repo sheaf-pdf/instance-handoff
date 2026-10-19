@@ -599,6 +599,51 @@ fn a_state_folder_named_through_a_link_is_reported_where_it_is() {
     claim.release();
 }
 
+// The state folder names the runtime folder in the base: `i-` and 16 hex
+// digits.
+#[test]
+fn each_state_folder_has_an_owner_of_its_own() {
+    let dir = dir();
+    let other = Builder::new(APP, dir.tmp.path().join("other")).dir(&dir.path);
+    let a = claim(builder(&dir).start(&Args::default()));
+    let b = claim(other.start(&Args::default()));
+    assert_ne!(a.dir(), b.dir());
+    for owner in [&a, &b] {
+        assert_eq!(owner.dir().parent(), Some(dir.path.as_path()));
+        let name = owner.dir().file_name().unwrap().to_str().unwrap();
+        let hex = name.strip_prefix("i-").unwrap();
+        let digit = |c: u8| c.is_ascii_digit() || (b'a'..=b'f').contains(&c);
+        assert!(hex.len() == 16 && hex.bytes().all(digit), "{name}");
+    }
+    a.release();
+    b.release();
+}
+
+#[cfg(unix)]
+#[test]
+fn launches_that_name_one_state_folder_through_a_link_meet() {
+    let dir = dir();
+    let real = dir.tmp.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let (owner, rx) = serve(claim(
+        Builder::new(APP, real.join("app"))
+            .dir(&dir.path)
+            .start(&Args::default()),
+    ));
+    let info = match Builder::new(APP, link.join("app"))
+        .dir(&dir.path)
+        .start(&args(&["x"]))
+    {
+        Started::HandedOff(info) => info,
+        other => panic!("{other:?}"),
+    };
+    assert!(info.confirmed());
+    assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["x"]));
+    owner.release();
+}
+
 #[test]
 fn scopes_make_separate_owners() {
     let dir = dir();
