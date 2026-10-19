@@ -10,11 +10,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use instance_handoff::Guard;
 use instance_handoff::{
-    AppId, Args, Builder, Claim, ElevatedOwner, End, Kind, Level, Mode, Owner, Reason, Request,
-    Started, State,
+    AppId, Args, Builder, Claim, ElevatedOwner, End, Guard, Kind, Level, Mode, Owner, Reason,
+    Request, Started, State,
 };
 
 const APP: AppId = AppId::headless("test.handoff");
@@ -54,6 +52,20 @@ fn canonical(path: &Path) -> PathBuf {
     } else {
         real
     }
+}
+
+/// Asserts that the crate made the folder `path` private: mode 0700 on
+/// Unix. On Windows the crate's own tests check its access list, so here it
+/// need only be a folder.
+fn assert_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{}", path.display());
+    }
+    #[cfg(windows)]
+    assert!(path.is_dir(), "{}", path.display());
 }
 
 fn claim(started: Started<Args>) -> Claim<Args> {
@@ -831,7 +843,6 @@ fn launches_that_name_one_state_folder_through_a_link_meet() {
 // Two runtime folders with one state folder, as in two containers: the
 // second launch to take its lock finds the guard held, and runs alone at
 // once without binding a socket.
-#[cfg(unix)]
 #[test]
 fn a_second_runtime_folder_finds_the_state_folder_in_use() {
     let dir = dir();
@@ -858,16 +869,13 @@ fn a_second_runtime_folder_finds_the_state_folder_in_use() {
 // Guard::Off takes no guard and makes no guard file, so an owner in
 // another runtime folder starts beside it. It still makes the missing state
 // folder, private. State::none has no folder to guard.
-#[cfg(unix)]
 #[test]
 fn guard_off_and_no_state_take_no_guard() {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     let dir = dir();
     let state = dir.tmp.path().join("state");
     let off = claim(builder(&dir).guard(Guard::Off).start(&Args::default()));
     assert!(!off.guarded());
-    assert_eq!(mode(&state), 0o700);
+    assert_private(&state);
     assert!(!state.join(".instance-handoff.lock").exists());
     let beside = claim(
         builder(&dir)
@@ -892,14 +900,11 @@ fn guard_off_and_no_state_take_no_guard() {
 // own, but an owner without a scope never starts beside them, nor one with
 // a scope beside it. The launch turned away lets go of its lock at once. A
 // keyed start makes the missing state folder, private.
-#[cfg(unix)]
 #[test]
 fn keyed_owners_share_the_guard() {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     let dir = dir();
     let a = claim(builder(&dir).scope("a").start(&Args::default()));
-    assert_eq!(mode(&dir.tmp.path().join("state")), 0o700);
+    assert_private(&dir.tmp.path().join("state"));
     let b = claim(builder(&dir).scope("b").start(&Args::default()));
     assert!(a.guarded() && b.guarded());
     let unkeyed = builder(&dir);

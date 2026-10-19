@@ -119,8 +119,8 @@ impl<T> Claim<T> {
     /// Whether this process holds the state folder's
     /// [guard](crate::Guard), alone or, with a
     /// [scope](crate::Builder::scope), shared. It doesn't under
-    /// [`Guard::Off`], for [`State::none`], on Windows, on a network file
-    /// system, or where the file system can't lock files (see
+    /// [`Guard::Off`], for [`State::none`], on a network file system, or
+    /// where the file system can't lock files (see
     /// [`Guard::Local`](crate::Guard::Local)).
     ///
     /// [`Guard::Off`]: crate::Guard::Off

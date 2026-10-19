@@ -702,7 +702,6 @@ fn a_stopped_owner_never_delivers_a_launch_that_ran_alone() {
 // Another process owns the state folder from another runtime folder: a
 // launch is told at once, well inside its timeout, and nothing reaches the
 // owner.
-#[cfg(unix)]
 #[test]
 fn a_guard_held_by_another_process_is_reported_at_once() {
     let (_tmp, dir) = dir();

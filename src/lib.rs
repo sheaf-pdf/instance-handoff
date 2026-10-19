@@ -43,11 +43,12 @@
 //! # Guarantees
 //!
 //! - At most one process holds the lock for an app id and runtime folder
-//!   at a time, and only it gets [`Started::Owner`]. On Unix the owner also
-//!   holds the state folder's [guard](Guard), where it takes one, so a
-//!   launch that took the lock in another runtime folder (another
-//!   container, another [`Builder::dir`], another app id) doesn't own that
-//!   state folder too: it runs alone at once with [`Reason::StateInUse`].
+//!   at a time, and only it gets [`Started::Owner`]. The owner also holds
+//!   the state folder's [guard](Guard), where it takes one, so a launch
+//!   that took the lock in another runtime folder (another container,
+//!   another [`Builder::dir`], another app id, or on Windows another
+//!   integrity level) doesn't own that state folder too: it runs alone at
+//!   once with [`Reason::StateInUse`].
 //!   Two owners that both have a [scope](Builder::scope) share the guard,
 //!   and own the state folder side by side. A process that gets
 //!   [`Started::Alone`] must not write the state the owner owns. If the
@@ -191,20 +192,21 @@
 //! something deleted it. On Windows nothing can: the owner holds its
 //! folder, its lock and `instance.pipe` open, sharing no delete.
 //!
-//! On Unix the owner also holds a lock in the state folder, on
+//! The owner also holds a lock in the state folder, on
 //! `.instance-handoff.lock`: the [guard](Guard). Launches that name one
 //! state folder can still find two runtime folders: in two containers,
-//! under two [`Builder::dir`] folders, or as two app ids (an app and a
-//! companion tool that share its folder), say. The guard keeps the second
-//! from owning the state beside the first: it runs alone at once with
-//! [`Reason::StateInUse`]. Owners with a [scope](Builder::scope) take the
-//! guard shared, so they own one state folder side by side, but never
-//! beside an owner without one. On a network file system the owner takes
-//! no guard, so each host keeps an owner of its own. Nor does it where the
-//! file system can't lock files: see [`Guard::Local`]. A `start` that takes
-//! the lock makes the state folder first if it is missing, whether or not
+//! under two [`Builder::dir`] folders, as two app ids (an app and a
+//! companion tool that share its folder), or on Windows at two integrity
+//! levels, say. The guard keeps the second from owning the state beside the
+//! first: it runs alone at once with [`Reason::StateInUse`]. Owners with a
+//! [scope](Builder::scope) take the guard shared, so they own one state
+//! folder side by side, but never beside an owner without one. On a network
+//! file system the owner takes no guard, so each host keeps an owner of its
+//! own; on Windows that is a share, which a mapped drive resolves to, or a
+//! drive that Windows says is remote. Nor does it where the file system
+//! can't lock files: see [`Guard::Local`]. A `start` that takes the lock
+//! makes the state folder first if it is missing, private, whether or not
 //! it takes the guard.
-//! Windows owners take no guard, and make nothing in the state folder.
 //!
 //! # Privileges
 //!
@@ -230,8 +232,11 @@
 //!   owner of its own, and never reaches the normal (medium) owner; nor
 //!   does a normal launch reach an elevated one. Each level's folder is
 //!   labelled at its level, so lower levels can't read it or take its
-//!   lock. Below medium (low integrity, AppContainer), launches can't make
-//!   or open their folder and run alone with [`Reason::RuntimeDir`].
+//!   lock. Every level locks the same [guard](Guard) in a state folder,
+//!   though, so while an owner at one level holds it, a launch at the other
+//!   runs alone with [`Reason::StateInUse`]. Below medium (low integrity,
+//!   AppContainer), launches can't make or open their folder and run alone
+//!   with [`Reason::RuntimeDir`].
 //!
 //! A launch whose rights were raised from a login hands off to its level's
 //! owner, but by default never becomes it ([`Builder::elevated_owner`]):
@@ -252,10 +257,12 @@
 //!
 //! - Owners at two levels are two owners. If both read and write the same
 //!   files, keep the state apart per level, or refuse to run elevated. An
-//!   elevated and a normal process on Windows share the profile. Root under
-//!   `sudo -E` (or wherever `HOME` is kept) would write into the user's
-//!   home, so a state folder of the user's there, or one root would
-//!   create there, gives root [`Reason::ForeignState`] instead of the lock.
+//!   elevated and a normal process on Windows share the profile; the guard
+//!   keeps them from owning one state folder at once, unless both have a
+//!   scope. Root under `sudo -E` (or wherever `HOME` is kept) would write
+//!   into the user's home, so a state folder of the user's there, or one
+//!   root would create there, gives root [`Reason::ForeignState`] instead
+//!   of the lock.
 //! - Within one Unix user, finer privileges aren't compared: supplementary
 //!   groups (`newgrp`), capabilities and LSM confinement. A sandbox that
 //!   must keep its processes from the owner hides the runtime folder from
@@ -371,10 +378,12 @@
 //!   owner's integrity level's RID (0x2000 at medium), which marks its
 //!   level. An owner that can't take its marker gives byte 0 back. Closing
 //!   the handle releases both;
-//! - the guard, on Unix: `flock(LOCK_EX | LOCK_NB)` on
-//!   `.instance-handoff.lock` in the state folder, or
+//! - the guard: `.instance-handoff.lock` in the state folder, never
+//!   written. On Unix, `flock(LOCK_EX | LOCK_NB)` on it, or
 //!   `flock(LOCK_SH | LOCK_NB)` for an owner with a scope, held as the lock
-//!   is, and never written;
+//!   is. On Windows, a `LockFileEx` lock on one byte of it, at 2^31
+//!   (0x80000000), exclusive, or shared for an owner with a scope, released
+//!   when the handle closes;
 //! - the address. On Unix, `instance.sock` beside the lock. When that path
 //!   is too long for a socket address, Linux reaches it through
 //!   `/proc/self/fd`; otherwise, and on other Unixes, it uses

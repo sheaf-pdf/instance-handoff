@@ -316,8 +316,8 @@ fn own<T>(
 }
 
 /// For a launch that holds the lock: creates the canonical `state` folder
-/// when it is missing, whatever the guard (on Unix, so far), then takes its
-/// guard. A folder that can't be made gives [`Reason::Lock`], naming it.
+/// when it is missing, whatever the guard, then takes its guard. A folder
+/// that can't be made gives [`Reason::Lock`], naming it.
 fn take_state(b: &Builder, state: Option<&Path>) -> Result<Option<sys::Guard>, Reason> {
     if let Some(state) = state {
         sys::make_state_dir(state).map_err(|source| Reason::Lock {
@@ -894,7 +894,7 @@ mod tests {
     // the guard: the dead owner may have had the request, so the launch
     // reports it handed off, never alone, and lets go of the lock it took
     // (0004). With the guard free, it owns.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn a_committed_launch_that_finds_the_guard_held_is_handed_off_unconfirmed() {
         let tmp = tempfile::tempdir().unwrap();

@@ -356,8 +356,8 @@ pub enum Reason {
     /// The lock file can't be opened or locked (a file system without
     /// locks, say), the missing state folder can't be made, or the state
     /// folder's [guard](crate::Guard) can't be made, opened or locked (in a
-    /// state folder that is read-only, or a guard file that is another
-    /// user's).
+    /// state folder that is read-only or, on Windows, labelled above medium
+    /// integrity, or a guard file that is another user's).
     #[non_exhaustive]
     Lock {
         /// The lock file, the state folder or the guard file.
@@ -369,10 +369,11 @@ pub enum Reason {
     /// not the lock in this launch's runtime folder, so this launch can't
     /// reach it: an owner in another container, one given another
     /// [`Builder::dir`], an owner of another app id given the same state
-    /// folder, or one whose runtime folder was deleted and isn't made again
-    /// yet. Or one of the two has a [scope](crate::Builder::scope) and the
-    /// other hasn't: owners with scopes share the guard only with one
-    /// another. This launch let go of its lock before anyone could connect.
+    /// folder, on Windows one at another integrity level, or one whose
+    /// runtime folder was deleted and isn't made again yet. Or one of the
+    /// two has a [scope](crate::Builder::scope) and the other hasn't:
+    /// owners with scopes share the guard only with one another. This
+    /// launch let go of its lock before anyone could connect.
     /// Only [`Builder::start`] takes the guard.
     ///
     /// [`Builder::dir`]: crate::Builder::dir

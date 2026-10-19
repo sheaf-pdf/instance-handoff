@@ -96,8 +96,14 @@ pub(crate) fn instance_key(state: Option<&Path>, scope: Option<&OsStr>) -> Vec<u
 }
 
 /// The guard: the file in the state folder that the owner locks.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub(crate) const GUARD_FILE: &str = ".instance-handoff.lock";
+
+/// The byte of the Windows guard file that the owner locks: exclusively,
+/// or shared for an owner with a scope. It lies far into the file, which
+/// leaves room for text before it later.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const GUARD_BYTE: u64 = 1 << 31;
 
 /// Root's base on Linux: the same for every root launch, whether or not
 /// root is logged in.
@@ -224,6 +230,7 @@ mod tests {
     #[test]
     fn the_guard_file_is_frozen() {
         assert_eq!(GUARD_FILE, ".instance-handoff.lock");
+        assert_eq!(GUARD_BYTE, 0x8000_0000);
     }
 
     #[test]

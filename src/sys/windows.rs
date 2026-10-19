@@ -1,7 +1,8 @@
 //! Windows: the runtime folder under Local AppData, one per integrity
 //! level, `LockFileEx` on `instance.lock`, and a named pipe whose random
-//! name is published in `instance.pipe` beside the lock. The crate's thread
-//! runs overlapped I/O on every pipe instance at once.
+//! name is published in `instance.pipe` beside the lock, and another
+//! `LockFileEx` on the guard in the state folder, which every level shares.
+//! The crate's thread runs overlapped I/O on every pipe instance at once.
 //!
 //! A launch hands off only to an owner of its own user at its own integrity
 //! level: handed up, a request would gain rights; handed down, it would
@@ -37,6 +38,24 @@
 //! marker within about 100 ms gives byte 0 back, so no launch waits on an
 //! owner without one. Closing the handle releases both.
 //!
+//! The owner also locks one byte of the guard, `.instance-handoff.lock` in
+//! the state folder: the byte at 2^31, exclusively, or shared for an owner
+//! with a scope. Every level locks the same file, so an owner of a state
+//! folder at one level keeps out a launch at another, though each takes its
+//! lock in a folder of its own. The file gets an access list of its own,
+//! for this user and SYSTEM, and an explicit medium label that isn't
+//! protected, whatever level makes it, so every level can open and lock
+//! it. A state folder labelled above medium is refused, since a launch at
+//! medium couldn't make or lock the guard there, and so is a link or a
+//! junction in the state folder's place. The handle shares no delete, so
+//! while the owner holds it, the file can't be removed, nor the state
+//! folder renamed or removed. A missing state folder is made with an access
+//! list of its own, for this user and SYSTEM, and no label of its own: it
+//! still takes one that the folder above it hands down, as a `Builder::dir`
+//! base made above medium does, and is then refused. No guard is taken on a
+//! share, which a mapped drive resolves to, or on a drive that Windows says
+//! is remote.
+//!
 //! The pipe's controls, each against a threat:
 //! - its name is 128 random bits, published only after the pipe exists, in
 //!   a folder only this user can read: another user on a terminal server
@@ -58,16 +77,16 @@ use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::{null, null_mut};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BROKEN_PIPE, ERROR_IO_PENDING,
-    ERROR_LOCK_VIOLATION, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_ALL,
-    GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_FAILED,
-    WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BROKEN_PIPE, ERROR_INVALID_FUNCTION,
+    ERROR_IO_PENDING, ERROR_LOCK_VIOLATION, ERROR_NO_DATA, ERROR_NOT_SUPPORTED, ERROR_PIPE_BUSY,
+    ERROR_PIPE_CONNECTED, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    LocalFree, WAIT_FAILED, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -86,11 +105,12 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DELETE, FILE_ADD_FILE,
     FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
-    FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_DELETE_CHILD,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, FileAttributeTagInfo, GetDriveTypeW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
     GetVolumeInformationByHandleW, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
     OPEN_ALWAYS, PIPE_ACCESS_DUPLEX, READ_CONTROL, ReadFile, SECURITY_IDENTIFICATION, SYNCHRONIZE,
     UnlockFileEx, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER, WriteFile,
@@ -121,7 +141,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, WSF_VISIBLE};
 
 use crate::id::valid_id;
-use crate::naming::{OWNER_BYTE, level_folder, level_marker};
+use crate::naming::{GUARD_BYTE, GUARD_FILE, OWNER_BYTE, level_folder, level_marker};
 use crate::server::{Core, Peer, Session};
 use crate::wire::refusal;
 use crate::{AppId, Payload, Reason};
@@ -550,28 +570,15 @@ pub(crate) fn is_foreign(path: &Path) -> io::Result<bool> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
-    let handle = file.as_raw_handle();
-    let mut flags = 0;
-    // SAFETY: an open handle; the other out-parameters are null, which asks
-    // for nothing.
-    let ok = unsafe {
-        GetVolumeInformationByHandleW(
-            handle,
-            null_mut(),
-            0,
-            null_mut(),
-            null_mut(),
-            &mut flags,
-            null_mut(),
-            0,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if flags & FILE_PERSISTENT_ACLS == 0 {
+    foreign_owner(&file)
+}
+
+/// [`is_foreign`] for a file or folder open with `READ_CONTROL`.
+fn foreign_owner(file: &File) -> io::Result<bool> {
+    if !keeps_acls(file)? {
         return Ok(false);
     }
+    let handle = file.as_raw_handle();
     let mut owner: PSID = null_mut();
     let mut sd: *mut c_void = null_mut();
     // SAFETY: a handle opened with READ_CONTROL; `owner` points into `sd`,
@@ -596,6 +603,30 @@ pub(crate) fn is_foreign(path: &Path) -> io::Result<bool> {
         return Err(denied("its owner is unknown"));
     }
     Ok(!trusted(owner, me()?))
+}
+
+/// Whether the volume that the open `file` is on keeps owners, access lists
+/// and labels (`FILE_PERSISTENT_ACLS`). FAT and exFAT don't.
+fn keeps_acls(file: &File) -> io::Result<bool> {
+    let mut flags = 0;
+    // SAFETY: an open handle; the other out-parameters are null, which asks
+    // for nothing.
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle(),
+            null_mut(),
+            0,
+            null_mut(),
+            null_mut(),
+            &mut flags,
+            null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & FILE_PERSISTENT_ACLS != 0)
 }
 
 /// A final path in the form launches compare: `C:\…` on a drive and
@@ -885,12 +916,57 @@ fn create_private_dir(path: &Path, role: Role) -> io::Result<()> {
     create_dir_with_sd(path, &sddl)
 }
 
-/// Creates the folder `path` with the security `sddl` describes. An
-/// existing folder is left as it is.
+/// `path` in its verbatim form, `\\?\C:\…` or `\\?\UNC\server\share\…`,
+/// which the raw calls that make folders and files take past `MAX_PATH`,
+/// as std's own calls do. Only an absolute drive or share path whose names
+/// Windows would keep as they are is changed. A path with a `..`, or with a
+/// name that ends in a dot or a space, which Windows would trim, is kept as
+/// given, and so is any other form, such as one that is verbatim already.
+fn verbatim(path: &Path) -> PathBuf {
+    let mut parts = path.components();
+    let mut out = OsString::from(r"\\?\");
+    match parts.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(_) => out.push(prefix.as_os_str()),
+            Prefix::UNC(server, share) if !share.is_empty() => {
+                out.push(r"UNC\");
+                out.push(server);
+                out.push(r"\");
+                out.push(share);
+            }
+            _ => return path.to_path_buf(),
+        },
+        _ => return path.to_path_buf(),
+    }
+    if parts.next() != Some(Component::RootDir) {
+        return path.to_path_buf();
+    }
+    out.push(r"\");
+    for (i, part) in parts.enumerate() {
+        let Component::Normal(name) = part else {
+            return path.to_path_buf();
+        };
+        if name
+            .as_encoded_bytes()
+            .last()
+            .is_some_and(|&b| b == b'.' || b == b' ')
+        {
+            return path.to_path_buf();
+        }
+        if i > 0 {
+            out.push(r"\");
+        }
+        out.push(name);
+    }
+    PathBuf::from(out)
+}
+
+/// Creates the folder `path` with the security `sddl` describes, however
+/// long its path ([`verbatim`]). An existing folder is left as it is.
 fn create_dir_with_sd(path: &Path, sddl: &str) -> io::Result<()> {
     let sd = SecurityDescriptor::from_sddl(sddl)?;
     let sa = sd.attributes();
-    let wide_path = wide(path.as_os_str());
+    let wide_path = wide(verbatim(path).as_os_str());
     // SAFETY: a NUL-terminated path and valid security attributes.
     if unsafe { CreateDirectoryW(wide_path.as_ptr(), &sa) } == 0 {
         let e = io::Error::last_os_error();
@@ -901,20 +977,21 @@ fn create_dir_with_sd(path: &Path, sddl: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Opens the file `path` to read and write, creating it with the security
-/// `sddl` describes when it is missing; an existing file keeps its own. A
-/// link at `path` is opened as itself, not followed. While it is open,
-/// others may open it to read and write, but not to delete or rename it.
-fn create_file_with_sd(path: &Path, sddl: &str) -> io::Result<File> {
+/// Opens the file `path` with the `access` asked for, however long its path
+/// ([`verbatim`]), creating it with the security `sddl` describes when it
+/// is missing; an existing file keeps its own. A link at `path` is opened
+/// as itself, not followed. While it is open, others may open it to read
+/// and write, but not to delete or rename it.
+fn create_file_with_sd(path: &Path, access: u32, sddl: &str) -> io::Result<File> {
     let sd = SecurityDescriptor::from_sddl(sddl)?;
     let sa = sd.attributes();
-    let wide_path = wide(path.as_os_str());
+    let wide_path = wide(verbatim(path).as_os_str());
     // SAFETY: a NUL-terminated path, valid security attributes and no
     // template file.
     let h = unsafe {
         CreateFileW(
             wide_path.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
+            access,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             &sa,
             OPEN_ALWAYS,
@@ -1071,28 +1148,6 @@ fn take(file: &File, marker: u64) -> io::Result<bool> {
     }
 }
 
-/// The state folder's guard. Windows owners take none, so there is never
-/// one to hold.
-#[derive(Debug)]
-pub(crate) enum Guard {}
-
-// Owners drop or forget a guard as they do a lock.
-impl Drop for Guard {
-    fn drop(&mut self) {}
-}
-
-/// Makes nothing yet: a missing state folder is made with its access list
-/// once Windows owners take the guard.
-pub(crate) fn make_state_dir(_state: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-/// Windows owners take no guard: nothing is made or locked in the state
-/// folder.
-pub(crate) fn take_guard(_state: &Path, _shared: bool) -> Result<Option<Guard>, Reason> {
-    Ok(None)
-}
-
 /// Where a launch connects.
 struct Address {
     pipe: OsString,
@@ -1114,7 +1169,7 @@ impl Folder {
         let path = self.lock_path();
         if create {
             let sddl = format!("D:P(A;;FA;;;{})(A;;FA;;;SY)", me()?.sid_string);
-            return create_file_with_sd(&path, &sddl);
+            return create_file_with_sd(&path, GENERIC_READ | GENERIC_WRITE, &sddl);
         }
         OpenOptions::new()
             .read(true)
@@ -1554,6 +1609,230 @@ pub(crate) fn before_hand_off(owner_pid: Option<u32>) {
 }
 
 // ---------------------------------------------------------------------------
+// The state folder and its guard
+// ---------------------------------------------------------------------------
+
+/// Creates the canonical `state` folder when nothing is at its path: the
+/// folders above it as `create_dir_all` makes them, and the last one with
+/// an access list of its own, for this user and SYSTEM, handed down to
+/// what is made in it, and no label of its own. A label the folder above
+/// it hands down still reaches it, and one above medium makes
+/// [`take_guard`] refuse it. Whatever is there already is left as it is,
+/// for [`take_guard`] to open or refuse.
+pub(crate) fn make_state_dir(state: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(state) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = state.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let sddl = format!("D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)", me()?.sid_string);
+            create_dir_with_sd(state, &sddl)
+        }
+        found => found.map(drop),
+    }
+}
+
+/// The held guard: a `LockFileEx` lock on one byte of
+/// `.instance-handoff.lock` in the state folder, at 2^31, exclusive or
+/// shared. It is released when the handle closes. The handle shares no
+/// delete, so while it is open nobody can remove the file, or rename or
+/// remove the state folder.
+#[derive(Debug)]
+pub(crate) struct Guard(#[allow(dead_code)] File);
+
+/// Takes the guard in the canonical `state` folder, which
+/// [`make_state_dir`] has made: shared for a keyed owner, so keyed owners
+/// hold it side by side, and otherwise exclusive. Each owner opens the file
+/// afresh, so its lock is its own. [`Reason::StateInUse`] when another
+/// handle holds it in a mode that conflicts, at any integrity level. `None`
+/// on a network volume ([`is_remote`]), or where the file system can't lock
+/// files: the owner goes unguarded.
+pub(crate) fn take_guard(state: &Path, shared: bool) -> Result<Option<Guard>, Reason> {
+    take_guard_with(state, shared, is_remote)
+}
+
+/// [`take_guard`], asking `remote` whether the folder is on a network
+/// volume, so a test can say it is.
+fn take_guard_with(
+    state: &Path,
+    shared: bool,
+    remote: fn(&Path) -> bool,
+) -> Result<Option<Guard>, Reason> {
+    if remote(state) {
+        log::debug!(
+            "instance-handoff: {} is on a network volume, so this owner holds no guard",
+            state.display()
+        );
+        return Ok(None);
+    }
+    let path = state.join(GUARD_FILE);
+    let file = match open_guard(state) {
+        Ok(file) => file,
+        Err(source) => return Err(Reason::Lock { path, source }),
+    };
+    match try_lock(&file, GUARD_BYTE, 1, !shared) {
+        Ok(true) => Ok(Some(Guard(file))),
+        Ok(false) => Err(Reason::StateInUse { path }),
+        Err(e) if locks_unsupported(&e) => {
+            log::warn!(
+                "instance-handoff: {} can't be locked, so this owner holds no guard: {e}",
+                path.display()
+            );
+            Ok(None)
+        }
+        Err(source) => Err(Reason::Lock { path, source }),
+    }
+}
+
+/// Opens the guard file in `state`, creating it with an access list of its
+/// own, for this user and SYSTEM, and an explicit medium label that isn't
+/// protected, whatever level makes it, so every level can open and lock
+/// it. Opened to read only, since a lock needs no more. A state folder
+/// labelled above medium is refused: a launch at medium couldn't make or
+/// lock the guard there. So is a state folder that is a link or a junction
+/// ([`folder_label`]), and a guard file that is a link or a folder, or
+/// another user's.
+fn open_guard(state: &Path) -> io::Result<File> {
+    let me = me()?;
+    if folder_label(state)?.is_some_and(|level| level > MEDIUM) {
+        return Err(denied(
+            "the state folder is labelled above medium integrity",
+        ));
+    }
+    let sddl = format!(
+        "D:P(A;;FA;;;{})(A;;FA;;;SY)S:(ML;;NWNR;;;ME)",
+        me.sid_string
+    );
+    let file = create_file_with_sd(&state.join(GUARD_FILE), GENERIC_READ, &sddl)?;
+    let (attributes, link) = attributes(&file)?;
+    if link || attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+    }
+    if foreign_owner(&file)? {
+        return Err(denied("owned by another user"));
+    }
+    Ok(file)
+}
+
+/// The integrity level that the label of the state folder at `path` names,
+/// if it has a label. A folder on a volume that keeps no labels has none.
+/// The folder is opened as itself, as on Unix: a link or a junction at
+/// `path`, or anything but a folder, is refused, so the label read is that
+/// of the folder the guard is made in.
+fn folder_label(path: &Path) -> io::Result<Option<u32>> {
+    let dir = OpenOptions::new()
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let (attributes, link) = attributes(&dir)?;
+    if link {
+        return Err(denied("a link or junction, not a folder"));
+    }
+    if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
+    }
+    if !keeps_acls(&dir)? {
+        return Ok(None);
+    }
+    let mut sacl: *mut ACL = null_mut();
+    let mut sd: *mut c_void = null_mut();
+    // SAFETY: a handle opened with READ_CONTROL; `sacl` points into `sd`,
+    // freed by `Local`.
+    let err = unsafe {
+        GetSecurityInfo(
+            dir.as_raw_handle(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    if err != 0 {
+        return Err(win32(err));
+    }
+    let _sd = Local(sd);
+    // SAFETY: a valid (or null) SACL from the call above.
+    Ok(unsafe { label(sacl) })
+}
+
+/// The bit of a reparse point's tag that says it stands for another file
+/// or folder, as a symbolic link, a junction or a mount point does
+/// (`IsReparseTagNameSurrogate` in `winnt.h`).
+const NAME_SURROGATE: u32 = 0x2000_0000;
+
+/// The attributes of `file`, opened without following links, and whether
+/// it is a link: a reparse point that stands for another file or folder.
+/// Other reparse points, such as a cloud file's placeholder (OneDrive) or a
+/// deduplicated file, only keep their data elsewhere, and count as the file
+/// or folder they are, as std's `is_symlink` counts them. Needs
+/// `FILE_READ_ATTRIBUTES`.
+fn attributes(file: &File) -> io::Result<(u32, bool)> {
+    // SAFETY: plain data, filled in by the call.
+    let mut info: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: an open handle, and a buffer of the size given.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let link = info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && info.ReparseTag & NAME_SURROGATE != 0;
+    Ok((info.FileAttributes, link))
+}
+
+/// Whether `e`, from `LockFileEx` on the guard file, says that the file
+/// system can't lock files: `ERROR_NOT_SUPPORTED`, or
+/// `ERROR_INVALID_FUNCTION` from a driver that has no byte-range locks.
+fn locks_unsupported(e: &io::Error) -> bool {
+    is(e, ERROR_NOT_SUPPORTED) || is(e, ERROR_INVALID_FUNCTION)
+}
+
+/// What `GetDriveTypeW` says of a network drive. windows-sys has it only
+/// under a feature this crate doesn't otherwise need.
+const DRIVE_REMOTE: u32 = 4;
+
+/// Whether the canonical `state` is on a network volume, which
+/// [`Guard::Local`](crate::Guard::Local) leaves unguarded: a share
+/// (`\\server\share`, as a mapped drive's final path is), or a drive that
+/// Windows says is remote. Any other path counts as local, and the lock
+/// decides.
+fn is_remote(state: &Path) -> bool {
+    remote_with(state, |root| {
+        let root = wide(root);
+        // SAFETY: a NUL-terminated path.
+        unsafe { GetDriveTypeW(root.as_ptr()) }
+    })
+}
+
+/// [`is_remote`], asking `drive_type` what `GetDriveTypeW` says of a
+/// drive's root folder (`C:\`), so a test can give the answers.
+fn remote_with(path: &Path, drive_type: impl Fn(&OsStr) -> u32) -> bool {
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    match prefix.kind() {
+        Prefix::UNC(..) | Prefix::VerbatimUNC(..) => true,
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+            let root = format!("{}:\\", char::from(letter.to_ascii_uppercase()));
+            drive_type(OsStr::new(&root)) == DRIVE_REMOTE
+        }
+        // A volume with no drive letter, which is never a share, or a
+        // device.
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Overlapped operations
 // ---------------------------------------------------------------------------
 
@@ -1795,8 +2074,7 @@ impl Waker {
     }
 }
 
-/// The folder and the lock, as the owner holds them. `guard` stays `None`:
-/// Windows owners take no guard.
+/// The folder, the lock and the guard, as the owner holds them.
 #[derive(Debug)]
 pub(crate) struct Held {
     pub(crate) folder: Option<Folder>,
@@ -1822,24 +2100,23 @@ impl Held {
     }
 }
 
+/// What `start` hands over to a `Claim`: the folder, the lock, the guard
+/// if it took one, and the pipe.
 #[derive(Debug)]
 pub(crate) struct Claimed {
     pub(crate) folder: Folder,
     pub(crate) lock: Lock,
+    guard: Option<Guard>,
     pub(crate) listener: io::Result<PipeListener>,
 }
 
 impl Claimed {
-    pub(crate) fn new(
-        folder: Folder,
-        lock: Lock,
-        _guard: Option<Guard>,
-        app_id: &AppId,
-    ) -> Claimed {
+    pub(crate) fn new(folder: Folder, lock: Lock, guard: Option<Guard>, app_id: &AppId) -> Claimed {
         let listener = folder.listen(app_id);
         Claimed {
             folder,
             lock,
+            guard,
             listener,
         }
     }
@@ -1850,10 +2127,11 @@ impl Claimed {
     }
 
     pub(crate) fn guarded(&self) -> bool {
-        false
+        self.guard.is_some()
     }
 
     pub(crate) fn abandon(self) {
+        std::mem::forget(self.guard);
         std::mem::forget(self.lock);
     }
 
@@ -1861,7 +2139,7 @@ impl Claimed {
         let held = Held {
             folder: Some(self.folder),
             lock: Some(self.lock),
-            guard: None,
+            guard: self.guard,
         };
         match self.listener {
             Ok(l) => (held, Some(l), None),
@@ -1869,9 +2147,12 @@ impl Claimed {
         }
     }
 
+    /// Gives the guard and the lock up without serving, the guard first, so
+    /// a launch that takes the freed lock finds the guard free too.
     pub(crate) fn release(self) {
         self.folder.unpublish();
         drop(self.listener);
+        drop(self.guard);
         drop(self.lock);
     }
 }
@@ -2535,6 +2816,304 @@ mod tests {
 
         unlock(&other, rid, 1).unwrap();
         assert!(take(&owner, rid).unwrap());
+    }
+
+    // A missing state folder is made with an access list of its own and no
+    // label of its own; the folders above it are made as create_dir_all
+    // makes them. One that exists is left as it is, and so is a file at the
+    // path, for the guard to refuse.
+    #[test]
+    fn only_a_missing_state_folder_is_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("missing").join("state");
+        make_state_dir(&state).unwrap();
+        assert_eq!(security(&state, DACL).0, spelled(&private("OICI"), DACL));
+        let (label, level) = security(&state, LABEL);
+        assert_eq!(level, None, "{label}");
+
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        let before = security(&open, DACL).0;
+        make_state_dir(&open).unwrap();
+        assert_eq!(security(&open, DACL).0, before);
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        make_state_dir(&file).unwrap();
+        assert!(file.is_file());
+        assert!(matches!(take_guard(&file, false), Err(Reason::Lock { .. })));
+        assert!(make_state_dir(&file.join("state")).is_err());
+    }
+
+    // The raw calls that make the state folder and the guard file stop at
+    // MAX_PATH unless the path is verbatim, as std makes its own. A state
+    // folder far deeper than that is made and guarded as any other.
+    #[test]
+    fn a_state_folder_with_a_long_path_is_made_and_guarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = tmp.path().to_path_buf();
+        for name in ["a", "b", "c"] {
+            state.push(name.repeat(100));
+        }
+        state.push("state");
+        assert!(state.as_os_str().len() > 300, "{}", state.display());
+        make_state_dir(&state).unwrap();
+        assert_eq!(security(&state, DACL).0, spelled(&private("OICI"), DACL));
+        let guard = take_guard(&state, false).unwrap();
+        assert!(guard.is_some(), "a local folder locks");
+        assert!(state.join(GUARD_FILE).is_file());
+    }
+
+    // What the raw calls are given: only an absolute drive or share path
+    // that Windows would keep as it is takes the verbatim form.
+    #[test]
+    fn plain_absolute_paths_are_made_verbatim() {
+        let rows = [
+            (r"C:\a\b", r"\\?\C:\a\b"),
+            (r"c:/a//b/", r"\\?\c:\a\b"),
+            (r"C:\a\.\b", r"\\?\C:\a\b"),
+            (r"C:\", r"\\?\C:\"),
+            (r"\\server\share\a", r"\\?\UNC\server\share\a"),
+            (r"\\?\C:\a", r"\\?\C:\a"),
+            (r"\\?\UNC\server\share\a", r"\\?\UNC\server\share\a"),
+            (r"\\.\C:\a", r"\\.\C:\a"),
+            (r"C:a", r"C:a"),
+            (r"\a", r"\a"),
+            (r"a\b", r"a\b"),
+            (r"C:\a\..\b", r"C:\a\..\b"),
+            (r"C:\a.\b", r"C:\a.\b"),
+            (r"C:\a\b ", r"C:\a\b "),
+        ];
+        for (path, want) in rows {
+            assert_eq!(verbatim(Path::new(path)).as_os_str(), want, "{path}");
+        }
+    }
+
+    // Frozen with the guard's name: a private file with one label, medium,
+    // its own and not protected, never written, and an exclusive lock on
+    // byte 2^31 alone, which no other handle shares. Held, the file can't be
+    // removed, nor its folder renamed.
+    #[test]
+    fn the_guard_is_byte_2_31_of_a_private_file_labelled_medium() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        make_state_dir(&state).unwrap();
+        let guard = take_guard(&state, false)
+            .unwrap()
+            .expect("a local folder locks");
+        let file = state.join(GUARD_FILE);
+        assert_eq!(security(&file, DACL).0, spelled(&private(""), DACL));
+        let (label, level) = security(&file, LABEL);
+        assert_eq!(label.matches("(ML;").count(), 1, "{label}");
+        assert!(label.contains("(ML;;NWNR;;;ME)"), "{label}");
+        assert!(!label.starts_with("S:P"), "{label}");
+        assert_eq!(level, Some(MEDIUM), "{label}");
+
+        let other = OpenOptions::new().read(true).open(&file).unwrap();
+        assert!(!try_lock(&other, GUARD_BYTE, 1, false).unwrap());
+        for (start, end) in [(0, GUARD_BYTE), (GUARD_BYTE + 1, GUARD_BYTE + 0x10000)] {
+            assert!(try_lock(&other, start, end - start, true).unwrap());
+            unlock(&other, start, end - start).unwrap();
+        }
+        let err = take_guard(&state, false).unwrap_err();
+        assert!(
+            matches!(&err, Reason::StateInUse { path } if *path == file),
+            "{err}"
+        );
+        assert!(std::fs::remove_file(&file).is_err());
+        assert!(std::fs::rename(&state, tmp.path().join("moved")).is_err());
+
+        drop(guard);
+        assert!(try_lock(&other, GUARD_BYTE, 1, true).unwrap());
+        unlock(&other, GUARD_BYTE, 1).unwrap();
+        assert!(take_guard(&state, false).unwrap().is_some());
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), 0);
+    }
+
+    // Frozen with the guard's modes: a keyed owner's lock is shared, so
+    // other keyed owners and any other shared lock hold beside it, but no
+    // exclusive one. An exclusive guard keeps keyed owners out in turn.
+    #[test]
+    fn a_keyed_guard_is_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        let file = state.join(GUARD_FILE);
+        let a = take_guard(state, true).unwrap();
+        let b = take_guard(state, true).unwrap();
+        assert!(a.is_some() && b.is_some(), "a local folder locks");
+        let other = OpenOptions::new().read(true).open(&file).unwrap();
+        assert!(!try_lock(&other, GUARD_BYTE, 1, true).unwrap());
+        assert!(try_lock(&other, GUARD_BYTE, 1, false).unwrap());
+        drop(other);
+        let err = take_guard(state, false).unwrap_err();
+        assert!(
+            matches!(&err, Reason::StateInUse { path } if *path == file),
+            "{err}"
+        );
+        drop(a);
+        assert!(take_guard(state, false).is_err());
+        drop(b);
+        let unkeyed = take_guard(state, false).unwrap().unwrap();
+        let err = take_guard(state, true).unwrap_err();
+        assert!(matches!(err, Reason::StateInUse { .. }), "{err}");
+        drop(unkeyed);
+        assert!(take_guard(state, true).unwrap().is_some());
+    }
+
+    // A launch at medium couldn't make or lock a guard in a folder labelled
+    // above medium, so such a state folder is refused, and nothing is made
+    // in it. A process may label a folder up to its own level only, so that
+    // case needs a level above medium. A folder labelled low or medium
+    // takes the guard.
+    #[test]
+    fn a_state_folder_labelled_above_medium_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let labelled = |level: u32| {
+            let dir = tmp.path().join(format!("{level:x}"));
+            let sddl = format!("{}S:(ML;;NW;;;S-1-16-{level})", private("OICI"));
+            create_dir_with_sd(&dir, &sddl).unwrap();
+            dir
+        };
+        for level in [0x1000, MEDIUM] {
+            let dir = labelled(level);
+            assert!(take_guard(&dir, false).unwrap().is_some(), "{level:#x}");
+        }
+        let me = me().unwrap();
+        if me.integrity > MEDIUM {
+            let dir = labelled(me.integrity);
+            let err = take_guard(&dir, false).unwrap_err();
+            assert!(
+                matches!(&err, Reason::Lock { path, .. } if *path == dir.join(GUARD_FILE)),
+                "{err}"
+            );
+            assert!(!dir.join(GUARD_FILE).exists());
+
+            // A state folder in a Builder::dir base made at this level
+            // takes the base's label, though it has none of its own, and is
+            // refused too.
+            let base = tmp.path().join("base");
+            create_private_dir(&base, Role::Level).unwrap();
+            let state = base.join("state");
+            make_state_dir(&state).unwrap();
+            let (label, level) = security(&state, LABEL);
+            assert_eq!(level, Some(me.integrity), "{label}");
+            let err = take_guard(&state, false).unwrap_err();
+            assert!(
+                matches!(&err, Reason::Lock { path, .. } if *path == state.join(GUARD_FILE)),
+                "{err}"
+            );
+        }
+    }
+
+    // A folder in the guard's place is refused, and so is a link, which
+    // only a process that may make links can set up: CI's elevated run can,
+    // and its run at medium can't.
+    #[test]
+    fn a_guard_that_isnt_a_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("folder");
+        std::fs::create_dir_all(folder.join(GUARD_FILE)).unwrap();
+        let err = take_guard(&folder, false).unwrap_err();
+        assert!(matches!(err, Reason::Lock { .. }), "{err}");
+
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir(&linked).unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, b"").unwrap();
+        let link = linked.join(GUARD_FILE);
+        match std::os::windows::fs::symlink_file(&target, &link) {
+            Ok(()) => {
+                let err = take_guard(&linked, false).unwrap_err();
+                assert!(
+                    matches!(&err, Reason::Lock { path, .. } if *path == link),
+                    "{err}"
+                );
+                assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+            }
+            Err(e) => println!("skipped the link in the guard's place: {e}"),
+        }
+    }
+
+    // The state folder is opened as itself, as on Unix: a junction in its
+    // place is refused, naming the guard file, and nothing is made where it
+    // leads.
+    #[test]
+    fn a_state_folder_that_is_a_junction_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        make_state_dir(&link).unwrap();
+        let err = take_guard(&link, false).unwrap_err();
+        assert!(
+            matches!(&err, Reason::Lock { path, .. } if *path == link.join(GUARD_FILE)),
+            "{err}"
+        );
+        assert!(!real.join(GUARD_FILE).exists());
+    }
+
+    #[test]
+    fn file_systems_without_locks_leave_the_owner_unguarded() {
+        for code in [ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION] {
+            assert!(locks_unsupported(&win32(code)), "{code}");
+        }
+        for code in [ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION] {
+            assert!(!locks_unsupported(&win32(code)), "{code}");
+        }
+    }
+
+    // A state folder on a network volume gets no guard, and no guard file
+    // is made in it.
+    #[test]
+    fn a_state_folder_on_a_network_volume_goes_unguarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join(GUARD_FILE);
+        assert!(
+            take_guard_with(tmp.path(), false, |_| true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!file.exists());
+        assert!(
+            take_guard_with(tmp.path(), false, |_| false)
+                .unwrap()
+                .is_some()
+        );
+        assert!(file.exists());
+    }
+
+    // Where a state folder may be, and whether it counts as on a network
+    // volume, where Z: is a mapped drive and the rest are local. A mapped
+    // drive's final path is its share, but a path that can't be resolved is
+    // kept as given. The runner's temporary folder is local.
+    #[test]
+    fn shares_and_remote_drives_are_network_volumes() {
+        const FIXED: u32 = 3;
+        let drive_type = |root: &OsStr| if root == r"Z:\" { DRIVE_REMOTE } else { FIXED };
+        let rows = [
+            (r"C:\Users\me\AppData\Roaming\app", false),
+            (r"Z:\app", true),
+            (r"z:\app", true),
+            (r"\\server\share\app", true),
+            (r"\\?\UNC\server\share\app", true),
+            (r"\\?\Z:\app", true),
+            (r"\\?\C:\app", false),
+            (r"\\?\Volume{0}\app", false),
+            (r"\\?\GLOBALROOT\Device\X\app", false),
+            (r"\\.\C:\app", false),
+            ("app", false),
+        ];
+        for (path, remote) in rows {
+            assert_eq!(remote_with(Path::new(path), drive_type), remote, "{path}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_remote(&final_path(tmp.path()).unwrap()));
     }
 
     // Each label here is one this process may set: below its own level, or

@@ -96,25 +96,30 @@ pub enum Mode {
 /// which the owner takes after the lock in its runtime folder and holds as
 /// long. Launches that name one state folder can still end up in two
 /// runtime folders: in two containers, say, given two [`Builder::dir`]
-/// folders, or as two app ids that share the folder. The one that takes
-/// its lock second finds the guard held, lets go of its lock and runs alone
-/// at once with [`Reason::StateInUse`], rather than own the state folder
-/// beside the first.
+/// folders, as two app ids that share the folder, or on Windows at two
+/// integrity levels. The one that takes its lock second finds the guard
+/// held, lets go of its lock and runs alone at once with
+/// [`Reason::StateInUse`], rather than own the state folder beside the
+/// first.
 ///
 /// An owner with a [scope](Builder::scope) takes the guard shared. Owners
 /// with scopes then hold it side by side, whatever their scopes and
 /// runtime folders, but never beside an owner without one: whichever of
 /// the two comes second runs alone with [`Reason::StateInUse`].
 ///
-/// `start` makes the guard file (mode 0600) in the state folder, which it
-/// has created if it was missing (see [`Builder::new`]). The file is never
-/// written. Like the lock, the guard is held until the process exits, or
-/// until [`Owner::release`] or [`Claim::release`] gives both up, and a
-/// child forked from the owner holds it too until it exits.
+/// `start` makes the guard file in the state folder, which it has created
+/// if it was missing (see [`Builder::new`]): on Unix with mode 0600, and on
+/// Windows with an access list for the user and SYSTEM and a medium label,
+/// so that every integrity level can lock it. The file is never written.
+/// Like the lock, the guard is held until the process exits, or until
+/// [`Owner::release`] or [`Claim::release`] gives both up, and a child
+/// forked from the owner holds it too until it exits. On Windows, while
+/// the owner holds it, the file can't be removed, nor the state folder
+/// renamed or removed.
 ///
-/// No guard is taken, and no guard file made, under [`Guard::Off`], for
-/// [`State::none`], and on Windows. Nor is one held on a network file
-/// system, or where the file system can't lock files: see [`Guard::Local`].
+/// No guard is taken, and no guard file made, under [`Guard::Off`] and for
+/// [`State::none`]. Nor is one held on a network file system, or where the
+/// file system can't lock files: see [`Guard::Local`].
 /// An owner that holds none doesn't keep out launches in other runtime
 /// folders, with a scope or without. [`Claim::guarded`] says
 /// whether the owner holds it.
@@ -127,7 +132,11 @@ pub enum Mode {
 pub enum Guard {
     /// Take the guard on a local disk. One that can't be made or opened
     /// gives [`Reason::Lock`]: the state folder is read-only, say, or the
-    /// guard file is another user's.
+    /// guard file is another user's, or on Windows the state folder is
+    /// labelled above medium integrity, where a launch at medium couldn't
+    /// lock the guard. A state folder inside a [`Builder::dir`] folder that
+    /// a launch above medium made takes that folder's label, so keep it
+    /// outside.
     ///
     /// On a network file system the owner takes no guard and makes no
     /// guard file. A lock there would reach every host that mounts it, and
@@ -136,9 +145,12 @@ pub enum Guard {
     /// 2 mounts the Windows drives), AFS, Ceph, Coda, NCP, Lustre, GFS2,
     /// OCFS2 and VirtualBox shared folders, but not FUSE, whatever serves
     /// it. On macOS and the BSDs it means a file system not marked
-    /// `MNT_LOCAL`, and on illumos NFS and SMB.
+    /// `MNT_LOCAL`, and on illumos NFS and SMB. On Windows it means a share
+    /// (`\\server\share`, which a mapped drive resolves to), or a drive
+    /// that Windows says is remote.
     ///
-    /// Where the file system can't lock files (`ENOLCK` or `EOPNOTSUPP`),
+    /// Where the file system can't lock files (`ENOLCK` or `EOPNOTSUPP`,
+    /// and on Windows `ERROR_NOT_SUPPORTED` or `ERROR_INVALID_FUNCTION`),
     /// the owner holds no guard either. Either way [`Claim::guarded`] is
     /// false.
     ///
@@ -226,12 +238,12 @@ impl Builder {
     /// links, and one [scope](Builder::scope) meet one owner. Launches that
     /// name two folders get two owners. Each user, and on Windows each
     /// integrity level, has owners of its own: see the crate docs on where
-    /// the lock lives. On Unix the owner also holds a lock in the state
-    /// folder, the [guard](Guard), so a launch that finds another runtime
-    /// folder, as in another container, runs alone with
-    /// [`Reason::StateInUse`] rather than become a second owner of that
-    /// state folder. Owners with a scope share the guard with one another,
-    /// never with an owner without one.
+    /// the lock lives. The owner also holds a lock in the state folder, the
+    /// [guard](Guard), so a launch that finds another runtime folder, as in
+    /// another container or on Windows at another integrity level, runs
+    /// alone with [`Reason::StateInUse`] rather than become a second owner
+    /// of that state folder. Owners with a scope share the guard with one
+    /// another, never with an owner without one.
     ///
     /// Before [`start`](Builder::start) creates anything, it checks whose
     /// the state folder is, or, while it is missing, whose the nearest
@@ -253,10 +265,11 @@ impl Builder {
     /// [`hand_off`](Builder::hand_off) and [`probe`](Builder::probe) write
     /// nothing there, and don't check.
     ///
-    /// On Unix, once it holds the lock, `start` creates the state folder if
-    /// it is missing, with the folders above it, the last one private (mode
-    /// 0700), whatever the [guard](Guard). One that can't be made gives
-    /// [`Reason::Lock`]. On Windows `start` makes nothing there.
+    /// Once it holds the lock, `start` creates the state folder if it is
+    /// missing, with the folders above it, whatever the [guard](Guard). The
+    /// last one is private: mode 0700 on Unix, and on Windows an access list
+    /// for the user and SYSTEM alone, which what is made in it inherits.
+    /// One that can't be made gives [`Reason::Lock`].
     pub fn new(app_id: AppId, state: impl Into<State>) -> Builder {
         Builder {
             app_id,
@@ -278,8 +291,8 @@ impl Builder {
     /// only when both match. Owners of one state folder under two scopes
     /// run side by side, so the app must keep their writes to it safe.
     ///
-    /// On Unix, owners with a scope take the state folder's [guard](Guard)
-    /// shared, so they hold it side by side, whatever their scopes. An owner
+    /// Owners with a scope take the state folder's [guard](Guard) shared,
+    /// so they hold it side by side, whatever their scopes. An owner
     /// without one holds it alone: while it runs, a launch with a scope that
     /// would own runs alone with [`Reason::StateInUse`], and while owners
     /// with scopes run, so does a launch without one. So pass a scope to
@@ -313,9 +326,17 @@ impl Builder {
     /// share the guard. A folder serves one privilege level: on Windows,
     /// one made at another integrity level is refused with
     /// [`Reason::RuntimeDir`], so elevated and normal launches given the
-    /// same folder don't share it. For tests, a fresh temporary folder and
-    /// state folder per test keep a panicking test's lock and guard from
-    /// blocking the next.
+    /// same folder don't share it.
+    ///
+    /// Keep the state folder outside this folder. On Windows a folder made
+    /// in it takes its label, so where a launch above medium integrity made
+    /// it (an elevated app, or a service), the state folder is labelled
+    /// above medium too, and every `start` that takes the [guard](Guard)
+    /// runs alone with [`Reason::Lock`].
+    ///
+    /// For tests, a fresh temporary folder and state folder per test, side
+    /// by side, keep a panicking test's lock and guard from blocking the
+    /// next.
     pub fn dir(mut self, dir: impl Into<PathBuf>) -> Builder {
         self.dir = Some(dir.into());
         self

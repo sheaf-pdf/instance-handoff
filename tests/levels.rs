@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use instance_handoff::{AppId, Args, Builder, Claim, Kind, Reason, Started, State};
 use windows_sys::Win32::Foundation::{
@@ -224,6 +224,49 @@ fn a_folder_made_at_one_level_is_refused_at_the_other() {
     assert!(!rest.iter().any(|l| l.starts_with("took ")), "{rest:?}");
 }
 
+// Every level locks one guard in the state folder, though each has a
+// runtime folder of its own: while an owner at one level holds it, a
+// launch at the other runs alone with StateInUse at once. Medium can lock
+// the guard file that high made.
+#[test]
+fn the_guard_holds_across_levels() {
+    if !elevated() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let at_medium = tmp.path().join("medium");
+    let id = APP;
+    let env = [
+        (ID, OsStr::new(id.as_str())),
+        (DIR, at_medium.as_os_str()),
+        (STATE, state.as_os_str()),
+    ];
+    let high = Builder::new(APP, state.as_path()).dir(tmp.path().join("high"));
+
+    // High owns first, and makes the state folder and the guard file.
+    let owner = claim(high.start(&Args::default()));
+    assert!(owner.guarded());
+    let mut child = medium("child_launch", &env);
+    let outcome = child.expect("outcome ");
+    assert!(outcome.starts_with("alone StateInUse"), "{outcome}");
+    let ms: u64 = child.expect("elapsed ").parse().unwrap();
+    assert!(ms < 1000, "{ms} ms");
+    child.finish();
+    owner.release();
+
+    let mut child = medium("child_owner", &env);
+    child.expect("owner ");
+    let t = Instant::now();
+    match high.start(&Args::new(["from-high"])) {
+        Started::Alone(Reason::StateInUse { .. }) => {}
+        other => panic!("{}", describe(&other)),
+    }
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    let rest = child.finish();
+    assert!(!rest.iter().any(|l| l.starts_with("took ")), "{rest:?}");
+}
+
 /// What a medium process may do with files, folders and locks a high one
 /// made, and the reverse: the facts a lock shared across levels (0015)
 /// would rest on. Each level also reports its token, session and window
@@ -346,14 +389,18 @@ fn child_owner() {
     let _ = io::stdin().read_line(&mut String::new());
 }
 
-/// Launches once and reports how.
+/// Launches once and reports how, and how long `start` took, in
+/// milliseconds.
 #[test]
 fn child_launch() {
     if !is_role("child_launch") {
         return;
     }
+    let t = Instant::now();
     let started = child_builder().start(&Args::new(["from-medium"]));
+    let ms = t.elapsed().as_millis();
     println!("outcome {}", describe(&started));
+    println!("elapsed {ms}");
     if let Started::Owner(claim) = started {
         claim.release();
     }
@@ -1339,7 +1386,11 @@ fn medium_token() -> OwnedHandle {
 /// This process's environment with [`ROLE`] set to `role` and `extra`
 /// added, as a sorted, double-NUL-terminated block.
 fn env_block(role: &str, extra: &[(&str, &OsStr)]) -> Vec<u16> {
-    let ours = |k: &OsStr| [ROLE, ID, DIR].iter().any(|n| k.eq_ignore_ascii_case(n));
+    let ours = |k: &OsStr| {
+        [ROLE, ID, DIR, STATE]
+            .iter()
+            .any(|n| k.eq_ignore_ascii_case(n))
+    };
     let mut vars: Vec<(OsString, OsString)> =
         std::env::vars_os().filter(|(k, _)| !ours(k)).collect();
     vars.push((ROLE.into(), role.into()));
