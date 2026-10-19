@@ -130,6 +130,37 @@ impl fmt::Display for End {
     }
 }
 
+/// Why a launch may not become the owner: what [`Reason::MayNotOwn`]
+/// carries. [`Builder::elevated_owner`] sets who may.
+///
+/// It displays as the cause, for messages: `its rights were raised from a
+/// login`.
+///
+/// [`Builder::elevated_owner`]: crate::Builder::elevated_owner
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ineligible {
+    /// Its rights were raised from a login, as under `sudo`, and
+    /// [`ElevatedOwner::Allow`] wasn't set.
+    ///
+    /// [`ElevatedOwner::Allow`]: crate::ElevatedOwner::Allow
+    Raised,
+    /// It has more rights than a normal process (on Unix, it is root), under
+    /// [`ElevatedOwner::NotAboveNormal`].
+    ///
+    /// [`ElevatedOwner::NotAboveNormal`]: crate::ElevatedOwner::NotAboveNormal
+    AboveNormal,
+}
+
+impl fmt::Display for Ineligible {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Ineligible::Raised => "its rights were raised from a login",
+            Ineligible::AboveNormal => "it has more rights than a normal process",
+        })
+    }
+}
+
 /// Why a launch runs without the lock and handed nothing off.
 ///
 /// Every reason leaves the process able to run, as long as it writes none
@@ -264,6 +295,17 @@ pub enum Reason {
         /// What the owner has and this launch lacks.
         rights: Rights,
     },
+    /// This launch may not become the owner ([`Builder::elevated_owner`]),
+    /// and nobody it may hand off to is running, or it is
+    /// [`Mode::Separate`], which never hands off. It never took the lock.
+    ///
+    /// [`Builder::elevated_owner`]: crate::Builder::elevated_owner
+    /// [`Mode::Separate`]: crate::Mode::Separate
+    #[non_exhaustive]
+    MayNotOwn {
+        /// Why it may not.
+        why: Ineligible,
+    },
     /// On Linux with systemd: this process has no login session, so the
     /// user's runtime folder (`/run/user/<uid>`) doesn't exist. Launches
     /// from cron, `@reboot` or a system service land here. Run `loginctl
@@ -368,6 +410,9 @@ impl fmt::Display for Reason {
                 f,
                 "the running instance ({owner}) has {rights}, which this launch lacks"
             ),
+            Reason::MayNotOwn { why } => {
+                write!(f, "this launch may not become the running instance: {why}")
+            }
             Reason::NoSession {} => f.write_str(
                 "no login session, so no runtime folder (`loginctl enable-linger` keeps one)",
             ),
@@ -464,5 +509,24 @@ mod tests {
             "{reason}"
         );
         assert!(reason.source().is_none());
+    }
+
+    #[test]
+    fn may_not_own_says_why() {
+        let raised = Reason::MayNotOwn {
+            why: Ineligible::Raised,
+        };
+        assert_eq!(
+            raised.to_string(),
+            "this launch may not become the running instance: its rights were raised from a login"
+        );
+        let above = Reason::MayNotOwn {
+            why: Ineligible::AboveNormal,
+        };
+        assert_eq!(
+            above.to_string(),
+            "this launch may not become the running instance: it has more rights than a normal process"
+        );
+        assert!(raised.source().is_none());
     }
 }

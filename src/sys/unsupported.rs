@@ -50,6 +50,14 @@ pub(crate) fn is_foreign(_: &Path) -> io::Result<bool> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
+pub(crate) fn raised() -> bool {
+    false
+}
+
+pub(crate) fn above_normal() -> bool {
+    false
+}
+
 pub(crate) fn open_folder(_: &Place, _: bool) -> Result<Option<Folder>, Reason> {
     Err(Reason::Unsupported {})
 }

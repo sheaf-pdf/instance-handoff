@@ -229,6 +229,19 @@ fn me() -> io::Result<&'static Identity> {
         .map_err(|&code| io::Error::from_raw_os_error(code))
 }
 
+/// Whether this launch's rights were raised from a login. Elevation isn't
+/// read here, so no launch is: an elevated one owns in its level's folder.
+pub(crate) fn raised() -> bool {
+    false
+}
+
+/// Whether this launch has more rights than a normal process. Integrity
+/// levels aren't compared here, so no launch has: each level owns in its
+/// own folder.
+pub(crate) fn above_normal() -> bool {
+    false
+}
+
 fn trusted(sid: PSID, me: &Identity) -> bool {
     // SAFETY: both are valid SIDs.
     let known = unsafe {

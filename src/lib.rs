@@ -195,6 +195,21 @@
 //!   integrity, AppContainer), launches can't make or open their folder and
 //!   run alone with [`Reason::RuntimeDir`].
 //!
+//! A launch whose rights were raised from a login hands off to its level's
+//! owner, but by default never becomes it ([`Builder::elevated_owner`]):
+//! with no owner running, it runs alone at once with
+//! [`Reason::MayNotOwn`]. On Unix that is root whose person is known and
+//! isn't root: `SUDO_UID` names them (`sudo`, `run0`), or `PKEXEC_UID`
+//! (`pkexec`), `DOAS_USER` (`doas`), or on Linux the login user id that
+//! `su` keeps (`/proc/self/loginuid`). Root's own login and services
+//! that systemd starts, which have no login user id, still own, and so
+//! does root after `su` on macOS and the BSDs, which keep none at all.
+//! Root in a container owns when the container runs in a user namespace or
+//! was started outside a login, by a daemon such as Docker's. A container
+//! started from `sudo` with no user namespace keeps the login user id,
+//! so its root counts as raised. On Windows no launch counts as raised:
+//! an elevated one owns in its own folder.
+//!
 //! Two limits:
 //!
 //! - Owners at two levels are two owners. If both read and write the same
@@ -214,7 +229,11 @@
 //! Root's folder is fixed, so a service that runs as root meets root's
 //! launches as it is, unless its unit makes `/run` read-only, as
 //! `ProtectSystem=strict` does; then give it
-//! `RuntimeDirectory=instance-handoff`.
+//! `RuntimeDirectory=instance-handoff`. A root daemon started by hand
+//! from `sudo`, or from `su` on Linux, counts as raised and doesn't own by
+//! default: start it through systemd, which gives services no login user
+//! id, or set [`ElevatedOwner::Allow`], as OpenRC and SysV init scripts
+//! run from `sudo` need.
 //! For a long-running owner of another user that starts
 //! outside a login session:
 //!
@@ -366,10 +385,10 @@ mod wire;
 )]
 mod sys;
 
-pub use builder::{Builder, Mode, State};
+pub use builder::{Builder, ElevatedOwner, Mode, State};
 pub use id::{AppId, InvalidAppId, Kind};
 pub use level::{Level, Rights};
-pub use outcome::{End, OwnerInfo, Reason, Started};
+pub use outcome::{End, Ineligible, OwnerInfo, Reason, Started};
 pub use owner::{Claim, Owner};
 #[cfg(feature = "serde")]
 pub use payload::Json;

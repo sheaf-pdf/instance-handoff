@@ -5,7 +5,10 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crate::wire::{self, Hello, Reply, refusal, state, status};
-use crate::{Activation, AppId, Builder, Claim, Mode, OwnerInfo, Payload, Reason, Started, sys};
+use crate::{
+    Activation, AppId, Builder, Claim, ElevatedOwner, Ineligible, Mode, OwnerInfo, Payload, Reason,
+    Started, sys,
+};
 
 /// Between attempts while the owner starts, is busy or quits.
 const RETRY: Duration = Duration::from_millis(50);
@@ -140,9 +143,39 @@ fn encode_request<T: Payload>(b: &Builder, payload: &T) -> Result<Vec<u8>, Reaso
     .encode())
 }
 
+/// Why a launch may not own under `policy`, if it may not. `raised`: its
+/// rights were raised from a login. `above_normal`: it has more rights than
+/// a normal process.
+fn ineligible(policy: ElevatedOwner, raised: bool, above_normal: bool) -> Option<Ineligible> {
+    match policy {
+        ElevatedOwner::Allow => None,
+        _ if raised => Some(Ineligible::Raised),
+        ElevatedOwner::NotAboveNormal if above_normal => Some(Ineligible::AboveNormal),
+        _ => None,
+    }
+}
+
 pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
     if !sys::SUPPORTED {
         return Started::Alone(Reason::Unsupported {});
+    }
+    let may_not_own = ineligible(b.elevated_owner, sys::raised(), sys::above_normal());
+    start_as(b, payload, may_not_own)
+}
+
+/// `start` for a launch that may own, or that may not, and why.
+fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible>) -> Started<T> {
+    if let Some(why) = may_not_own {
+        // It never takes the lock, nor creates the folder: it hands off as
+        // `hand_off` does, or runs alone at once.
+        if b.mode == Mode::Separate {
+            return Started::Alone(Reason::MayNotOwn { why });
+        }
+        return match hand_off(b, Some(payload)) {
+            Ok(info) => Started::HandedOff(info),
+            Err(Reason::NoOwner {}) => Started::Alone(Reason::MayNotOwn { why }),
+            Err(reason) => Started::Alone(reason),
+        };
     }
     let state = b.canonical_state();
     // Before anything is created: a launch never makes or owns state in
@@ -631,6 +664,80 @@ mod tests {
         assert!(!same_app(&owner, &app(Kind::Windowed)));
         assert!(!same_app(&owner, &app(Kind::Headless)));
         assert!(!same_app(&hello(), &AppId::headless("other")));
+    }
+
+    // Raised: rights raised from a login. Above normal: root, on Unix.
+    #[test]
+    fn who_may_own() {
+        use ElevatedOwner::*;
+        use Ineligible::*;
+        let rows = [
+            // (policy, raised, above normal): why it may not own.
+            ((NotRaised, false, false), None),
+            ((NotRaised, false, true), None),
+            ((NotRaised, true, false), Some(Raised)),
+            ((NotRaised, true, true), Some(Raised)),
+            ((NotAboveNormal, false, false), None),
+            ((NotAboveNormal, false, true), Some(AboveNormal)),
+            ((NotAboveNormal, true, false), Some(Raised)),
+            ((NotAboveNormal, true, true), Some(Raised)),
+            ((Allow, false, false), None),
+            ((Allow, false, true), None),
+            ((Allow, true, false), None),
+            ((Allow, true, true), None),
+        ];
+        for ((policy, raised, above), why) in rows {
+            assert_eq!(
+                ineligible(policy, raised, above),
+                why,
+                "{policy:?} {raised} {above}"
+            );
+        }
+    }
+
+    // A launch told it may not own never takes the lock or makes the
+    // folder. It hands off to an owner that is running, and otherwise runs
+    // alone.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_launch_that_may_not_own_hands_off_or_runs_alone() {
+        use crate::Args;
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        let b = Builder::new(AppId::headless("test.gate"), crate::State::none())
+            .dir(&run)
+            .timeout(Duration::from_secs(3));
+        let raised = Some(Ineligible::Raised);
+        let may_not_own = |started: Started<Args>| match started {
+            Started::Alone(Reason::MayNotOwn { why }) => why,
+            other => panic!("expected MayNotOwn: {other:?}"),
+        };
+        let own = |started: Started<Args>| match started {
+            Started::Owner(claim) => claim,
+            other => panic!("expected the owner: {other:?}"),
+        };
+
+        let why = may_not_own(start_as(&b, &Args::default(), raised));
+        assert_eq!(why, Ineligible::Raised);
+        assert!(!run.exists());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let owner = own(start_as(&b, &Args::default(), None)).serve(move |r| tx.send(r).is_ok());
+        let sent = Args::new(["raised"]);
+        match start_as(&b, &sent, raised) {
+            Started::HandedOff(info) => assert!(info.confirmed()),
+            other => panic!("expected to hand off: {other:?}"),
+        }
+        let got = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(got.payload(), &sent);
+        // A separate launch never hands off.
+        let separate = b.clone().mode(Mode::Separate);
+        may_not_own(start_as(&separate, &Args::default(), raised));
+
+        // The folder stays, with nobody holding its lock.
+        owner.release();
+        may_not_own(start_as(&b, &Args::default(), raised));
+        own(start_as(&b, &Args::default(), None)).release();
     }
 
     #[test]

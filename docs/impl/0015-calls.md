@@ -57,7 +57,7 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
 6. **LostState.**
    - After `LostState` the owner gives up its runtime lock and socket. It watches for `LostState` only while it holds the guard. *Recommended.*
    - A guard file deleted from an unchanged state folder is re-created if nobody holds the new one; otherwise the owner ends with `LostState`. This matches how the runtime lock already works (0008). *Our call.*
-7. **exclusive().** With `State::none()`, `Guard::Off` or a skipped guard, `exclusive()` takes the runtime lock without listening, as `Mode::Separate` did. `ElevatedOwner` applies to it, so a raised `exclusive()` under `NotRaised` gets `MayNotOwn { Raised }`. *Recommended.*
+7. **exclusive().** With `State::none()`, `Guard::Off` or a skipped guard, `exclusive()` takes the runtime lock without listening, as `Mode::Separate` did. `ElevatedOwner` applies to it, so a raised `exclusive()` under `NotRaised` gets `MayNotOwn { Raised }`. *Recommended.* Until slice 30, a `Mode::Separate` launch that may not own does the same: `MayNotOwn` at once, whether or not an owner runs. *Our call (slice 34).*
 
 ## 5. Folders and bases (slices 7, 19, 22, 31)
 
@@ -87,7 +87,7 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
 
 1. `Excluded` applies to `start`, `hand_off`, `probe` and `exclusive`. *Recommended.*
 2. Set-id is a plain comparison of the raw ids. *Recommended.* Slice 4 must show that the SAFER token used by the medium tests isn't restricted, or the medium job would break.
-3. **Raised on Unix.** `SUDO_UID`, `PKEXEC_UID`, `DOAS_USER` and `loginuid` are enough for 0.1. `su` on the BSDs and macOS goes undetected, since they have no `loginuid`. Slice 34 checks whether `run0` sets `SUDO_UID`. *Our call.*
+3. **Raised on Unix.** `SUDO_UID`, `PKEXEC_UID`, `DOAS_USER` and `loginuid` are enough for 0.1. `su` on the BSDs and macOS goes undetected, since they have no `loginuid`. `run0` sets `SUDO_UID`: its man page lists it, with `SUDO_USER` and `SUDO_GID`, since systemd 256 (checked in slice 34 against systemd 259). *Our call.* A variable that isn't a number, or a `DOAS_USER` that names no user, counts as unset. *Our call (slice 34).*
 4. On Unix, `NotAboveNormal` means no root owner. *Recommended.*
 5. UIAccess (0x2010) may own under `NotAboveNormal`, as the sketch says. MEDIUM_PLUS (0x2100) counts as above normal. *Our call.*
 6. **Can show windows.** Unknown counts as able everywhere.

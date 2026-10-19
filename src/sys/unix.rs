@@ -285,6 +285,101 @@ pub(crate) fn final_path(path: &Path) -> io::Result<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Who may own
+// ---------------------------------------------------------------------------
+
+/// What tells a raised launch, gathered apart from the rule so that the
+/// rule can be tested.
+#[derive(Debug)]
+pub(crate) struct RaisedEnv {
+    pub(crate) euid: u32,
+    /// `SUDO_UID`: the user who ran `sudo` or `run0`.
+    pub(crate) sudo_uid: Option<u32>,
+    /// `PKEXEC_UID`: the user who ran `pkexec`.
+    pub(crate) pkexec_uid: Option<u32>,
+    /// `DOAS_USER`, the name of the user who ran `doas`, as a user id.
+    pub(crate) doas_user: Option<u32>,
+    /// On Linux, `/proc/self/loginuid`: the user who logged in, which `su`
+    /// and `sudo` keep. `None` when it is unset (4294967295).
+    pub(crate) loginuid: Option<u32>,
+}
+
+/// Whether a launch's rights were raised from a login: it is root, and the
+/// person who logged in is known and isn't root. Root's own login, a
+/// service and a container's root name root or nobody. This only keeps
+/// launches from owning, so a person it can't see, as after `su` on macOS
+/// and the BSDs, leaves the launch free to own.
+pub(crate) fn raised_from(env: &RaisedEnv) -> bool {
+    env.euid == 0
+        && [env.sudo_uid, env.pkexec_uid, env.doas_user, env.loginuid]
+            .into_iter()
+            .flatten()
+            .any(|uid| uid != 0)
+}
+
+/// The id of the user named `name`, from the user database.
+fn uid_of(name: &OsStr) -> Option<u32> {
+    let c = cstr(name).ok()?;
+    let mut buf = vec![0u8; 1024];
+    loop {
+        // SAFETY: passwd is plain data; getpwnam_r fills it in.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `c` is a valid C string, `pwd` and `found` are valid for
+        // writes, and `buf` for writes of its length.
+        let r = unsafe {
+            libc::getpwnam_r(
+                c.as_ptr(),
+                &mut pwd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if r == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        return (r == 0 && !found.is_null()).then_some(pwd.pw_uid);
+    }
+}
+
+/// The user who logged in, as the kernel keeps it for this process. Only
+/// Linux keeps one.
+fn loginuid() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/self/loginuid").ok()?;
+        text.trim().parse().ok().filter(|&uid| uid != u32::MAX)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn raised_env() -> RaisedEnv {
+    let uid = |name: &str| -> Option<u32> { std::env::var(name).ok()?.parse().ok() };
+    RaisedEnv {
+        euid: euid(),
+        sudo_uid: uid("SUDO_UID"),
+        pkexec_uid: uid("PKEXEC_UID"),
+        doas_user: std::env::var_os("DOAS_USER").and_then(|name| uid_of(&name)),
+        loginuid: loginuid(),
+    }
+}
+
+/// Whether this launch's rights were raised from a login.
+pub(crate) fn raised() -> bool {
+    raised_from(&raised_env())
+}
+
+/// Whether this launch has more rights than a normal process: it is root.
+pub(crate) fn above_normal() -> bool {
+    euid() == 0
+}
+
+// ---------------------------------------------------------------------------
 // The folder
 // ---------------------------------------------------------------------------
 
@@ -1730,6 +1825,58 @@ mod tests {
             base(linux_rule(&root_snap, &ID)).unwrap().0,
             PathBuf::from("/run/user/0/snap.app")
         );
+    }
+
+    // One row per way to reach root, or a launch that looks like one. Only
+    // root with a known person who isn't root is raised.
+    #[test]
+    fn raised_launches() {
+        let (user, root, none) = (Some(1000), Some(0), None);
+        // (launch, euid, SUDO_UID, PKEXEC_UID, DOAS_USER, loginuid, raised)
+        let rows = [
+            ("sudo, no login id", 0, user, none, none, none, true),
+            ("sudo -i on Linux", 0, user, none, none, user, true),
+            // run0's command runs as a service: no login id.
+            ("run0", 0, user, none, none, none, true),
+            ("su on Linux", 0, none, none, none, user, true),
+            ("sudo after su", 0, root, none, none, user, true),
+            ("doas", 0, none, none, user, none, true),
+            ("pkexec", 0, none, user, none, user, true),
+            ("root's own login", 0, none, none, none, root, false),
+            ("root login, sudo", 0, root, none, none, root, false),
+            // Started by the service manager: no login.
+            ("a systemd service", 0, none, none, none, none, false),
+            // The user who made the namespace is its root, and a login id
+            // the namespace doesn't map reads as unset.
+            ("rootless container", 0, none, none, none, root, false),
+            // No login id, and su sets no variable.
+            ("su on macOS, BSDs", 0, none, none, none, none, false),
+            // Not root: no raised rights, whatever the variables say.
+            ("a stale SUDO_UID", 1000, user, none, none, user, false),
+            ("sudo -u bob", 1001, user, none, none, user, false),
+        ];
+        for (launch, euid, sudo_uid, pkexec_uid, doas_user, loginuid, raised) in rows {
+            let env = RaisedEnv {
+                euid,
+                sudo_uid,
+                pkexec_uid,
+                doas_user,
+                loginuid,
+            };
+            assert_eq!(raised_from(&env), raised, "{launch}: {env:?}");
+        }
+    }
+
+    #[test]
+    fn doas_users_are_looked_up() {
+        assert_eq!(uid_of(OsStr::new("root")), Some(0));
+        assert_eq!(uid_of(OsStr::new("no-such-user-ih")), None);
+        assert_eq!(uid_of(OsStr::new("ro\0ot")), None);
+        let env = raised_env();
+        assert_eq!(env.euid, euid());
+        if env.euid != 0 {
+            assert!(!raised() && !above_normal());
+        }
     }
 
     // Root's base: made only where its parent exists, and refused when it

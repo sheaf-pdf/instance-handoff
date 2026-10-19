@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use instance_handoff::{
-    AppId, Args, Builder, Claim, End, Kind, Mode, Owner, Reason, Request, Started, State,
+    AppId, Args, Builder, Claim, ElevatedOwner, End, Kind, Mode, Owner, Reason, Request, Started,
+    State,
 };
 
 const APP: AppId = AppId::headless("test.handoff");
@@ -124,6 +125,25 @@ fn separate_launches_run_alone_beside_an_owner_and_own_when_nobody_does() {
     assert!(t.elapsed() < Duration::from_secs(1));
     assert!(rx.try_recv().is_err());
     owner.release();
+}
+
+// The tests don't run raised, so Allow and the default policy both own
+// and hand off as launches always have.
+#[test]
+fn allow_owns_and_hands_off_as_before() {
+    let dir = dir();
+    let allow = builder(&dir).elevated_owner(ElevatedOwner::Allow);
+    let (owner, rx) = serve(claim(allow.start(&args(&["one"]))));
+    for launch in [allow, builder(&dir)] {
+        let info = match launch.start(&args(&["two"])) {
+            Started::HandedOff(info) => info,
+            other => panic!("{other:?}"),
+        };
+        assert!(info.confirmed());
+        assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["two"]));
+    }
+    owner.release();
+    claim(builder(&dir).start(&Args::default())).release();
 }
 
 #[test]

@@ -77,9 +77,43 @@ pub enum Mode {
     ///
     /// A separate launch that finds nobody becomes the owner. Serve it with
     /// [`Claim::decline_all`] if it must not receive the user's launches.
+    /// One that may not own ([`Builder::elevated_owner`]) runs alone at
+    /// once with [`Reason::MayNotOwn`].
     ///
     /// [`Claim::decline_all`]: crate::Claim::decline_all
     Separate,
+}
+
+/// Which launches with raised rights may become the owner when nobody is:
+/// see [`Builder::elevated_owner`].
+///
+/// A launch that may not own never takes the lock. It hands off to the
+/// owner if one is running, and otherwise runs alone at once with
+/// [`Reason::MayNotOwn`]. This only keeps launches from owning: it never
+/// lets one hand off where it otherwise couldn't.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ElevatedOwner {
+    /// A launch whose rights were raised from a login doesn't own
+    /// ([`Ineligible::Raised`]). On Unix that is root whose person is
+    /// known and isn't root: `sudo`, `run0`, `pkexec`, `doas`, and on Linux
+    /// `su`. Root's own login and systemd's services still own. On Windows
+    /// no launch counts as raised. See the crate docs on privileges, which
+    /// also cover containers.
+    ///
+    /// [`Ineligible::Raised`]: crate::Ineligible::Raised
+    #[default]
+    NotRaised,
+    /// Also no owner with more rights than a normal process
+    /// ([`Ineligible::AboveNormal`]): on Unix, no root launch owns, so
+    /// root never keeps the state. On Windows this is the same as
+    /// `NotRaised`.
+    ///
+    /// [`Ineligible::AboveNormal`]: crate::Ineligible::AboveNormal
+    NotAboveNormal,
+    /// Any launch may own. A launch under `sudo` becomes root's owner when
+    /// root has none, and root's later launches hand off to it.
+    Allow,
 }
 
 /// Configures and runs the decision: own, hand off, or run alone.
@@ -105,6 +139,7 @@ pub struct Builder {
     scope: Option<OsString>,
     dir: Option<PathBuf>,
     pub(crate) mode: Mode,
+    pub(crate) elevated_owner: ElevatedOwner,
     pub(crate) timeout: Duration,
     pub(crate) payload_version: u32,
     pub(crate) upkeep: Upkeep,
@@ -113,8 +148,8 @@ pub struct Builder {
 impl Builder {
     /// A builder for `app_id`, whose state is in `state` ([`State::dir`]),
     /// or which keeps none ([`State::none`]). The defaults: the default
-    /// runtime folder, [`Mode::Join`], a 5 second timeout and payload
-    /// version 0.
+    /// runtime folder, [`Mode::Join`], [`ElevatedOwner::NotRaised`], a 5
+    /// second timeout and payload version 0.
     ///
     /// Before [`start`](Builder::start) creates anything, it checks whose
     /// the state folder is, or, while it is missing, whose the nearest
@@ -141,6 +176,7 @@ impl Builder {
             scope: None,
             dir: None,
             mode: Mode::Join,
+            elevated_owner: ElevatedOwner::NotRaised,
             timeout: Duration::from_secs(5),
             payload_version: 0,
             upkeep: Upkeep::default(),
@@ -182,6 +218,14 @@ impl Builder {
     /// See [`Mode`]. Defaults to [`Mode::Join`].
     pub fn mode(mut self, mode: Mode) -> Builder {
         self.mode = mode;
+        self
+    }
+
+    /// Which launches with raised rights may become the owner when nobody
+    /// is: see [`ElevatedOwner`]. Defaults to [`ElevatedOwner::NotRaised`].
+    /// Only `start` can own, so `hand_off` and `probe` don't look at it.
+    pub fn elevated_owner(mut self, policy: ElevatedOwner) -> Builder {
+        self.elevated_owner = policy;
         self
     }
 
@@ -256,7 +300,10 @@ impl Builder {
         Ok(place)
     }
 
-    /// Take the lock, or hand `payload` to the process holding it.
+    /// Take the lock, or hand `payload` to the process holding it. A
+    /// launch that may not own ([`Builder::elevated_owner`]) never takes
+    /// the lock: with nobody to hand off to, it runs alone with
+    /// [`Reason::MayNotOwn`].
     ///
     /// Blocks for at most the [timeout](Builder::timeout) plus the greater
     /// of the timeout and one second, and usually for a few milliseconds. `payload` is encoded only if it is
