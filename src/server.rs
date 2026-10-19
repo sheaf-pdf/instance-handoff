@@ -243,6 +243,21 @@ enum Phase {
     Done,
 }
 
+/// What the OS reports about the launch at the other end of a connection,
+/// never what the launch says about itself. The default is a launch it
+/// reported nothing about.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Peer {
+    pid: Option<u32>,
+}
+
+impl Peer {
+    /// A launch known by its process id, where the platform gives one.
+    pub(crate) fn new(pid: Option<u32>) -> Peer {
+        Peer { pid }
+    }
+}
+
 /// One connection, from HELLO, or a refusal sent in its place, to the
 /// launch's close.
 pub(crate) struct Session<T> {
@@ -252,12 +267,12 @@ pub(crate) struct Session<T> {
     sent: usize,
     deadline: Instant,
     pending: Option<Request<T>>,
-    launcher_pid: Option<u32>,
+    peer: Peer,
 }
 
 impl<T: Payload> Session<T> {
     /// A new connection: HELLO goes out at once.
-    pub(crate) fn new(core: &Core<T>, launcher_pid: Option<u32>, now: Instant) -> Session<T> {
+    pub(crate) fn new(core: &Core<T>, peer: Peer, now: Instant) -> Session<T> {
         Session {
             phase: Phase::Request,
             inbuf: Vec::new(),
@@ -265,14 +280,14 @@ impl<T: Payload> Session<T> {
             sent: 0,
             deadline: now + REQUEST_WAIT,
             pending: None,
-            launcher_pid,
+            peer,
         }
     }
 
     /// A connection refused before HELLO: REPLY REFUSED with `why` is all
     /// it is told.
     #[cfg_attr(windows, allow(dead_code))]
-    pub(crate) fn refused(why: u8, now: Instant) -> Session<T> {
+    pub(crate) fn refused(peer: Peer, why: u8, now: Instant) -> Session<T> {
         let mut s = Session {
             phase: Phase::Request,
             inbuf: Vec::new(),
@@ -280,7 +295,7 @@ impl<T: Payload> Session<T> {
             sent: 0,
             deadline: now,
             pending: None,
-            launcher_pid: None,
+            peer,
         };
         s.reply(Reply::refused(why), now);
         s
@@ -430,7 +445,7 @@ impl<T: Payload> Session<T> {
             .and_then(|b| wire::os_from_bytes(b).ok())
             .map(PathBuf::from);
         let activation = Activation::from_parts(req.xdg_activation_token, req.startup_id);
-        self.pending = Some(Request::remote(payload, cwd, activation, self.launcher_pid));
+        self.pending = Some(Request::remote(payload, cwd, activation, self.peer.pid));
         self.out.extend_from_slice(&wire::empty(wire::READY));
         self.phase = Phase::Commit;
         self.deadline = now + COMMIT_WAIT;
@@ -559,7 +574,7 @@ mod tests {
     fn a_committed_request_reaches_the_handler_once() {
         let core = core(Some(Box::new(|_| Answer::Take)));
         let now = Instant::now();
-        let mut s = Session::new(&core, Some(42), now);
+        let mut s = Session::new(&core, Peer::new(Some(42)), now);
         let hello = take_out(&mut s);
         assert_eq!(hello[0].0, wire::HELLO);
         let hello = Hello::decode(&hello[0].1).unwrap();
@@ -590,7 +605,7 @@ mod tests {
     fn a_launch_that_leaves_before_commit_is_never_delivered() {
         let core = core(Some(Box::new(|_| Answer::Take)));
         let now = Instant::now();
-        let mut s = Session::new(&core, None, now);
+        let mut s = Session::new(&core, Peer::default(), now);
         take_out(&mut s);
         s.read(&request(3, Args::default().encode().unwrap()), &core, now);
         s.eof(&core.ctx.app_id);
@@ -602,7 +617,7 @@ mod tests {
     fn no_commit_in_time_gets_a_gave_up_reply() {
         let core = core(Some(Box::new(|_| Answer::Take)));
         let now = Instant::now();
-        let mut s = Session::new(&core, None, now);
+        let mut s = Session::new(&core, Peer::default(), now);
         take_out(&mut s);
         s.read(&request(3, Args::default().encode().unwrap()), &core, now);
         take_out(&mut s);
@@ -628,7 +643,7 @@ mod tests {
             (wire::empty(wire::COMMIT), refusal::MALFORMED),
         ];
         for (bytes, why) in cases {
-            let mut s = Session::new(&core, None, now);
+            let mut s = Session::new(&core, Peer::default(), now);
             take_out(&mut s);
             assert!(s.read(&bytes, &core, now).is_none());
             let r = reply(&take_out(&mut s));
@@ -655,7 +670,7 @@ mod tests {
 
         // Before HELLO, as on Unix: the reply is all there is, then the
         // launch's close is awaited.
-        let mut s = Session::<Args>::refused(refusal::PEER, now);
+        let mut s = Session::<Args>::refused(Peer::default(), refusal::PEER, now);
         refused(&take_out(&mut s));
         assert!(s.should_shut_write());
         assert_eq!(s.deadline(), now + DRAIN_WAIT);
@@ -667,7 +682,7 @@ mod tests {
 
         // After HELLO, as on Windows, which checks a launch only once it
         // has read from it. A second refusal adds nothing.
-        let mut s = Session::new(&core, None, now);
+        let mut s = Session::new(&core, Peer::default(), now);
         assert_eq!(take_out(&mut s)[0].0, wire::HELLO);
         s.refuse(refusal::PEER, now);
         s.refuse(refusal::PEER, now);
@@ -684,14 +699,14 @@ mod tests {
         assert!(c.poll_control());
         assert_eq!(c.shared.ended(), Some(End::Stopped));
         let now = Instant::now();
-        let mut s = Session::new(&c, None, now);
+        let mut s = Session::new(&c, Peer::default(), now);
         let hello = take_out(&mut s);
         assert_eq!(Hello::decode(&hello[0].1).unwrap().state, state::BUSY);
         s.read(&request(3, Args::default().encode().unwrap()), &c, now);
         assert_eq!(reply(&take_out(&mut s)).status, status::BUSY);
 
         let declining = core(None);
-        let mut s = Session::new(&declining, None, now);
+        let mut s = Session::new(&declining, Peer::default(), now);
         let hello = take_out(&mut s);
         assert_eq!(Hello::decode(&hello[0].1).unwrap().state, state::DECLINING);
         assert_eq!(declining.shared.ended(), None);
@@ -738,7 +753,7 @@ mod tests {
             },
         );
         let now = Instant::now();
-        let mut s = Session::new(&core, None, now);
+        let mut s = Session::new(&core, Peer::default(), now);
         take_out(&mut s);
         s.read(&request(3, vec![1]), &core, now);
         let r = reply(&take_out(&mut s));
@@ -762,7 +777,7 @@ mod tests {
         let c = core(Some(Box::new(|_| Answer::Take)));
         c.shared.stop.store(true, Ordering::SeqCst);
         let now = Instant::now();
-        let mut s = Session::new(&c, None, now);
+        let mut s = Session::new(&c, Peer::default(), now);
         let hello = take_out(&mut s);
         assert_eq!(Hello::decode(&hello[0].1).unwrap().state, state::BUSY);
         s.read(&request(3, Args::default().encode().unwrap()), &c, now);

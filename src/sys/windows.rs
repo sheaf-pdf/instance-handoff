@@ -85,7 +85,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
 use crate::id::valid_id;
 use crate::naming::level_folder;
-use crate::server::{Core, Session};
+use crate::server::{Core, Peer, Session};
 use crate::wire::refusal;
 use crate::{AppId, Payload, Reason};
 
@@ -1621,7 +1621,7 @@ fn connected<T: Payload>(
         pipe,
         read,
         write,
-        session: Session::new(core, pid, now),
+        session: Session::new(core, Peer::new(pid), now),
         checked: false,
     };
     pump(&mut c, app_id);

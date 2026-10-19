@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::naming;
-use crate::server::{Core, Session};
+use crate::server::{Core, Peer, Session};
 use crate::wire::refusal;
 use crate::{AppId, Payload, Reason};
 
@@ -1454,17 +1454,17 @@ fn accept<T: Payload>(
                 // A launch this owner won't serve is told so at once, in
                 // place of HELLO, rather than left to wait out its timeout.
                 let session = match peer_cred(stream.as_fd()) {
-                    Ok((uid, pid)) if uid == euid() => Session::new(core, pid, now),
-                    Ok((uid, _)) => {
+                    Ok((uid, pid)) if uid == euid() => Session::new(core, Peer::new(pid), now),
+                    Ok((uid, pid)) => {
                         log::warn!(
                             "instance-handoff {}: refused a connection from user {uid}",
                             core.ctx.app_id
                         );
-                        Session::refused(refusal::PEER, now)
+                        Session::refused(Peer::new(pid), refusal::PEER, now)
                     }
                     Err(e) => {
                         log::warn!("instance-handoff {}: peer check: {e}", core.ctx.app_id);
-                        Session::refused(refusal::PEER, now)
+                        Session::refused(Peer::default(), refusal::PEER, now)
                     }
                 };
                 if let Err(e) = stream.set_nonblocking(true) {
