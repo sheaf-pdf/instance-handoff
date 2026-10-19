@@ -84,11 +84,12 @@
 //!   [Privileges](#privileges). On Unix both ends check the other's user
 //!   id. On Windows every integrity level finds the one owner, and a launch
 //!   at another level than the owner's learns so at once, from the owner's
-//!   lock, and hands it nothing. The owner checks the launch's token: it
-//!   refuses another user, and a launch whose token is at another
-//!   integrity level, naming its own level, unless the launch is above it
-//!   and hands its request down. The launch checks that the pipe is its
-//!   own user's, at the level the owner's lock shows.
+//!   lock, and hands it nothing, unless it is above the owner and hands its
+//!   request down. The owner checks the launch's token: it refuses another
+//!   user, and a launch whose token is at another integrity level, naming
+//!   its own level, unless the launch is above it and hands its request
+//!   down. The launch checks that the pipe is its own user's, at the level
+//!   the owner's lock shows.
 //! - [`Builder::start`], [`Builder::hand_off`], [`Builder::probe`] and
 //!   [`Builder::exclusive`] never panic, whatever the
 //!   [timeout](Builder::timeout). Every failure is a [`Reason`], and
@@ -276,19 +277,28 @@
 //!   at once, with [`Reason::MoreRights`] when the launch has the higher
 //!   level, or [`Reason::OwnerHasMoreRights`] when the owner has;
 //!   [`Builder::probe`] reports such an owner unconfirmed. With
-//!   [`Builder::hand_down`], a launch above an owner that names its level
-//!   in its greeting hands its request down instead: it says so in its
-//!   request, and the owner, which admits a launch above it only then,
-//!   tells its handler what was given up, from the levels of the two tokens
-//!   ([`Request::handed_down`]). A request is never handed up. The crate's
-//!   own launches don't hand down yet: they connect only to an owner at
-//!   their own level, and answer one at another from its lock. Each owner
-//!   publishes its pipe's name in a folder of its level, labelled at that
-//!   level, so lower levels can't read it. A launch also checks that the
-//!   owner's pipe is labelled at the level the lock shows, and refuses
-//!   another with [`Reason::Peer`]. Below medium (low integrity,
-//!   AppContainer), launches can't make or open their folder and run alone
-//!   with [`Reason::RuntimeDir`].
+//!   [`Builder::hand_down`], a launch above the owner hands its request
+//!   down instead: it says so in its request, and the owner, which admits a
+//!   launch above it only then, tells its handler what was given up, from
+//!   the levels of the two tokens ([`Request::handed_down`]). A request is
+//!   never handed up. Each owner publishes its pipe's name in a folder of
+//!   its level, labelled at that level, so lower levels can't read it. A
+//!   launch talks to an owner at its own level, or below it when it hands
+//!   down, through that folder, and checks that the folder and the owner's
+//!   pipe are labelled at the level the lock shows, refusing another with
+//!   [`Reason::Peer`]. Below medium (low integrity, AppContainer), launches
+//!   can't make or open their folder and run alone with
+//!   [`Reason::RuntimeDir`].
+//!
+//! The crate never decides whether a request may do without its launch's
+//! rights: the app, or its user, does. On Windows, a launch from an
+//! administrator terminal that finds a normal owner gets
+//! [`Reason::MoreRights`], which names the owner and what it lacks. The
+//! app can ask the user whether to open the request in the running
+//! instance without those rights, and on a yes hand it off again with
+//! `b.clone().hand_down(true).hand_off(&payload)`. Otherwise it runs
+//! alone, and must not write the state. A command that needs no rights,
+//! such as a reload, can hand down without asking.
 //!
 //! A launch whose rights were raised from a login hands off to its level's
 //! owner, but by default never becomes it ([`Builder::elevated_owner`]):
@@ -316,8 +326,8 @@
 //!   one root would create there, gives root [`Reason::ForeignState`]
 //!   instead of the lock. On Windows an elevated and a normal process
 //!   share the profile, and launches of one state meet one owner at either
-//!   level: a launch at the other level runs alone at once, and must not
-//!   write the state.
+//!   level: a launch at the other level that doesn't hand its request down
+//!   runs alone at once, and must not write the state.
 //! - Within one Unix user, finer privileges aren't compared: supplementary
 //!   groups (`newgrp`), capabilities and LSM confinement. A sandbox that
 //!   must keep its processes from the owner hides the runtime folder from

@@ -6,12 +6,14 @@
 //! instance at once.
 //!
 //! A launch hands off only to an owner of its own user at its own integrity
-//! level: handed up, a request would gain rights; handed down, it would
-//! lose the ones the user elevated for. Every level locks the one
-//! `instance.lock` of a state, so a launch at another level than the
-//! owner's finds it, and is answered at once rather than become a second
-//! owner. Each level's address folder is labelled at that level, so lower
-//! levels can neither read the pipe's name nor replace it.
+//! level, unless the app lets it hand its request down to a lower one:
+//! handed up, a request would gain rights; handed down, it would lose the
+//! ones the user elevated for. Every level locks the one `instance.lock`
+//! of a state, so a launch at another level than the owner's finds it, and
+//! rather than become a second owner is answered at once, or hands its
+//! request down to an owner below it. Each level's address folder is
+//! labelled at that level, so lower levels can neither read the pipe's
+//! name nor replace it.
 //!
 //! A launch refuses a Local AppData that resolves into the profiles folder
 //! (`C:\Users`) but outside its user's profile (into another user's
@@ -71,12 +73,13 @@
 //! If that is held, it looks for a higher marker, and otherwise for any,
 //! with shared locks on ranges of bytes 1 to 0xFFFF, halving a range that
 //! conflicts. It gives each lock back at once. The highest marker wins.
-//! Only an owner at the launch's own level is talked to, through that
-//! level's address folder, which the launch opens and checks before it
-//! reads the pipe's name. One at another level is answered at once from
-//! its marker: the launch or the owner has rights the other lacks, and a
-//! probe is told it runs. With no marker, the owner is still starting, and
-//! the launch looks again until its deadline.
+//! A launch talks to an owner at its own level, or to one below it when it
+//! hands its request down, through the address folder of the owner's
+//! level, which it opens and checks before it reads the pipe's name. Any
+//! other owner at another level is answered at once from its marker: the
+//! launch or the owner has rights the other lacks, and a probe is told it
+//! runs. With no marker, the owner is still starting, and the launch looks
+//! again until its deadline.
 //!
 //! The pipe's controls, each against a threat:
 //! - its name is 128 random bits, published only after the pipe exists, in
@@ -89,8 +92,8 @@
 //!   lower level can't open it;
 //! - `PIPE_REJECT_REMOTE_CLIENTS`;
 //! - the launch connects for identification only, and checks that the pipe
-//!   is its own user's, at the level the owner's marker shows (its own),
-//!   before it sends anything;
+//!   is its own user's, at the level the owner's marker shows (its own, or
+//!   a lower one it hands its request down to), before it sends anything;
 //! - the owner checks the launch's token by impersonation. It refuses
 //!   another user with PEER, and a launch at another level with PRIVILEGE
 //!   and its own level, unless the launch is above it and hands its
@@ -1555,8 +1558,9 @@ fn pipe_name(id: &str, secret: &str) -> OsString {
 /// The pipe a launch opened must be this user's, labelled at `expected`,
 /// the level the owner's marker shows, or it isn't the owner this launch
 /// read the level of. A launch talks only to an owner marked at its own
-/// level, and a process can't label an object above its own level, so a
-/// lower process of the same user can't pass for the owner.
+/// level, or at a lower one when it hands its request down, never above.
+/// A process can't label an object above its own level, so a process of
+/// the same user below the owner can't pass for it.
 fn check_pipe_owner(pipe: &File, expected: crate::Level) -> io::Result<()> {
     let me = me()?;
     let mut owner: PSID = null_mut();
@@ -3670,6 +3674,40 @@ mod tests {
         folder.unpublish();
         std::fs::write(&file, "x \\\\evil\\pipe\n").unwrap();
         assert!(read_address(&run).is_err());
+    }
+
+    // A launch takes a pipe for the owner's only when it is labelled at the
+    // level the owner's marker shows: its own, or one below it that it
+    // hands its request down to. A pipe at another level than the marker's
+    // is refused either way.
+    #[test]
+    fn a_pipe_must_be_labelled_at_the_markers_level() {
+        let me = me().unwrap();
+        let below = me.integrity - 0x1000;
+        let pipe_at = |rid: u32| {
+            let name = pipe_name("test.windows", &random_hex().unwrap());
+            let sd = SecurityDescriptor::from_sddl(&format!(
+                "O:{sid}D:P(A;;{access:#x};;;{sid})S:(ML;;NWNR;;;S-1-16-{rid})",
+                sid = me.sid_string,
+                access = FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            ))
+            .unwrap();
+            let server = create_instance(&name, &sd, true).unwrap();
+            let client = OpenOptions::new()
+                .access_mode(CLIENT_ACCESS)
+                .security_qos_flags(SECURITY_IDENTIFICATION)
+                .open(&name)
+                .unwrap();
+            (server, client)
+        };
+        let level = crate::Level::from_rid;
+
+        let (_server, own) = pipe_at(me.integrity);
+        assert!(check_pipe_owner(&own, level(me.integrity)).is_ok());
+        assert!(check_pipe_owner(&own, level(below)).is_err());
+        let (_server, lower) = pipe_at(below);
+        assert!(check_pipe_owner(&lower, level(below)).is_ok());
+        assert!(check_pipe_owner(&lower, level(me.integrity)).is_err());
     }
 
     // A launch can show windows outside session 0, on a visible window

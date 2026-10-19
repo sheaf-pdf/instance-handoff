@@ -150,10 +150,11 @@ fn a_medium_launch_never_hands_off_to_a_high_owner() {
     let _ = std::fs::remove_dir_all(base);
 }
 
-// The reverse: high finds the medium owner's lock held, and its start and
-// hand_off fail at once with MoreRights, sending nothing. Neither becomes
-// a second owner. An exclusive run, which without a state folder takes no
-// guard, takes the same lock instead and fails at once with StateInUse.
+// The reverse: high finds the medium owner's lock held, and, without
+// hand_down, its start and hand_off fail at once with MoreRights, sending
+// nothing. Neither becomes a second owner. An exclusive run, which without
+// a state folder takes no guard, takes the same lock instead and fails at
+// once with StateInUse.
 #[test]
 fn a_high_launch_never_hands_off_to_a_medium_owner() {
     if !elevated() {
@@ -187,6 +188,66 @@ fn a_high_launch_never_hands_off_to_a_medium_owner() {
         !key.join("run-high").exists(),
         "high made its address folder"
     );
+
+    let rest = child.finish();
+    assert!(!rest.iter().any(|l| l.starts_with("took ")), "{rest:?}");
+    let _ = std::fs::remove_dir_all(base);
+}
+
+// Only with hand_down does high hand its request down to the medium
+// owner. Then start and hand_off reach it through the address folder of
+// its level, as the marker in its lock shows it, and the owner's handler
+// and the launch are both told what was given up, from the two tokens'
+// levels. Without it, high gets MoreRights at once, as before, and a
+// probe, which hands nothing down, finds the owner unconfirmed either
+// way.
+#[test]
+fn a_high_launch_hands_down_only_when_asked() {
+    if !elevated() {
+        return;
+    }
+    let id = app("hands-down");
+    let mut child = medium("child_owner", &[(ID, OsStr::new(id.as_str()))]);
+    let key = PathBuf::from(child.expect("owner "));
+    let base = app_folder(&key, &id).to_path_buf();
+    let given = Rights::Level {
+        launch: Level::HIGH,
+        owner: Level::MEDIUM,
+    };
+    let took = |args: &Args| format!("{args:?}, handed down {:?}", Some(&given));
+
+    let high = Builder::new(id, State::none());
+    let kept = Args::new(["kept"]);
+    let t = Instant::now();
+    match high.start(&kept) {
+        Started::Alone(Reason::MoreRights { rights, .. }) => assert_eq!(rights, given),
+        other => panic!("{}", describe(&other)),
+    }
+    let reason = high.hand_off(&kept).unwrap_err();
+    assert!(matches!(reason, Reason::MoreRights { .. }), "{reason}");
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+
+    let down = high.clone().hand_down(true);
+    let started = Args::new(["started"]);
+    match down.start(&started) {
+        Started::HandedOff(info) => {
+            assert!(info.confirmed());
+            assert_eq!(info.level(), Some(Level::MEDIUM));
+            assert_eq!(info.handed_down(), Some(&given));
+        }
+        other => panic!("{}", describe(&other)),
+    }
+    assert_eq!(child.expect("took "), took(&started));
+    let handed_off = Args::new(["handed off"]);
+    let info = down.hand_off(&handed_off).unwrap();
+    assert!(info.confirmed());
+    assert_eq!(info.handed_down(), Some(&given));
+    assert_eq!(child.expect("took "), took(&handed_off));
+    for b in [&high, &down] {
+        let found = b.probe().unwrap();
+        assert_eq!(found.to_string(), "pid unknown, medium");
+        assert!(!found.confirmed());
+    }
 
     let rest = child.finish();
     assert!(!rest.iter().any(|l| l.starts_with("took ")), "{rest:?}");
@@ -358,9 +419,10 @@ fn the_guard_holds_across_levels() {
 /// A medium owner identifies a high launch from its token, though the
 /// launch connects for identification only, and refuses it at once with
 /// PRIVILEGE and its own level. The crate's own launches at high read the
-/// medium owner's level from its marker and never connect, so a client
-/// built here connects as they would, through the owner's address folder,
-/// and sends a valid REQUEST.
+/// medium owner's level from its marker, and connect only to hand their
+/// request down, so a client built here connects as they would, through
+/// the owner's address folder, and sends a valid REQUEST without
+/// HAND_DOWN.
 #[test]
 fn a_medium_owner_refuses_a_high_client_at_once() {
     if !elevated() {
@@ -412,9 +474,10 @@ fn a_medium_owner_refuses_a_high_client_at_once() {
 /// A high client that hands its request down to a medium owner, with the
 /// HAND_DOWN record, is delivered, and the owner's handler is told what it
 /// gave up, from the two tokens' levels: never from the record, whose RIDs
-/// here are false. The crate's own launches at high read a medium owner's
-/// level from its marker and don't connect yet, so a client built here
-/// hands down as they will, through the owner's address folder.
+/// here are false. The crate's own launches name the true ones, as
+/// a_high_launch_hands_down_only_when_asked shows, so only a client built
+/// here can send false ones. It connects as they do, through the owner's
+/// address folder.
 #[test]
 fn a_medium_owner_takes_a_high_client_that_hands_down() {
     if !elevated() {
@@ -824,7 +887,8 @@ fn message(kind: u8, records: &[(u8, &[u8])]) -> Vec<u8> {
 /// A connection to the medium owner whose runtime folder is `dir`, made as
 /// the crate's launches make it, for identification only, from the pipe's
 /// name in the owner's address folder, `run`. It skips their checks of the
-/// folder's and the pipe's labels, so a high client reaches a medium owner.
+/// folder's and the pipe's labels, and their answer from the owner's
+/// marker, so a high client reaches a medium owner without handing down.
 fn raw_client(dir: &Path, id: &AppId) -> File {
     let address = std::fs::read_to_string(dir.join("run").join("instance.pipe")).unwrap();
     let (named, secret) = address.trim_end().split_once(' ').unwrap();

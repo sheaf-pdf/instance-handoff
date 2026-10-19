@@ -71,20 +71,25 @@ enum Meet {
 
 /// What a launch at level `own` does about an owner at `owner`, as its
 /// marker shows it, before it connects: see [`rights`]. `probe`: the
-/// launch is a probe.
-fn meet(own: Option<Level>, owner: OwnerLevel, probe: bool) -> Meet {
+/// launch is a probe. `hand_down`: it may hand its request down to an
+/// owner below it ([`Builder::hand_down`]).
+fn meet(own: Option<Level>, owner: OwnerLevel, probe: bool, hand_down: bool) -> Meet {
     match owner {
         OwnerLevel::Same => Meet::Talk(own),
         OwnerLevel::Starting => Meet::Wait,
-        // Windows reads the launch's own level to look for the marker, so
-        // here it is known. Were it not, `Talk(None)` matches no address
-        // folder or pipe's label, so nothing is sent to an owner at another
-        // level. Nor does the marker let a launch hand down yet: `Talk(own)`
-        // would look for the owner's address in this launch's own level's
-        // folder, where an owner at another level publishes none.
-        OwnerLevel::Other(owner) => match own.and_then(|own| rights(own, owner, probe, false)) {
-            Some(answer) => Meet::Report(answer),
-            None => Meet::Talk(own),
+        OwnerLevel::Other(owner) => match own.map(|own| rights(own, owner, probe, hand_down)) {
+            Some(Some(answer)) => Meet::Report(answer),
+            // The launch's own level, or one below it that the launch hands
+            // its request down to: it talks to the owner through the
+            // address folder of the owner's level, where the pipe must be
+            // labelled at that level too. `rights` never lets a launch go
+            // on to an owner above it.
+            Some(None) => Meet::Talk(Some(owner)),
+            // Windows reads the launch's own level to look for the marker,
+            // so here it is known. Were it not, `Talk(None)` matches no
+            // address folder or pipe's label, so nothing is sent to an
+            // owner at another level.
+            None => Meet::Talk(None),
         },
     }
 }
@@ -132,11 +137,12 @@ fn rights(
 }
 
 /// [`meet`], for a launch whose owner died after it committed: it talks
-/// to an owner it may talk to, and looks again for one still starting
-/// until it is `past` its wait. Anything else, an owner at another level,
-/// one that never finished starting or a marker that can't be read, gives
-/// `None`: the request is handed off, unconfirmed, since the dead owner
-/// may have had it.
+/// to an owner it may talk to, one below it too when it hands its request
+/// down, and looks again for one still starting until it is `past` its
+/// wait. Anything else, an owner at another level that it doesn't talk
+/// to, one that never finished starting or a marker that can't be read,
+/// gives `None`: the request is handed off, unconfirmed, since the dead
+/// owner may have had it.
 fn meet_after_commit(met: Meet, past: bool) -> Option<Meet> {
     match met {
         Meet::Talk(_) => Some(met),
@@ -147,9 +153,9 @@ fn meet_after_commit(met: Meet, past: bool) -> Option<Meet> {
 
 /// [`meet`], for a launch at level `own` and the owner of the lock in
 /// `folder`. A marker that can't be read gives [`Reason::Lock`].
-fn meet_owner(folder: &sys::Folder, own: Option<Level>, probe: bool) -> Meet {
+fn meet_owner(folder: &sys::Folder, own: Option<Level>, probe: bool, hand_down: bool) -> Meet {
     match folder.owner_level() {
-        Ok(owner) => meet(own, owner, probe),
+        Ok(owner) => meet(own, owner, probe, hand_down),
         Err(source) => Meet::Report(Err(Reason::Lock {
             path: folder.lock_path(),
             source,
@@ -386,7 +392,7 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
         if let Some(w) = waiting.filter(|_| past(deadline)) {
             return Started::Alone(w.reason(began.elapsed()));
         }
-        let at = match meet_owner(&folder, limits.level, false) {
+        let at = match meet_owner(&folder, limits.level, false, b.hand_down) {
             Meet::Talk(at) => at,
             Meet::Wait => {
                 waiting = Some(Waiting::Unresponsive.after(waiting, deadline));
@@ -604,7 +610,7 @@ fn hand_off_at<T: Payload>(
         if let Some(w) = waiting.filter(|_| past(deadline)) {
             return Err(w.reason(began.elapsed()));
         }
-        let at = match meet_owner(&folder, own, request.is_none()) {
+        let at = match meet_owner(&folder, own, request.is_none(), b.hand_down) {
             Meet::Talk(at) => at,
             Meet::Wait => {
                 waiting = Some(Waiting::Unresponsive.after(waiting, deadline));
@@ -662,9 +668,10 @@ enum AfterCommit {
 /// not run alone on it. It takes the lock, and the canonical state folder
 /// and its guard, if nobody holds them and it may own (`owns` is
 /// `Some(state)`; `None` for `hand_off`), or hands the request to
-/// the next owner, one with another nonce. Otherwise (no owner in time, one
-/// that won't take it or is at another level, or a state folder it can't
-/// make or whose guard another process holds) it is handed off,
+/// the next owner, one with another nonce, below it too when it hands its
+/// request down. Otherwise (no owner in time, one that won't take it or is
+/// at another level that it doesn't hand down to, or a state folder it
+/// can't make or whose guard another process holds) it is handed off,
 /// unconfirmed: the dead owner may have had it.
 fn after_commit(
     folder: &sys::Folder,
@@ -702,7 +709,8 @@ fn after_commit(
         } else if !folder.lock_held().unwrap_or(true) {
             return AfterCommit::Info(unconfirmed);
         }
-        let at = match meet_after_commit(meet_owner(folder, limits.level, false), past(until)) {
+        let met = meet_owner(folder, limits.level, false, b.hand_down);
+        let at = match meet_after_commit(met, past(until)) {
             Some(Meet::Talk(at)) => at,
             Some(Meet::Wait) => {
                 pause(until);
@@ -738,7 +746,8 @@ fn same_app(hello: &Hello, app_id: &AppId, key: &[u8]) -> bool {
 /// request (a probe), it ends after HELLO. `key` is this launch's instance
 /// key, which HELLO's STATE must match. `committed_to` is the nonce of an
 /// owner this launch already committed to. `at` is the level the owner's
-/// pipe must be labelled at: see [`Meet::Talk`].
+/// pipe must be labelled at: see [`Meet::Talk`]. Below this launch's own
+/// level, HELLO must name it too.
 fn exchange(
     folder: &sys::Folder,
     b: &Builder,
@@ -799,11 +808,19 @@ fn exchange(
             theirs: hello.payload_version,
         });
     }
+    // Sent below its own level to hand down, this launch found the pipe
+    // labelled at the level the owner's marker shows. A HELLO that names
+    // another level, or none, isn't that owner's: it is sent nothing, so
+    // the launch never misreports what it gave up.
+    let theirs = hello.level.map(Level::from_rid);
+    if own.zip(at).is_some_and(|(own, at)| at < own) && theirs != at {
+        return Exchange::Fail(not_ours());
+    }
     // A request never goes up, and goes down only with `hand_down`. So at
     // another level this launch decides at once, whether or not the owner
     // serves, and sends nothing, unless it hands its request down. Where
     // either level is unknown, as on Unix, it goes on.
-    let levels = own.zip(hello.level.map(Level::from_rid));
+    let levels = own.zip(theirs);
     let probe = request.is_none();
     match levels.and_then(|(own, theirs)| rights(own, theirs, probe, b.hand_down)) {
         Some(Ok(info)) => return Exchange::Taken(info),
@@ -828,7 +845,7 @@ fn exchange(
     let info = OwnerInfo {
         pid: conn.peer_pid(),
         confirmed: true,
-        level: hello.level.map(crate::Level::from_rid),
+        level: theirs,
         handed_down,
     };
     let Some(request) = request else {
@@ -1415,6 +1432,71 @@ mod tests {
         assert!(taken.try_recv().is_err());
     }
 
+    // Sent below its own level to hand down, a launch takes HELLO only from
+    // the owner the marker showed: one that names another level, its own
+    // or none, isn't that owner, and gets nothing. At the marker's level
+    // it goes on, here to a busy owner. Only Windows connects below the
+    // launch's level, where the pipe's label shows the owner's, so the
+    // test sets the launch's level and calls `exchange` with the marker's,
+    // as `meet` gives it.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_that_hands_down_takes_hello_only_at_the_markers_level() {
+        use std::io::{Read, Write};
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Builder::new(AppId::headless("test.down"), crate::State::none())
+            .dir(tmp.path().join("run"))
+            .timeout(Duration::from_secs(3))
+            .hand_down(true);
+        let folder = sys::open_folder(&b.place(None).unwrap(), true)
+            .unwrap()
+            .unwrap();
+        let _lock = folder.lock().unwrap().unwrap();
+        let socket = b.runtime_dir().unwrap().join("instance.sock");
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let key = b.instance_key(None);
+        // What each owner names in HELLO; the marker shows medium.
+        let named = [
+            None,
+            Some(Level::HIGH),
+            Some(Level::LOW),
+            Some(Level::MEDIUM),
+        ];
+        let hellos = named.map(|level| {
+            Hello {
+                app_id: "test.down".into(),
+                payload_version: b.payload_version,
+                serving: serving::BUSY,
+                level: level.map(Level::rid),
+                state: key.clone(),
+                ..hello()
+            }
+            .encode()
+        });
+        let owner = std::thread::spawn(move || {
+            for (hello, stream) in hellos.iter().zip(listener.incoming()) {
+                let mut stream = stream.unwrap();
+                stream.write_all(hello).unwrap();
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).unwrap();
+                assert!(got.is_empty(), "the launch sent {got:?}");
+            }
+        });
+        let request = encode_request(&b, &crate::Args::new(["x"])).unwrap();
+        let limits = Limits::new(Instant::now(), b.timeout, Some(Level::HIGH));
+        let marker = Some(Level::MEDIUM);
+        let talk = || exchange(&folder, &b, &key, Some(&request), &limits, None, marker);
+        for level in &named[..3] {
+            match talk() {
+                Exchange::Fail(Reason::WireVersion { theirs: 0, .. }) => {}
+                Exchange::Fail(reason) => panic!("{level:?}: {reason}"),
+                _ => panic!("{level:?}: went on"),
+            }
+        }
+        assert!(matches!(talk(), Exchange::Retry(Waiting::Busy)));
+        owner.join().unwrap();
+    }
+
     // Both ways, and a kind from a later release: the two kinds of an id
     // refuse each other.
     #[test]
@@ -1526,15 +1608,19 @@ mod tests {
     // shows, before it connects. A launch answers an owner at another
     // level at once, from its marker: start and hand_off are refused, a
     // probe is told it runs, unconfirmed, and a committed launch whose
-    // owner died is handed off, unconfirmed. Nothing is sent. On Windows,
-    // an_owner_at_another_level_is_answered_at_once tries each call
-    // against owners forged below and above.
+    // owner died is handed off, unconfirmed. Nothing is sent. The one
+    // exception is an owner below a launch that hands its request down:
+    // start, hand_off and a committed launch talk to it, at its level. On
+    // Windows, an_owner_at_another_level_is_answered_at_once tries each
+    // call against owners forged below and above, and
+    // a_launch_that_hands_down_looks_in_the_owners_address_folder tries
+    // to hand down to them.
     #[test]
     fn a_launch_meets_the_owner_by_its_marker() {
         use OwnerLevel::*;
         /// What a meeting comes to. An answer at once names the owner's
         /// level, from its marker.
-        #[derive(Debug, PartialEq)]
+        #[derive(Debug, Clone, PartialEq)]
         enum Is {
             Talk(Option<Level>),
             Wait,
@@ -1573,12 +1659,14 @@ mod tests {
         let wait = || [Is::Wait, Is::Wait, Is::Wait, Is::Unconfirmed];
         let rows = [
             // (launch, owner): start and hand_off, probe, then a committed
-            // launch whose owner died, before its wait is past and after.
-            ((medium, Same), talk(medium)),
-            ((None, Same), talk(None)),
+            // launch whose owner died, before its wait is past and after;
+            // then the same with hand_down, where that differs.
+            ((medium, Same), talk(medium), None),
+            ((None, Same), talk(None), None),
             // Never found: owner_level gives Same for the launch's own
             // level's marker.
-            ((medium, Other(Level::MEDIUM)), talk(medium)),
+            ((medium, Other(Level::MEDIUM)), talk(medium), None),
+            // A request is never handed up.
             (
                 (medium, Other(Level::HIGH)),
                 [
@@ -1587,7 +1675,11 @@ mod tests {
                     Is::Unconfirmed,
                     Is::Unconfirmed,
                 ],
+                None,
             ),
+            // With hand_down, the launch talks to the owner below it, at
+            // the owner's level, before a commit and after. A probe hands
+            // nothing down.
             (
                 (medium, Other(Level::LOW)),
                 [
@@ -1596,21 +1688,30 @@ mod tests {
                     Is::Unconfirmed,
                     Is::Unconfirmed,
                 ],
+                Some([Is::Talk(low), Is::Runs(low), Is::Talk(low), Is::Talk(low)]),
             ),
-            ((medium, Starting), wait()),
-            ((None, Starting), wait()),
+            ((medium, Starting), wait(), None),
+            ((None, Starting), wait(), None),
             // A launch that doesn't know its own level can't compare, so
-            // it fails closed: `None` matches no pipe's label.
-            ((None, Other(Level::HIGH)), talk(None)),
+            // it fails closed, handing down or not: `None` matches no
+            // pipe's label.
+            ((None, Other(Level::HIGH)), talk(None), None),
+            ((None, Other(Level::LOW)), talk(None), None),
         ];
-        for ((own, owner), [hand_off, probe, committed, past]) in rows {
-            let after = |is_past| {
-                meet_after_commit(meet(own, owner, false), is_past).map_or(Is::Unconfirmed, is)
-            };
-            assert_eq!(is(meet(own, owner, false)), hand_off, "{own:?} {owner:?}");
-            assert_eq!(is(meet(own, owner, true)), probe, "{own:?} {owner:?}");
-            assert_eq!(after(false), committed, "{own:?} {owner:?}");
-            assert_eq!(after(true), past, "{own:?} {owner:?}");
+        for ((own, owner), without, with) in rows {
+            let with = with.unwrap_or_else(|| without.clone());
+            let cases = [(false, without), (true, with)];
+            for (hand_down, [hand_off, probe, committed, past]) in cases {
+                let after = |is_past| {
+                    meet_after_commit(meet(own, owner, false, hand_down), is_past)
+                        .map_or(Is::Unconfirmed, is)
+                };
+                let case = format!("{own:?} {owner:?} {hand_down}");
+                assert_eq!(is(meet(own, owner, false, hand_down)), hand_off, "{case}");
+                assert_eq!(is(meet(own, owner, true, hand_down)), probe, "{case}");
+                assert_eq!(after(false), committed, "{case}");
+                assert_eq!(after(true), past, "{case}");
+            }
         }
     }
 
@@ -1803,6 +1904,84 @@ mod tests {
             }
             assert!(began.elapsed() < Duration::from_secs(1), "{owner}");
         }
+    }
+
+    // With hand_down, a launch above the owner talks to it through the
+    // address folder of the owner's level, as its marker shows it, and
+    // checks that folder first. The owner here is forged below both levels
+    // the tests run at, and publishes nothing. With no folder, start and
+    // hand_off look again until their deadline, as for an owner not
+    // listening yet, and a committed launch whose owner died until its
+    // wait after the commit is past. With a folder there that isn't
+    // labelled at the owner's level, start and hand_off fail at once with
+    // Peer, sending nothing. A probe hands nothing down, and is told the
+    // owner runs. An owner above is still answered at once.
+    // tests/levels.rs hands down to a real owner.
+    #[cfg(windows)]
+    #[test]
+    fn a_launch_that_hands_down_looks_in_the_owners_address_folder() {
+        use crate::Args;
+        let tmp = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_millis(100);
+        let b = Builder::new(AppId::headless("test.down"), crate::State::none())
+            .dir(tmp.path().join("run"))
+            .timeout(timeout)
+            .hand_down(true);
+        let folder = sys::open_folder(&b.place(None).unwrap(), true)
+            .unwrap()
+            .unwrap();
+        let start = || match start_as(&b, &Args::default(), None) {
+            Started::Alone(reason) => reason,
+            other => panic!("{other:?}"),
+        };
+        let hand_off = || b.hand_off(&Args::default()).unwrap_err();
+
+        let below = folder.lock_at(Level::LOW.rid()).unwrap().unwrap();
+        for reason in [start(), hand_off()] {
+            match reason {
+                Reason::Unresponsive { waited } => assert!(waited >= timeout, "{waited:?}"),
+                other => panic!("{other}"),
+            }
+        }
+        let found = b.probe().unwrap();
+        assert_eq!(
+            (found.pid(), found.level(), found.confirmed()),
+            (None, Some(Level::LOW), false)
+        );
+        // A committed launch whose owner died hands down to the next owner
+        // too: it looks for this one's address until its wait after the
+        // commit is past, where without hand_down it is handed off at once
+        // (an_owner_at_another_level_is_answered_at_once).
+        let began = Instant::now();
+        let limits = Limits::new(began, timeout, sys::level());
+        let key = b.instance_key(None);
+        match after_commit(&folder, &b, &key, &[], 1, Some(None), &limits) {
+            AfterCommit::Info(info) => assert!(!info.confirmed()),
+            AfterCommit::Own(..) => panic!("owned beside an owner below"),
+        }
+        let waited = began.elapsed();
+        assert!(waited >= Duration::from_millis(900), "{waited:?}");
+        // Made as Windows makes any folder, it isn't labelled low.
+        let address = crate::naming::level_folder(Level::LOW.rid());
+        std::fs::create_dir(b.runtime_dir().unwrap().join(address)).unwrap();
+        for reason in [start(), hand_off()] {
+            assert!(matches!(reason, Reason::Peer { .. }), "{reason}");
+        }
+        drop(below);
+
+        let _above = folder.lock_at(Level::SYSTEM.rid()).unwrap().unwrap();
+        let began = Instant::now();
+        let rights = Rights::Level {
+            launch: sys::level().unwrap(),
+            owner: Level::SYSTEM,
+        };
+        for reason in [start(), hand_off()] {
+            match reason {
+                Reason::OwnerHasMoreRights { rights: r, .. } => assert_eq!(r, rights),
+                other => panic!("{other}"),
+            }
+        }
+        assert!(began.elapsed() < Duration::from_secs(1));
     }
 
     // Byte 0 held with no marker is an owner still starting. Each call

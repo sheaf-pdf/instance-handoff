@@ -141,7 +141,8 @@ impl<T> Claim<T> {
     /// name is published in. This process still owns the lock. Later
     /// launches at its level wait out their timeout and run alone, or on
     /// Windows run alone at once with [`Reason::Peer`] when that folder is
-    /// there but fails its check. Launches at another level are answered
+    /// there but fails its check, and so do launches above it that hand
+    /// their request down. Other launches at another level are answered
     /// from the lock, as always.
     ///
     /// [`Reason::Peer`]: crate::Reason::Peer

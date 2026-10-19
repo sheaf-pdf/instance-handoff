@@ -53,7 +53,7 @@ impl OwnerInfo {
     /// The owner's process id, as the OS reported it for the connection.
     /// `None` where the platform doesn't say, across PID namespaces (every
     /// Flatpak instance has its own), and for an owner at another integrity
-    /// level that won't take this launch's requests.
+    /// level, unless this launch handed its request down to it.
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
@@ -64,8 +64,10 @@ impl OwnerInfo {
     /// hung, or died with nothing to take its place, or its handler
     /// panicked. The request may be taken late, or not at all, and this
     /// process should still exit. It is also `false` from `probe` for an
-    /// owner at another integrity level, which won't serve this launch,
-    /// and for an owner this launch reported without talking to it.
+    /// owner at another integrity level: a probe hands nothing down, and
+    /// nothing is ever handed up, so it doesn't ask whether that owner
+    /// serves. And it is `false` for an owner this launch reported without
+    /// talking to it.
     ///
     /// [`Builder::probe`]: crate::Builder::probe
     pub fn confirmed(&self) -> bool {
@@ -433,8 +435,7 @@ pub enum Reason {
     /// On Windows a launch usually learns this from the marker in the
     /// owner's lock, before it connects, and then never talks to the owner:
     /// unlike the owner's greeting, the marker can't show its app, kind or
-    /// state folder. The crate's launches don't hand down to an owner they
-    /// find this way yet.
+    /// state folder. A launch that hands down talks to it all the same.
     ///
     /// [`Builder::hand_down`]: crate::Builder::hand_down
     #[non_exhaustive]

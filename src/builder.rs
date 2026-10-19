@@ -233,12 +233,14 @@ impl Builder {
     /// name two folders get two owners. Each user has owners of its own:
     /// see the crate docs on where the lock lives. On Windows every
     /// integrity level meets the one owner, and a launch at another level
-    /// than the owner's runs alone at once (see the crate docs on
-    /// privileges). The owner also holds a lock in the state folder, the
-    /// [guard](Guard), so a launch that finds another runtime folder, as in
-    /// another container, runs alone with [`Reason::StateInUse`] rather
-    /// than become a second owner of that state folder. Owners with a scope
-    /// share the guard with one another, never with an owner without one.
+    /// than the owner's runs alone at once, unless it is above the owner
+    /// and hands its request down ([`hand_down`](Builder::hand_down); see
+    /// the crate docs on privileges). The owner also holds a lock in the
+    /// state folder, the [guard](Guard), so a launch that finds another
+    /// runtime folder, as in another container, runs alone with
+    /// [`Reason::StateInUse`] rather than become a second owner of that
+    /// state folder. Owners with a scope share the guard with one another,
+    /// never with an owner without one.
     ///
     /// Before [`start`](Builder::start) or [`exclusive`](Builder::exclusive)
     /// creates anything, it checks whose the state folder is, or, while it
@@ -376,8 +378,10 @@ impl Builder {
     /// launches meet root's owner, so this changes nothing there. Applies
     /// to `start` and `hand_off`: `probe` and
     /// [`exclusive`](Builder::exclusive) hand nothing over, and ignore it.
-    /// The crate's own launches don't hand down yet: they connect only to
-    /// an owner at their own level (see the crate docs on privileges).
+    /// On Windows a launch that hands down reaches the owner through the
+    /// folder of the owner's level, and checks that the folder and the
+    /// owner's pipe are labelled at the level the owner's lock shows (see
+    /// the crate docs on privileges).
     ///
     /// [`Request::handed_down`]: crate::Request::handed_down
     pub fn hand_down(mut self, allow: bool) -> Builder {
@@ -521,13 +525,16 @@ impl Builder {
     /// couldn't own; with
     /// [`Reason::Declined`] for an owner that turns launches away, and with
     /// [`Reason::Busy`] or [`Reason::Unresponsive`] when the owner hasn't
-    /// served (or has stopped) by the [timeout](Builder::timeout). An owner
-    /// at another integrity level, as the marker in its lock or its
-    /// greeting shows, won't take this launch's requests: it is `Ok` at
-    /// once, with its [level](OwnerInfo::level) and
-    /// [`OwnerInfo::confirmed`] false. Read from the marker, before
-    /// connecting, that answer can't check the owner's app, kind or state
-    /// folder, as the greeting does. Creates no folder and no lock.
+    /// served (or has stopped) by the [timeout](Builder::timeout). A probe
+    /// never hands anything down, so an owner at another integrity level,
+    /// as the marker in its lock or its greeting shows, is `Ok` at once,
+    /// with its [level](OwnerInfo::level) and [`OwnerInfo::confirmed`]
+    /// false. That doesn't mean `start` and `hand_off` fail: an owner below
+    /// still takes their requests from a builder with
+    /// [`hand_down`](Builder::hand_down), though one above takes none. Read
+    /// from the marker, before connecting, that answer can't check the
+    /// owner's app, kind or state folder, as the greeting does. Creates no
+    /// folder and no lock.
     pub fn probe(&self) -> Result<OwnerInfo, Reason> {
         launch::hand_off::<()>(self, None)
     }
@@ -579,9 +586,11 @@ impl Builder {
     /// that runtime folder holds the lock, on Windows at any integrity
     /// level. While it holds the lock, launches there find nobody serving,
     /// and run alone, or fail, with [`Reason::Unresponsive`] at their
-    /// timeout. On Windows only those at its integrity level wait: a launch
-    /// at another reads this run's level from the lock, as it would an
-    /// owner's, and is answered at once (see the crate docs on privileges).
+    /// timeout. On Windows only those at its integrity level wait, and
+    /// those above it that hand their request down
+    /// ([`hand_down`](Builder::hand_down)). Any other launch at another
+    /// level reads this run's level from the lock, as it would an owner's,
+    /// and is answered at once (see the crate docs on privileges).
     ///
     /// A process that may take no part at all, as a setuid or setgid
     /// program that runs with its rights, fails at once with
