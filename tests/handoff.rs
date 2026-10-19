@@ -509,9 +509,23 @@ fn socket(dir: &Path) -> std::os::unix::net::UnixStream {
     std::os::unix::net::UnixStream::connect(dir.join("instance.sock")).unwrap()
 }
 
+/// The owner's address folder in the runtime folder `dir` on Windows: the
+/// folder of this process's integrity level, which holds `instance.pipe`.
+#[cfg(windows)]
+fn address_folder(dir: &Path) -> PathBuf {
+    let name = match own_level().unwrap() {
+        0x1000 => "run-low".to_owned(),
+        0x2000 => "run".to_owned(),
+        0x3000 => "run-high".to_owned(),
+        0x4000 => "run-system".to_owned(),
+        rid => format!("run-{rid:x}"),
+    };
+    dir.join(name)
+}
+
 #[cfg(windows)]
 fn socket(dir: &Path) -> std::fs::File {
-    let address = std::fs::read_to_string(dir.join("instance.pipe")).unwrap();
+    let address = std::fs::read_to_string(address_folder(dir).join("instance.pipe")).unwrap();
     let (id, secret) = address.trim_end().split_once(' ').unwrap();
     let name = format!(r"\\.\pipe\instance-handoff.{id}.{secret}");
     // A pipe takes as many clients as it has listening instances; the
@@ -830,9 +844,11 @@ fn an_owner_that_lost_its_lock_gives_the_guard_up() {
     drop(first);
 }
 
-// The owner holds its folder, its lock and its address open, sharing no
+// The owner holds its folders, its lock and its address open, sharing no
 // delete: nothing there can be removed or replaced, so a launch still
-// finds it, with the owner's next check an hour away.
+// finds it, with the owner's next check an hour away. The lock is in the
+// runtime folder, and the address in the folder of the owner's level in
+// it.
 #[cfg(windows)]
 #[test]
 fn a_live_owners_folder_and_address_stay_put() {
@@ -841,14 +857,18 @@ fn a_live_owners_folder_and_address_stay_put() {
     let (owner, rx) = serve(claim(
         builder(&dir).__upkeep(hour, hour).start(&Args::default()),
     ));
-    let run = owner.dir();
+    let key = owner.dir();
+    let run = address_folder(key);
     let address = run.join("instance.pipe");
+    assert!(key.join("instance.lock").is_file());
     assert!(std::fs::remove_file(&address).is_err());
     let other = run.join("other");
     std::fs::write(&other, "x\n").unwrap();
     assert!(std::fs::rename(&other, &address).is_err());
-    assert!(std::fs::remove_dir_all(run).is_err());
-    assert!(std::fs::rename(run, run.with_extension("moved")).is_err());
+    for folder in [key, run.as_path()] {
+        assert!(std::fs::remove_dir_all(folder).is_err());
+        assert!(std::fs::rename(folder, folder.with_extension("moved")).is_err());
+    }
     assert!(address.exists());
     builder(&dir).hand_off(&args(&["after"])).unwrap();
     assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["after"]));

@@ -101,7 +101,11 @@ impl<T> Claim<T> {
         self.run::<()>(None)
     }
 
-    /// The runtime folder holding the lock.
+    /// The runtime folder holding the lock: [`Builder::runtime_dir`]. On
+    /// Windows every integrity level shares it, and the owner publishes its
+    /// pipe's name in its level's folder in it.
+    ///
+    /// [`Builder::runtime_dir`]: crate::Builder::runtime_dir
     pub fn dir(&self) -> &Path {
         self.claimed().folder.path()
     }
@@ -133,8 +137,14 @@ impl<T> Claim<T> {
     }
 
     /// Why later launches can't reach this process, if they can't: the
-    /// socket couldn't be made. This process still owns the lock; later
-    /// launches wait out their timeout and run alone.
+    /// socket couldn't be made, or on Windows the pipe or the folder its
+    /// name is published in. This process still owns the lock. Later
+    /// launches at its level wait out their timeout and run alone, or on
+    /// Windows run alone at once with [`Reason::Peer`] when that folder is
+    /// there but fails its check. Launches at another level are answered
+    /// from the lock, as always.
+    ///
+    /// [`Reason::Peer`]: crate::Reason::Peer
     pub fn listen_error(&self) -> Option<&io::Error> {
         self.claimed().listener.as_ref().err()
     }
@@ -315,7 +325,7 @@ impl Owner {
         &self.app_id
     }
 
-    /// The runtime folder holding the lock.
+    /// The runtime folder holding the lock, as [`Claim::dir`] reported it.
     pub fn dir(&self) -> &Path {
         &self.dir
     }

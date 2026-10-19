@@ -74,11 +74,10 @@ impl From<&Path> for State {
 /// which the owner takes after the lock in its runtime folder and holds as
 /// long. Launches that name one state folder can still end up in two
 /// runtime folders: in two containers, say, given two [`Builder::dir`]
-/// folders, as two app ids that share the folder, or on Windows at two
-/// integrity levels. The one that takes its lock second finds the guard
-/// held, lets go of its lock and runs alone at once with
-/// [`Reason::StateInUse`], rather than own the state folder beside the
-/// first.
+/// folders, or as two app ids that share the folder. The one that takes
+/// its lock second finds the guard held, lets go of its lock and runs
+/// alone at once with [`Reason::StateInUse`], rather than own the state
+/// folder beside the first.
 ///
 /// An owner with a [scope](Builder::scope) takes the guard shared. Owners
 /// with scopes then hold it side by side, whatever their scopes and
@@ -121,9 +120,7 @@ pub enum Guard {
     /// gives [`Reason::Lock`]: the state folder is read-only, say, or the
     /// guard file is another user's, or on Windows the state folder is
     /// labelled above medium integrity, where a launch at medium couldn't
-    /// lock the guard. A state folder inside a [`Builder::dir`] folder that
-    /// a launch above medium made takes that folder's label, so keep it
-    /// outside.
+    /// lock the guard.
     ///
     /// On a network file system the owner takes no guard and makes no
     /// guard file. A lock there would reach every host that mounts it, and
@@ -225,14 +222,15 @@ impl Builder {
     ///
     /// Launches of `app_id` that name one state folder, through whatever
     /// links, and one [scope](Builder::scope) meet one owner. Launches that
-    /// name two folders get two owners. Each user, and on Windows each
-    /// integrity level, has owners of its own: see the crate docs on where
-    /// the lock lives. The owner also holds a lock in the state folder, the
+    /// name two folders get two owners. Each user has owners of its own:
+    /// see the crate docs on where the lock lives. On Windows every
+    /// integrity level meets the one owner, and a launch at another level
+    /// than the owner's runs alone at once (see the crate docs on
+    /// privileges). The owner also holds a lock in the state folder, the
     /// [guard](Guard), so a launch that finds another runtime folder, as in
-    /// another container or on Windows at another integrity level, runs
-    /// alone with [`Reason::StateInUse`] rather than become a second owner
-    /// of that state folder. Owners with a scope share the guard with one
-    /// another, never with an owner without one.
+    /// another container, runs alone with [`Reason::StateInUse`] rather
+    /// than become a second owner of that state folder. Owners with a scope
+    /// share the guard with one another, never with an owner without one.
     ///
     /// Before [`start`](Builder::start) or [`exclusive`](Builder::exclusive)
     /// creates anything, it checks whose the state folder is, or, while it
@@ -315,16 +313,11 @@ impl Builder {
     /// another folder, with the same state folder, runs alone with
     /// [`Reason::StateInUse`] while this owner holds the [guard](Guard),
     /// unless both have a [scope](Builder::scope), since owners with scopes
-    /// share the guard. A folder serves one privilege level: on Windows,
-    /// one made at another integrity level is refused with
-    /// [`Reason::RuntimeDir`], so elevated and normal launches given the
-    /// same folder don't share it.
-    ///
-    /// Keep the state folder outside this folder. On Windows a folder made
-    /// in it takes its label, so where a launch above medium integrity made
-    /// it (an elevated app, or a service), the state folder is labelled
-    /// above medium too, and every `start` that takes the [guard](Guard)
-    /// runs alone with [`Reason::Lock`].
+    /// share the guard. On Windows every integrity level shares it, as it
+    /// does Local AppData: it is made with no label, whatever level makes
+    /// it, and elevated and normal launches given it meet one owner. One
+    /// labelled above medium integrity, where a launch at medium couldn't
+    /// make the instance folder, is refused with [`Reason::RuntimeDir`].
     ///
     /// For tests, a fresh temporary folder and state folder per test, side
     /// by side, keep a panicking test's lock and guard from blocking the
@@ -393,10 +386,9 @@ impl Builder {
     /// The runtime folder `start` would use, without creating anything: the
     /// instance folder that the state folder and the [scope](Builder::scope)
     /// name (`i-` and 16 hex digits), in the app's folder or in
-    /// [`Builder::dir`]. In Local AppData on Windows, it is the folder of
-    /// this process's integrity level inside the instance folder. The state
-    /// folder's links are resolved as `start` resolves them. For diagnostics
-    /// and tests. `None` when there is none to use: see
+    /// [`Builder::dir`]. On Windows every integrity level shares it. The
+    /// state folder's links are resolved as `start` resolves them. For
+    /// diagnostics and tests. `None` when there is none to use: see
     /// [`Reason::NoSession`], [`Reason::NoRuntimeDir`] and
     /// [`Reason::Unsupported`].
     pub fn runtime_dir(&self) -> Option<PathBuf> {
@@ -473,9 +465,9 @@ impl Builder {
     /// at another integrity level, as the marker in its lock or its
     /// greeting shows, won't take this launch's requests: it is `Ok` at
     /// once, with its [level](OwnerInfo::level) and
-    /// [`OwnerInfo::confirmed`] false. While each level has its own folder,
-    /// a probe finds none (see the crate docs on privileges). Creates no
-    /// folder and no lock.
+    /// [`OwnerInfo::confirmed`] false. Read from the marker, before
+    /// connecting, that answer can't check the owner's app, kind or state
+    /// folder, as the greeting does. Creates no folder and no lock.
     pub fn probe(&self) -> Result<OwnerInfo, Reason> {
         launch::hand_off::<()>(self, None)
     }
@@ -524,9 +516,12 @@ impl Builder {
     /// [`Guard::Local`]), it takes the lock in the runtime folder instead,
     /// as an owner would, but serves nothing. Then it fails with
     /// [`Reason::StateInUse`] while an owner, or another exclusive run, of
-    /// that runtime folder holds the lock. While it holds the lock,
-    /// launches there find nobody serving, and run alone, or fail, with
-    /// [`Reason::Unresponsive`] at their timeout.
+    /// that runtime folder holds the lock, on Windows at any integrity
+    /// level. While it holds the lock, launches there find nobody serving,
+    /// and run alone, or fail, with [`Reason::Unresponsive`] at their
+    /// timeout. On Windows only those at its integrity level wait: a launch
+    /// at another reads this run's level from the lock, as it would an
+    /// owner's, and is answered at once (see the crate docs on privileges).
     ///
     /// A launch that may not own under [`Builder::elevated_owner`] fails at
     /// once with [`Reason::MayNotOwn`]. A [windowed](crate::Kind::Windowed)

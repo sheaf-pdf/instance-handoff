@@ -114,9 +114,11 @@ pub(crate) const ROOT_BASE_RUN: &str = "/run/instance-handoff";
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const ROOT_BASE_VAR_RUN: &str = "/var/run/instance-handoff";
 
-/// The Windows runtime folder for an integrity level, the last RID of its
+/// The Windows address folder for an integrity level, the last RID of its
 /// mandatory label: `run` at medium, the normal level, and one of its own
-/// at every other, so that each level has its own owner.
+/// at every other. An owner at that level makes it in the instance folder,
+/// which every level shares, and publishes its pipe's name there, in
+/// `instance.pipe`.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn level_folder(level: u32) -> String {
     match level {

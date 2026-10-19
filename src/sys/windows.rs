@@ -1,13 +1,17 @@
-//! Windows: the runtime folder under Local AppData, one per integrity
-//! level, `LockFileEx` on `instance.lock`, and a named pipe whose random
-//! name is published in `instance.pipe` beside the lock, and another
-//! `LockFileEx` on the guard in the state folder, which every level shares.
-//! The crate's thread runs overlapped I/O on every pipe instance at once.
+//! Windows: the runtime folder under Local AppData, which every integrity
+//! level shares, `LockFileEx` on `instance.lock` in it, and a named pipe
+//! whose random name the owner publishes in `instance.pipe`, in a folder
+//! of its level beside the lock; and another `LockFileEx` on the guard in
+//! the state folder. The crate's thread runs overlapped I/O on every pipe
+//! instance at once.
 //!
 //! A launch hands off only to an owner of its own user at its own integrity
 //! level: handed up, a request would gain rights; handed down, it would
-//! lose the ones the user elevated for. Each level's folder is labelled at
-//! that level, so lower levels can neither read it nor squat its lock.
+//! lose the ones the user elevated for. Every level locks the one
+//! `instance.lock` of a state, so a launch at another level than the
+//! owner's finds it, and is answered at once rather than become a second
+//! owner. Each level's address folder is labelled at that level, so lower
+//! levels can neither read the pipe's name nor replace it.
 //!
 //! A launch refuses a Local AppData that resolves into the profiles folder
 //! (`C:\Users`) but outside its user's profile (into another user's
@@ -16,19 +20,20 @@
 //!
 //! Each folder from the base down gets an access list of its own, for this
 //! user and SYSTEM, whatever its parent hands down; the missing parents of
-//! a `Builder::dir` base are made as Windows makes any folder. In Local
-//! AppData, the app's folder has no label, so it counts as medium. The
-//! instance folder in it, which every level shares, is labelled medium by
-//! whichever level makes it, and the label isn't handed down. Each level's
-//! folder in it is labelled at that level, and hands the label down to what
-//! is made in it. So each of these folders carries at most one label, its
-//! own. A `Builder::dir` base and its instance folder are labelled at the
-//! process's level, as a level's folder is. No label is protected (`S:P`):
-//! that needs a privilege the crate never enables. A launch refuses an
-//! instance folder in Local AppData labelled other than medium (none counts
-//! as medium), and a level's folder labelled at another level.
-//! `instance.lock` gets an access list of its own too, and takes its label
-//! from its folder.
+//! a `Builder::dir` base are made as Windows makes any folder. The app's
+//! folder in Local AppData, or a `Builder::dir` base, has no label, so it
+//! counts as medium. The instance folder in it, which holds `instance.lock`,
+//! is labelled medium by whichever level makes it, and the label isn't
+//! handed down. In the instance folder, each level's address folder, which
+//! only an owner at that level makes, is labelled at that level, and hands
+//! the label down to what is made in it. So each of these folders carries
+//! at most one label, its own. No label is protected (`S:P`): that needs a
+//! privilege the crate never enables. A launch refuses an app's folder or a
+//! base labelled above medium, where a launch at medium couldn't make the
+//! instance folder, an instance folder labelled other than medium (none
+//! counts as medium), and an address folder labelled at another level than
+//! the one it is for. `instance.lock` gets an access list of its own too,
+//! and an explicit medium label, so every level can open and lock it.
 //!
 //! The owner locks two bytes of `instance.lock`, both exclusively and
 //! through one handle: byte 0, which is owning, then the byte at its
@@ -41,37 +46,36 @@
 //! The owner also locks one byte of the guard, `.instance-handoff.lock` in
 //! the state folder: the byte at 2^31, exclusively, or shared for an owner
 //! with a scope. Every level locks the same file, so an owner of a state
-//! folder at one level keeps out a launch at another, though each takes its
-//! lock in a folder of its own. The file gets an access list of its own,
-//! for this user and SYSTEM, and an explicit medium label that isn't
-//! protected, whatever level makes it, so every level can open and lock
-//! it. A state folder labelled above medium is refused, since a launch at
-//! medium couldn't make or lock the guard there, and so is a link or a
-//! junction in the state folder's place. The handle shares no delete, so
-//! while the owner holds it, the file can't be removed, nor the state
-//! folder renamed or removed. A missing state folder is made with an access
-//! list of its own, for this user and SYSTEM, and no label of its own: it
-//! still takes one that the folder above it hands down, as a `Builder::dir`
-//! base made above medium does, and is then refused. No guard is taken on a
-//! share, which a mapped drive resolves to, or on a drive that Windows says
-//! is remote.
+//! folder keeps out a launch that took its lock in another runtime folder,
+//! at any level. The file gets an access list of its own, for this user
+//! and SYSTEM, and an explicit medium label that isn't protected, whatever
+//! level makes it, so every level can open and lock it. A state folder
+//! labelled above medium is refused, since a launch at medium couldn't make
+//! or lock the guard there, and so is a link or a junction in the state
+//! folder's place. The handle shares no delete, so while the owner holds
+//! it, the file can't be removed, nor the state folder renamed or removed.
+//! A missing state folder is made with an access list of its own, for this
+//! user and SYSTEM, and no label of its own: it still takes one that the
+//! folder above it hands down, and one above medium is then refused. No
+//! guard is taken on a share, which a mapped drive resolves to, or on a
+//! drive that Windows says is remote.
 //!
 //! A launch that finds byte 0 held reads the owner's level from its marker
 //! before it connects. It tries its own level's byte with a shared lock.
 //! If that is held, it looks for a higher marker, and otherwise for any,
 //! with shared locks on ranges of bytes 1 to 0xFFFF, halving a range that
 //! conflicts. It gives each lock back at once. The highest marker wins.
-//! Only an owner at the launch's own level is talked to. One at another
-//! level is answered at once from its marker: the launch or the owner has
-//! rights the other lacks, and a probe is told it runs. With no marker, the
-//! owner is still starting, and the launch looks again until its deadline.
-//! While each level locks in its own folder, a launch finds only its own
-//! level's marker.
+//! Only an owner at the launch's own level is talked to, through that
+//! level's address folder, which the launch opens and checks before it
+//! reads the pipe's name. One at another level is answered at once from
+//! its marker: the launch or the owner has rights the other lacks, and a
+//! probe is told it runs. With no marker, the owner is still starting, and
+//! the launch looks again until its deadline.
 //!
 //! The pipe's controls, each against a threat:
 //! - its name is 128 random bits, published only after the pipe exists, in
-//!   a folder only this user can read: another user on a terminal server
-//!   can't create it first;
+//!   a folder only this user, at the owner's level or above, can read:
+//!   another user on a terminal server can't create it first;
 //! - `FILE_FLAG_FIRST_PIPE_INSTANCE`: nobody else's instance can be joined;
 //! - a protected access list for this user's SID alone, with this user as
 //!   owner;
@@ -301,14 +305,15 @@ fn me() -> io::Result<&'static Identity> {
 }
 
 /// Whether this launch's rights were raised from a login. Elevation isn't
-/// read here, so no launch is: an elevated one owns in its level's folder.
+/// read here, so no launch is: an elevated one owns when nobody does, and
+/// launches at other levels then find it.
 pub(crate) fn raised() -> bool {
     false
 }
 
 /// Whether this launch has more rights than a normal process. Integrity
-/// levels aren't compared here, so no launch has: each level owns in its
-/// own folder.
+/// levels aren't compared here, so no launch has: a launch at any level
+/// may own, and launches at the others find it.
 pub(crate) fn above_normal() -> bool {
     false
 }
@@ -457,12 +462,10 @@ enum Base {
 pub(crate) struct Place {
     base: PathBuf,
     kind: Base,
-    /// The folders this crate makes in the base. Every integrity level
-    /// shares them when there is a level folder below them. Without one,
-    /// they belong to this process's level, and so does the base.
+    /// The folders this crate makes in the base: the app's folder in Local
+    /// AppData, then the instance folder. Every integrity level shares
+    /// them, and a `Builder::dir` base too.
     subs: Vec<OsString>,
-    /// The folder of this process's integrity level, last in the path.
-    level: Option<OsString>,
 }
 
 impl Place {
@@ -471,7 +474,6 @@ impl Place {
             base: dir,
             kind: Base::Create,
             subs: Vec::new(),
-            level: None,
         }
     }
 
@@ -482,26 +484,18 @@ impl Place {
     pub(crate) fn path(&self) -> PathBuf {
         let mut p = self.base.clone();
         p.extend(&self.subs);
-        p.extend(&self.level);
         p
     }
 
-    /// Each folder this crate makes in the base, with its role. Above a
-    /// level folder, the last is the instance folder, and any before it
-    /// (the app's folder) are shared. Without a level folder, each belongs
-    /// to this process's level.
+    /// Each folder this crate makes in the base, with its role: the last is
+    /// the instance folder, and any before it (the app's folder) are
+    /// shared.
     fn folders(&self) -> impl Iterator<Item = (&OsString, Role)> {
         let key = self.subs.len().saturating_sub(1);
-        let shared = self.level.is_some();
-        let subs = self.subs.iter().enumerate().map(move |(i, sub)| {
-            let role = match (shared, i == key) {
-                (false, _) => Role::Level,
-                (true, true) => Role::Key,
-                (true, false) => Role::Shared,
-            };
+        self.subs.iter().enumerate().map(move |(i, sub)| {
+            let role = if i == key { Role::Key } else { Role::Shared };
             (sub, role)
-        });
-        subs.chain(self.level.iter().map(|sub| (sub, Role::Level)))
+        })
     }
 }
 
@@ -525,12 +519,10 @@ pub(crate) fn default_place(id: &AppId) -> Result<Place, Reason> {
         std::slice::from_raw_parts(path, len)
     }));
     unsafe { CoTaskMemFree(path.cast()) };
-    let level = me().map_err(|e| Reason::runtime_dir(&base, e))?.integrity;
     Ok(Place {
         base,
         kind: Base::Known,
         subs: vec![id.as_str().into()],
-        level: Some(level_folder(level).into()),
     })
 }
 
@@ -778,15 +770,29 @@ fn upper(name: &OsStr) -> Vec<u16> {
 // The folder
 // ---------------------------------------------------------------------------
 
-/// An open, checked runtime folder. Its handle doesn't share delete, so
-/// while it is open nobody can rename or remove it, or anything above it.
+/// An open, checked runtime folder: the instance folder, which every
+/// integrity level shares and which holds `instance.lock`. Its handle
+/// doesn't share delete, so while it is open nobody can rename or remove
+/// it, or anything above it.
 #[derive(Debug)]
 pub(crate) struct Folder {
     path: PathBuf,
     _handle: File,
+    /// This owner's address folder, once it listens.
+    run: Option<AddressFolder>,
+}
+
+/// An owner's address folder: the folder of its integrity level in the
+/// instance folder, which holds only `instance.pipe`. Open and checked, and
+/// its handle doesn't share delete, so while it is open nobody can rename
+/// or remove it.
+#[derive(Debug)]
+struct AddressFolder {
+    path: PathBuf,
+    _handle: File,
     /// `instance.pipe`, held open while this process publishes it, so that
     /// a delete can't leave launches unable to find the pipe.
-    address: Mutex<Option<File>>,
+    held: Mutex<Option<File>>,
 }
 
 fn open_dir(path: &Path) -> io::Result<File> {
@@ -800,24 +806,26 @@ fn open_dir(path: &Path) -> io::Result<File> {
 /// What a folder this crate makes is for, which sets its label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
-    /// The app's folder in Local AppData, which every level shares:
-    /// unlabelled, so it counts as medium.
+    /// The app's folder in Local AppData, or a `Builder::dir` base, which
+    /// every level shares: unlabelled, so it counts as medium.
     Shared,
-    /// The instance folder in Local AppData, which every level shares:
-    /// labelled medium, whatever level makes it, and the label isn't handed
-    /// down. One with no label counts as medium too.
+    /// The instance folder, which every level shares and which holds
+    /// `instance.lock`: labelled medium, whatever level makes it, and the
+    /// label isn't handed down. One with no label counts as medium too.
     Key,
-    /// A folder of this process's integrity level: labelled at that level,
-    /// and the label is handed down to everything made in it.
-    Level,
+    /// The address folder of the integrity level with this RID, in the
+    /// instance folder: labelled at that level, and the label is handed
+    /// down to everything made in it. Only an owner at that level makes it.
+    Level(u32),
 }
 
 /// A real folder, owned by this user (or SYSTEM, Administrators,
 /// TrustedInstaller), that nobody else may change. A folder this crate
-/// makes (one with a `role`) must also be one nobody else may read. An
-/// instance folder in Local AppData must be labelled medium or not at all,
-/// and a level's folder at this process's level (no label counts as
-/// medium).
+/// makes (one with a `role`) must also be one nobody else may read, and be
+/// labelled as its role says, where no label counts as medium: a shared
+/// folder at medium or below, since a launch at medium must make the
+/// instance folder in it; an instance folder at medium; and an address
+/// folder at its level.
 fn check_dir(dir: &File, role: Option<Role>) -> io::Result<()> {
     let handle = dir.as_raw_handle();
     // SAFETY: plain data, filled in by the call.
@@ -859,10 +867,13 @@ fn check_dir(dir: &File, role: Option<Role>) -> io::Result<()> {
     // SAFETY: a valid (or null) SACL from the call above.
     let labelled = unsafe { label(sacl) };
     match role {
+        Some(Role::Shared) if labelled.is_some_and(|l| l > MEDIUM) => {
+            return Err(denied("labelled above medium integrity"));
+        }
         Some(Role::Key) if labelled.is_some_and(|l| l != MEDIUM) => {
             return Err(denied("labelled at an integrity level other than medium"));
         }
-        Some(Role::Level) if labelled.unwrap_or(MEDIUM) != me.integrity => {
+        Some(Role::Level(level)) if labelled.unwrap_or(MEDIUM) != level => {
             return Err(denied("made for another integrity level"));
         }
         _ => {}
@@ -914,19 +925,19 @@ struct AllowedAce {
 }
 
 /// Creates a folder that only this user (and SYSTEM) can open, whatever
-/// its parent would hand down, labelled as its `role` wants. A level's
-/// folder is labelled at this process's integrity level, and so is
-/// everything made in it, so that lower levels can't open any of it. An
+/// its parent would hand down, labelled as its `role` wants. An address
+/// folder is labelled at its level, and so is everything made in it, so
+/// that lower levels can't open any of it; a process may label a folder up
+/// to its own level only, so only an owner at that level makes it. An
 /// instance folder is labelled medium, which a process may set at medium
 /// or above, and nothing made in it takes that label. An existing folder
 /// is left as it is.
 fn create_private_dir(path: &Path, role: Role) -> io::Result<()> {
-    let me = me()?;
-    let mut sddl = format!("D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)", me.sid_string);
+    let mut sddl = format!("D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)", me()?.sid_string);
     match role {
         Role::Shared => {}
         Role::Key => sddl += "S:(ML;;NWNR;;;ME)",
-        Role::Level => sddl += &format!("S:(ML;OICI;NWNR;;;S-1-16-{})", me.integrity),
+        Role::Level(level) => sddl += &format!("S:(ML;OICI;NWNR;;;S-1-16-{level})"),
     }
     create_dir_with_sd(path, &sddl)
 }
@@ -1026,8 +1037,8 @@ pub(crate) fn open_folder(place: &Place, create: bool) -> Result<Option<Folder>,
     let missing = |e: &io::Error| e.kind() == io::ErrorKind::NotFound && !create;
     // Local AppData isn't the crate's, so it need only be safe, and not in
     // the profiles folder outside this user's profile. A `Builder::dir`
-    // base is the crate's, and belongs to this process's level.
-    let made = (place.kind == Base::Create).then_some(Role::Level);
+    // base is the crate's, and every level shares it.
+    let made = (place.kind == Base::Create).then_some(Role::Shared);
     if let (Some(role), true) = (made, create) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Reason::runtime_dir(&path, e))?;
@@ -1060,8 +1071,21 @@ pub(crate) fn open_folder(place: &Place, create: bool) -> Result<Option<Folder>,
     Ok(Some(Folder {
         path,
         _handle: dir,
-        address: Mutex::new(None),
+        run: None,
     }))
+}
+
+/// Opens the address folder of the integrity level `level` in the instance
+/// folder `key`, creating it when `create` is set, and checks it: it must
+/// be labelled at that level.
+fn open_address_folder(key: &Path, level: u32, create: bool) -> io::Result<(PathBuf, File)> {
+    let path = key.join(level_folder(level));
+    if create {
+        create_private_dir(&path, Role::Level(level))?;
+    }
+    let dir = open_dir(&path)?;
+    check_dir(&dir, Some(Role::Level(level)))?;
+    Ok((path, dir))
 }
 
 /// The held lock: exclusive `LockFileEx` locks on two bytes of the open
@@ -1219,12 +1243,17 @@ impl Folder {
     }
 
     /// Opens `instance.lock`, creating it when `create` is set. A new one
-    /// gets an access list of its own, for this user and SYSTEM, and no
-    /// label of its own: it takes its folder's.
+    /// gets an access list of its own, for this user and SYSTEM, and an
+    /// explicit medium label that isn't protected, whatever level makes it,
+    /// so every level can open and lock it. The instance folder hands down
+    /// no label, so this is its only one.
     fn open_lock(&self, create: bool) -> io::Result<File> {
         let path = self.lock_path();
         if create {
-            let sddl = format!("D:P(A;;FA;;;{})(A;;FA;;;SY)", me()?.sid_string);
+            let sddl = format!(
+                "D:P(A;;FA;;;{})(A;;FA;;;SY)S:(ML;;NWNR;;;ME)",
+                me()?.sid_string
+            );
             return create_file_with_sd(&path, GENERIC_READ | GENERIC_WRITE, &sddl);
         }
         OpenOptions::new()
@@ -1292,91 +1321,40 @@ impl Folder {
         })
     }
 
-    /// Writes `instance.pipe` in one step: written beside it, then renamed
-    /// over it. Then holds it open.
-    fn publish(&self, app_id: &AppId, secret: &str) -> io::Result<()> {
-        // Held, it can't be renamed over.
-        self.let_go_of_address();
-        let tmp = self.path.join(format!("{ADDRESS_FILE}.{secret}.tmp"));
-        std::fs::write(&tmp, format!("{app_id} {secret}\n"))?;
-        std::fs::rename(&tmp, self.path.join(ADDRESS_FILE)).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })?;
-        self.hold_address();
-        Ok(())
+    /// This owner's address folder, once it listens.
+    fn address_folder(&self) -> Option<&AddressFolder> {
+        self.run.as_ref()
     }
 
-    /// Opens `instance.pipe` to read, sharing only reads, unless this
-    /// process already holds it. Nothing else can then delete it, rename
-    /// over it or write to it, and launches can still read it. A failure
-    /// leaves it as before; the owner's upkeep tries again.
-    fn hold_address(&self) {
-        let mut held = self.address.lock().unwrap_or_else(|e| e.into_inner());
-        if held.is_some() {
-            return;
-        }
-        match OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(self.path.join(ADDRESS_FILE))
-        {
-            Ok(file) => *held = Some(file),
-            Err(e) => log::debug!("instance-handoff: holding {ADDRESS_FILE}: {e}"),
-        }
-    }
-
-    fn let_go_of_address(&self) {
-        *self.address.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    }
-
-    fn published(&self) -> io::Result<Option<String>> {
-        match std::fs::read_to_string(self.path.join(ADDRESS_FILE)) {
-            Ok(text) => Ok(Some(text)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
+    /// Withdraws the address, if this owner published one.
     fn unpublish(&self) {
-        self.let_go_of_address();
-        if let Err(e) = std::fs::remove_file(self.path.join(ADDRESS_FILE)) {
-            if e.kind() != io::ErrorKind::NotFound {
-                log::debug!("instance-handoff: removing {ADDRESS_FILE}: {e}");
-            }
+        if let Some(run) = self.address_folder() {
+            run.unpublish();
         }
     }
 
-    /// The pipe the address file names, checked character by character, so
-    /// it can't point anywhere but a local pipe of this crate.
-    fn address(&self) -> io::Result<Option<Address>> {
-        let Some(text) = self.published()? else {
-            return Ok(None);
-        };
-        let bad = || io::Error::new(io::ErrorKind::InvalidData, "a malformed instance.pipe");
-        let line = text.strip_suffix('\n').ok_or_else(bad)?;
-        let (id, secret) = line.split_once(' ').ok_or_else(bad)?;
-        if !valid_id(id.as_bytes())
-            || secret.len() != 32
-            || !secret
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(bad());
-        }
-        Ok(Some(Address {
-            pipe: pipe_name(id, secret),
-        }))
-    }
-
-    /// Creates the pipe, then publishes its name. A failed publish (another
+    /// Makes this owner's address folder, the folder of its integrity
+    /// level in the instance folder, and holds it open. Then creates the
+    /// pipe, and publishes its name there. A failed publish (another
     /// program holding the file) is retried by the owner's upkeep.
-    pub(crate) fn listen(&self, app_id: &AppId) -> io::Result<PipeListener> {
+    pub(crate) fn listen(&mut self, app_id: &AppId) -> io::Result<PipeListener> {
+        let run = match self.run.take() {
+            Some(run) => run,
+            None => {
+                let (path, handle) = open_address_folder(&self.path, me()?.integrity, true)?;
+                AddressFolder {
+                    path,
+                    _handle: handle,
+                    held: Mutex::new(None),
+                }
+            }
+        };
+        let run: &AddressFolder = self.run.insert(run);
         let secret = random_hex()?;
         let name = pipe_name(app_id.as_str(), &secret);
         let sd = SecurityDescriptor::for_pipe()?;
         let first = create_instance(&name, &sd, true)?;
-        let published = match self.publish(app_id, &secret) {
+        let published = match run.publish(app_id, &secret) {
             Ok(()) => true,
             Err(e) => {
                 log::warn!(
@@ -1394,17 +1372,35 @@ impl Folder {
         })
     }
 
-    /// Connects to the owner's pipe, which must be labelled at `level`, the
-    /// owner's level as its marker shows it.
+    /// Connects to the owner's pipe, through the address folder of `level`,
+    /// the owner's level as its marker shows it. The pipe must be labelled
+    /// at that level too. A missing folder, or one with no address yet, is
+    /// an owner not listening yet; a folder that fails its check gives
+    /// `Peer`. Without a level there is no folder to look in, and no pipe's
+    /// label would match.
     pub(crate) fn connect(
         &self,
         deadline: Option<Instant>,
         level: Option<crate::Level>,
     ) -> Result<Conn, Connect> {
-        let address = match self.address() {
-            Ok(Some(a)) => a,
-            Ok(None) => return Err(Connect::Retry(io::ErrorKind::NotFound.into())),
-            Err(e) => return Err(Connect::Retry(e)),
+        let Some(level) = level else {
+            return Err(Connect::Peer(denied(
+                "this launch's integrity level is unknown",
+            )));
+        };
+        let address = {
+            // Held open while the address is read, so the folder checked
+            // is the one it is read from.
+            let (run, _handle) = match open_address_folder(&self.path, level.rid(), false) {
+                Ok(opened) => opened,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Connect::Retry(e)),
+                Err(e) => return Err(Connect::Peer(e)),
+            };
+            match read_address(&run) {
+                Ok(Some(a)) => a,
+                Ok(None) => return Err(Connect::Retry(io::ErrorKind::NotFound.into())),
+                Err(e) => return Err(Connect::Retry(e)),
+            }
         };
         let file = loop {
             let opened = OpenOptions::new()
@@ -1438,6 +1434,91 @@ impl Folder {
     }
 }
 
+impl AddressFolder {
+    /// Writes `instance.pipe` in one step: written beside it, then renamed
+    /// over it. Then holds it open.
+    fn publish(&self, app_id: &AppId, secret: &str) -> io::Result<()> {
+        // Held, it can't be renamed over.
+        self.let_go();
+        let tmp = self.path.join(format!("{ADDRESS_FILE}.{secret}.tmp"));
+        std::fs::write(&tmp, format!("{app_id} {secret}\n"))?;
+        std::fs::rename(&tmp, self.path.join(ADDRESS_FILE)).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+        self.hold();
+        Ok(())
+    }
+
+    /// Opens `instance.pipe` to read, sharing only reads, unless this
+    /// process already holds it. Nothing else can then delete it, rename
+    /// over it or write to it, and launches can still read it. A failure
+    /// leaves it as before; the owner's upkeep tries again.
+    fn hold(&self) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_some() {
+            return;
+        }
+        match OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(self.path.join(ADDRESS_FILE))
+        {
+            Ok(file) => *held = Some(file),
+            Err(e) => log::debug!("instance-handoff: holding {ADDRESS_FILE}: {e}"),
+        }
+    }
+
+    fn let_go(&self) {
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn published(&self) -> io::Result<Option<String>> {
+        published(&self.path)
+    }
+
+    fn unpublish(&self) {
+        self.let_go();
+        if let Err(e) = std::fs::remove_file(self.path.join(ADDRESS_FILE)) {
+            if e.kind() != io::ErrorKind::NotFound {
+                log::debug!("instance-handoff: removing {ADDRESS_FILE}: {e}");
+            }
+        }
+    }
+}
+
+/// What `instance.pipe` in the address folder `run` says, if it is there.
+fn published(run: &Path) -> io::Result<Option<String>> {
+    match std::fs::read_to_string(run.join(ADDRESS_FILE)) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The pipe that `instance.pipe` in the address folder `run` names,
+/// checked character by character, so it can't point anywhere but a local
+/// pipe of this crate.
+fn read_address(run: &Path) -> io::Result<Option<Address>> {
+    let Some(text) = published(run)? else {
+        return Ok(None);
+    };
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "a malformed instance.pipe");
+    let line = text.strip_suffix('\n').ok_or_else(bad)?;
+    let (id, secret) = line.split_once(' ').ok_or_else(bad)?;
+    if !valid_id(id.as_bytes())
+        || secret.len() != 32
+        || !secret
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(bad());
+    }
+    Ok(Some(Address {
+        pipe: pipe_name(id, secret),
+    }))
+}
+
 fn super_past(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|d| Instant::now() >= d)
 }
@@ -1461,9 +1542,8 @@ fn pipe_name(id: &str, secret: &str) -> OsString {
 /// the level the owner's marker shows, or it isn't the owner this launch
 /// read the level of. A launch talks only to an owner marked at its own
 /// level, and a process can't label an object above its own level, so a
-/// lower process of the same user can't pass for the owner. `None` matches
-/// no label.
-fn check_pipe_owner(pipe: &File, expected: Option<crate::Level>) -> io::Result<()> {
+/// lower process of the same user can't pass for the owner.
+fn check_pipe_owner(pipe: &File, expected: crate::Level) -> io::Result<()> {
     let me = me()?;
     let mut owner: PSID = null_mut();
     let mut sacl: *mut ACL = null_mut();
@@ -1491,7 +1571,7 @@ fn check_pipe_owner(pipe: &File, expected: Option<crate::Level>) -> io::Result<(
     }
     // SAFETY: a valid (or null) SACL from the call above.
     let level = unsafe { label(sacl) }.unwrap_or(MEDIUM);
-    if Some(level) != expected.map(crate::Level::rid) {
+    if level != expected.rid() {
         return Err(denied("the owner runs at another integrity level"));
     }
     Ok(())
@@ -1665,14 +1745,14 @@ impl PipeListener {
     }
 
     /// The name was taken while none of our instances held it: start over
-    /// with a new one, published again.
-    fn renew(&mut self, folder: &Folder, app_id: &AppId) -> io::Result<()> {
+    /// with a new one, published again in the address folder `run`.
+    fn renew(&mut self, run: &AddressFolder, app_id: &AppId) -> io::Result<()> {
         let secret = random_hex()?;
         let name = pipe_name(app_id.as_str(), &secret);
         self.first = Some(create_instance(&name, &self.sd, true)?);
         self.name = name;
         self.secret = secret;
-        self.published = folder.publish(app_id, &self.secret).is_ok();
+        self.published = run.publish(app_id, &self.secret).is_ok();
         Ok(())
     }
 }
@@ -2193,7 +2273,12 @@ pub(crate) struct Claimed {
 }
 
 impl Claimed {
-    pub(crate) fn new(folder: Folder, lock: Lock, guard: Option<Guard>, app_id: &AppId) -> Claimed {
+    pub(crate) fn new(
+        mut folder: Folder,
+        lock: Lock,
+        guard: Option<Guard>,
+        app_id: &AppId,
+    ) -> Claimed {
         let listener = folder.listen(app_id);
         Claimed {
             folder,
@@ -2383,10 +2468,11 @@ pub(crate) fn serve<T: Payload>(
                             let held = core.shared.held();
                             let closing =
                                 core.shared.close.load(std::sync::atomic::Ordering::SeqCst);
-                            match (&held.folder, &held.lock) {
+                            let run = held.folder.as_ref().and_then(Folder::address_folder);
+                            match (run, &held.lock) {
                                 // As check_address: never publish for an
                                 // owner that is closing.
-                                (Some(folder), Some(_)) if !closing => l.renew(folder, &app_id),
+                                (Some(run), Some(_)) if !closing => l.renew(run, &app_id),
                                 _ => Err(e),
                             }
                         };
@@ -2617,12 +2703,13 @@ fn check_address<T: Payload>(core: &Core<T>, listener: Option<&mut PipeListener>
     if core.shared.close.load(std::sync::atomic::Ordering::SeqCst) {
         return true;
     }
-    let (Some(folder), Some(_)) = (&held.folder, &held.lock) else {
+    let run = held.folder.as_ref().and_then(Folder::address_folder);
+    let (Some(run), Some(_)) = (run, &held.lock) else {
         return true;
     };
     let want = format!("{} {}\n", core.ctx.app_id, listener.secret);
-    if folder.published().ok().flatten().as_deref() == Some(want.as_str()) {
-        folder.hold_address();
+    if run.published().ok().flatten().as_deref() == Some(want.as_str()) {
+        run.hold();
         listener.published = true;
         return true;
     }
@@ -2632,7 +2719,7 @@ fn check_address<T: Payload>(core: &Core<T>, listener: Option<&mut PipeListener>
             core.ctx.app_id
         );
     }
-    listener.published = match folder.publish(&core.ctx.app_id, &listener.secret) {
+    listener.published = match run.publish(&core.ctx.app_id, &listener.secret) {
         Ok(()) => true,
         Err(e) => {
             log::warn!(
@@ -2657,8 +2744,7 @@ mod tests {
     const LABEL: OBJECT_SECURITY_INFORMATION = LABEL_SECURITY_INFORMATION;
 
     /// A place laid out as in Local AppData, in a private folder made in
-    /// `tmp`: the app's folder, an instance folder, then this process's
-    /// level folder.
+    /// `tmp`: the app's folder, then an instance folder.
     fn local(tmp: &Path) -> Place {
         let base = tmp.join("local");
         create_private_dir(&base, Role::Shared).unwrap();
@@ -2666,8 +2752,12 @@ mod tests {
             base,
             kind: Base::Known,
             subs: vec![APP.into(), KEY.into()],
-            level: Some(level_folder(me().unwrap().integrity).into()),
         }
+    }
+
+    /// The name of this process's address folder.
+    fn own_level_folder() -> String {
+        level_folder(me().unwrap().integrity)
     }
 
     /// An access list for this user and SYSTEM alone, its entries handed
@@ -2747,10 +2837,10 @@ mod tests {
         }
     }
 
-    // The level folder comes last, below the instance folder that every
-    // level shares. The runner's Local AppData is in the profiles folder,
-    // so the profile check is live, and in the runner's own profile, so it
-    // passes.
+    // The runtime folder is the instance folder, which every level shares;
+    // no level's folder follows it. The runner's Local AppData is in the
+    // profiles folder, so the profile check is live, and in the runner's
+    // own profile, so it passes.
     #[test]
     fn the_default_folder_passes_the_check() {
         let mut place = default_place(&AppId::headless(APP)).unwrap();
@@ -2762,61 +2852,75 @@ mod tests {
         assert!(in_another_profile(&local, &profiles, nowhere), "{local:?}");
         assert!(!in_another_profile(&local, &profiles, &mine), "{local:?}");
         check_profile(&base).unwrap();
-        let level = level_folder(me().unwrap().integrity);
         place.push(KEY);
-        assert_eq!(place.path(), place.base.join(APP).join(KEY).join(level));
+        assert_eq!(place.path(), place.base.join(APP).join(KEY));
     }
 
     // Each folder has an access list of its own and at most one label, its
-    // own: the instance folder's isn't handed down to the level folder.
+    // own: the instance folder's isn't handed down to the address folder.
     // Windows reports a label given as a folder is made with AI
     // (auto-inherited) on the list that holds it, as the CI measurements in
-    // docs/design show.
+    // docs/design show. Only an owner makes its address folder, as it
+    // listens. A Builder::dir base is unlabelled, as the app's folder is.
     #[test]
     fn folders_this_crate_makes_are_private_and_labelled() {
         let me = me().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let place = local(tmp.path());
-        let folder = open_folder(&place, true).unwrap().unwrap();
-        let app = place.base.join(APP);
-        let key = app.join(KEY);
-        assert_eq!(folder.path(), key.join(level_folder(me.integrity)));
-
+        let id = AppId::headless(APP);
         let both = DACL | LABEL;
-        assert_eq!(security(&app, DACL).0, spelled(&private("OICI"), DACL));
-        let (label, level) = security(&app, LABEL);
-        assert_eq!(level, None, "{label}");
-        let want = format!("{}S:AI(ML;;NWNR;;;ME)", private("OICI"));
-        assert_eq!(security(&key, both).0, spelled(&want, both));
-        let want = format!(
+        let key_sddl = format!("{}S:AI(ML;;NWNR;;;ME)", private("OICI"));
+        let run_sddl = format!(
             "{}S:AI(ML;OICI;NWNR;;;S-1-16-{})",
             private("OICI"),
             me.integrity
         );
-        assert_eq!(security(folder.path(), both).0, spelled(&want, both));
+        let unlabelled = |dir: &Path| {
+            assert_eq!(security(dir, DACL).0, spelled(&private("OICI"), DACL));
+            let (label, level) = security(dir, LABEL);
+            assert_eq!(level, None, "{}: {label}", dir.display());
+        };
 
-        // Under Builder::dir, the base and the instance folder belong to
-        // this process's level.
-        let mut place = Place::dir(tmp.path().join("dir"));
+        let place = local(tmp.path());
+        let mut folder = open_folder(&place, true).unwrap().unwrap();
+        let app = place.base.join(APP);
+        let key = app.join(KEY);
+        let run = key.join(own_level_folder());
+        assert_eq!(folder.path(), key);
+        assert!(!run.exists(), "made before the owner listens");
+        let _listener = folder.listen(&id).unwrap();
+        unlabelled(&app);
+        assert_eq!(security(&key, both).0, spelled(&key_sddl, both));
+        assert_eq!(security(&run, both).0, spelled(&run_sddl, both));
+
+        let base = tmp.path().join("dir");
+        let mut place = Place::dir(base.clone());
         place.push(KEY);
-        let folder = open_folder(&place, true).unwrap().unwrap();
-        for dir in [folder.path(), &tmp.path().join("dir")] {
-            check_dir(&open_dir(dir).unwrap(), Some(Role::Level)).unwrap();
-        }
+        let mut folder = open_folder(&place, true).unwrap().unwrap();
+        let _listener = folder.listen(&id).unwrap();
+        unlabelled(&base);
+        let key = base.join(KEY);
+        assert_eq!(security(&key, both).0, spelled(&key_sddl, both));
+        let run = key.join(own_level_folder());
+        assert_eq!(security(&run, both).0, spelled(&run_sddl, both));
     }
 
-    // instance.lock has an access list of its own. Its one label is its
-    // folder's, handed down.
+    // instance.lock is in the instance folder, with an access list of its
+    // own and one label, medium, its own and not protected: the instance
+    // folder hands none down.
     #[test]
-    fn the_lock_file_has_its_own_access_list() {
+    fn the_lock_file_has_its_own_access_list_and_label() {
         let tmp = tempfile::tempdir().unwrap();
-        let folder = open_folder(&local(tmp.path()), true).unwrap().unwrap();
+        let place = local(tmp.path());
+        let folder = open_folder(&place, true).unwrap().unwrap();
         let _lock = folder.lock().unwrap().unwrap();
         let path = folder.lock_path();
+        assert_eq!(path, place.path().join(LOCK_FILE));
         assert_eq!(security(&path, DACL).0, spelled(&private(""), DACL));
         let (label, level) = security(&path, LABEL);
         assert_eq!(label.matches("(ML;").count(), 1, "{label}");
-        assert_eq!(level, Some(me().unwrap().integrity), "{label}");
+        assert!(label.contains("(ML;;NWNR;;;ME)"), "{label}");
+        assert!(!label.starts_with("S:P"), "{label}");
+        assert_eq!(level, Some(MEDIUM), "{label}");
     }
 
     // On disk: byte 0 of instance.lock is owning, and the byte at the
@@ -2847,8 +2951,7 @@ mod tests {
 
     impl Folder {
         /// Takes the lock as an owner at the level `rid` would, through a
-        /// handle of its own: an owner at another level, for tests, in
-        /// this level's folder.
+        /// handle of its own: an owner at a level the tests can't run at.
         pub(crate) fn lock_at(&self, rid: u32) -> io::Result<Option<Lock>> {
             let file = self.open_lock(true)?;
             Ok(take(&file, level_marker(rid))?.then_some(Lock(file)))
@@ -3087,11 +3190,11 @@ mod tests {
             );
             assert!(!dir.join(GUARD_FILE).exists());
 
-            // A state folder in a Builder::dir base made at this level
-            // takes the base's label, though it has none of its own, and is
+            // A state folder in a folder that hands down a label at this
+            // level takes it, though it has none of its own, and is
             // refused too.
             let base = tmp.path().join("base");
-            create_private_dir(&base, Role::Level).unwrap();
+            create_private_dir(&base, Role::Level(me.integrity)).unwrap();
             let state = base.join("state");
             make_state_dir(&state).unwrap();
             let (label, level) = security(&state, LABEL);
@@ -3216,16 +3319,15 @@ mod tests {
         assert!(!is_remote(&final_path(tmp.path()).unwrap()));
     }
 
-    // Each label here is one this process may set: below its own level, or
-    // at it.
+    // Which labels a launch refuses, each one this process may set: below
+    // its own level, or at it. The folders every level shares must be ones
+    // a launch at medium can use, and an address folder must be at its
+    // level.
     #[test]
-    fn a_folder_made_for_another_integrity_level_is_refused() {
+    fn folders_labelled_for_the_wrong_level_are_refused() {
         let me = me().unwrap();
-        let below = format!(
-            "{}S:(ML;OICI;NWNR;;;S-1-16-{})",
-            private("OICI"),
-            me.integrity - 0x1000
-        );
+        let labelled = |rid: u32| format!("{}S:(ML;OICI;NWNR;;;S-1-16-{rid})", private("OICI"));
+        let below = labelled(me.integrity - 0x1000);
 
         // An instance folder labelled low.
         let tmp = tempfile::tempdir().unwrap();
@@ -3236,30 +3338,61 @@ mod tests {
         create_dir_with_sd(&app.join(KEY), &low).unwrap();
         refused(&place, &app.join(KEY));
 
-        // One labelled above medium, where this process may label it so.
+        // An address folder labelled one level below this process's: the
+        // owner can't listen there, and a launch takes it for a peer's.
+        let tmp = tempfile::tempdir().unwrap();
+        let place = local(tmp.path());
+        let mut folder = open_folder(&place, true).unwrap().unwrap();
+        create_dir_with_sd(&place.path().join(own_level_folder()), &below).unwrap();
+        assert!(folder.listen(&AppId::headless(APP)).is_err());
+        let level = Some(crate::Level::from_rid(me.integrity));
+        assert!(matches!(folder.connect(None, level), Err(Connect::Peer(_))));
+
+        // A Builder::dir base labelled below this process's level, which
+        // a launch at medium can make folders in, is shared. Its label
+        // isn't handed down, so the instance folder's is the only one.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("dir");
+        let sddl = format!(
+            "{}S:(ML;;NWNR;;;S-1-16-{})",
+            private("OICI"),
+            me.integrity - 0x1000
+        );
+        create_dir_with_sd(&base, &sddl).unwrap();
+        let mut place = Place::dir(base.clone());
+        place.push(KEY);
+        assert!(open_folder(&place, true).unwrap().is_some());
+        let (label, level) = security(&base.join(KEY), LABEL);
+        assert_eq!(label.matches("(ML;").count(), 1, "{label}");
+        assert_eq!(level, Some(MEDIUM), "{label}");
+
+        // Labels above medium, where this process may set them: on an
+        // instance folder or an app's folder in Local AppData, which only
+        // something else labels so, and on a Builder::dir base, which
+        // builds before this one made at high, with the instance folder in
+        // it.
         if me.integrity > MEDIUM {
+            let above = labelled(me.integrity);
             let tmp = tempfile::tempdir().unwrap();
             let place = local(tmp.path());
             let app = place.base.join(APP);
             create_private_dir(&app, Role::Shared).unwrap();
-            create_private_dir(&app.join(KEY), Role::Level).unwrap();
+            create_dir_with_sd(&app.join(KEY), &above).unwrap();
             refused(&place, &app.join(KEY));
+
+            let tmp = tempfile::tempdir().unwrap();
+            let place = local(tmp.path());
+            let app = place.base.join(APP);
+            create_dir_with_sd(&app, &above).unwrap();
+            refused(&place, &app);
+
+            let tmp = tempfile::tempdir().unwrap();
+            let base = tmp.path().join("dir");
+            create_dir_with_sd(&base, &above).unwrap();
+            let mut place = Place::dir(base.clone());
+            place.push(KEY);
+            refused(&place, &base);
         }
-
-        // A level folder labelled one level below this process's.
-        let tmp = tempfile::tempdir().unwrap();
-        let place = local(tmp.path());
-        let app = place.base.join(APP);
-        create_private_dir(&app, Role::Shared).unwrap();
-        create_private_dir(&app.join(KEY), Role::Key).unwrap();
-        create_dir_with_sd(&place.path(), &below).unwrap();
-        refused(&place, &place.path());
-
-        // So is a Builder::dir base, which belongs to a level too.
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().join("dir");
-        create_dir_with_sd(&base, &below).unwrap();
-        refused(&Place::dir(base.clone()), &base);
     }
 
     // Instance folders used to be made without a label, and every level
@@ -3290,25 +3423,37 @@ mod tests {
         assert!(open_folder(&Place::dir(link), false).is_err());
     }
 
+    // The owner publishes its pipe's name in the address folder of its
+    // level, which it makes as it listens. Until then a launch finds no
+    // address, and tries again.
     #[test]
     fn more_instances_can_be_made_and_the_address_parses() {
         let tmp = tempfile::tempdir().unwrap();
-        let folder = open_folder(&Place::dir(tmp.path().join("run")), true)
+        let mut folder = open_folder(&Place::dir(tmp.path().join("dir")), true)
             .unwrap()
             .unwrap();
+        let level = Some(crate::Level::from_rid(me().unwrap().integrity));
+        assert!(matches!(
+            folder.connect(None, level),
+            Err(Connect::Retry(_))
+        ));
         let id = AppId::headless("test.windows");
         let mut listener = folder.listen(&id).unwrap();
         assert!(listener.published);
+        // A launch that doesn't know its own level is refused before it
+        // opens anything, though an address is there to read (6.1).
+        assert!(matches!(folder.connect(None, None), Err(Connect::Peer(_))));
         let _first = listener.instance(false).unwrap();
         let _second = listener.instance(false).unwrap();
-        let address = folder.address().unwrap().unwrap();
+        let run = tmp.path().join("dir").join(own_level_folder());
+        let address = read_address(&run).unwrap().unwrap();
         assert_eq!(address.pipe, listener.name);
         // Held while published: nothing else can rewrite it.
-        let file = tmp.path().join("run").join(ADDRESS_FILE);
+        let file = run.join(ADDRESS_FILE);
         assert!(std::fs::write(&file, "x \\\\evil\\pipe\n").is_err());
         folder.unpublish();
         std::fs::write(&file, "x \\\\evil\\pipe\n").unwrap();
-        assert!(folder.address().is_err());
+        assert!(read_address(&run).is_err());
     }
 
     // A launch can show windows outside session 0, on a visible window
@@ -3427,7 +3572,6 @@ mod tests {
             base: profiles.clone(),
             kind: Base::Known,
             subs: vec![APP.into(), KEY.into()],
-            level: Some(level_folder(me().unwrap().integrity).into()),
         };
         match open_folder(&place, false) {
             Err(Reason::RuntimeDir { path, source }) => {

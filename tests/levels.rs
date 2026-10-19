@@ -113,6 +113,11 @@ const RUN_HIGH: &str = "S:(ML;OICI;NWNR;;;HI)";
 // The tests
 // ---------------------------------------------------------------------------
 
+// Every level locks the one instance.lock of a state, in the instance
+// folder that the high owner made. A medium launch finds it held, reads
+// the owner's level from its marker, and runs alone at once with
+// OwnerHasMoreRights, sending nothing; its probe finds the owner,
+// unconfirmed.
 #[test]
 fn a_medium_launch_never_hands_off_to_a_high_owner() {
     if !elevated() {
@@ -120,21 +125,20 @@ fn a_medium_launch_never_hands_off_to_a_high_owner() {
     }
     let id = app("high-owner");
     let claim = claim(Builder::new(id.clone(), State::none()).start(&Args::default()));
-    assert!(
-        claim.dir().ends_with("run-high"),
-        "{}",
-        claim.dir().display()
-    );
-    let base = app_folder(claim.dir(), &id).to_path_buf();
+    let key = claim.dir().to_path_buf();
+    assert!(key.join("instance.lock").is_file(), "{}", key.display());
+    assert!(key.join("run-high").join("instance.pipe").is_file());
+    let base = app_folder(&key, &id).to_path_buf();
     let (tx, rx) = mpsc::channel();
     let owner = claim.serve(move |r| tx.send(r).is_ok());
 
     let mut child = medium("child_launch", &[(ID, OsStr::new(id.as_str()))]);
     let outcome = child.expect("outcome ");
-    assert!(
-        outcome.starts_with("owner ") && outcome.ends_with(r"\run"),
-        "{outcome}"
-    );
+    assert!(outcome.starts_with("alone OwnerHasMoreRights"), "{outcome}");
+    assert_quick(&child, "elapsed ");
+    let probe = child.expect("probe ");
+    assert_eq!(probe, "ok pid unknown, high, confirmed false");
+    assert_quick(&child, "probe elapsed ");
     child.finish();
     assert!(
         rx.try_recv().is_err(),
@@ -144,6 +148,10 @@ fn a_medium_launch_never_hands_off_to_a_high_owner() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+// The reverse: high finds the medium owner's lock held, and its start and
+// hand_off fail at once with MoreRights, sending nothing. Neither becomes
+// a second owner. An exclusive run, which without a state folder takes no
+// guard, takes the same lock instead and fails at once with StateInUse.
 #[test]
 fn a_high_launch_never_hands_off_to_a_medium_owner() {
     if !elevated() {
@@ -151,33 +159,45 @@ fn a_high_launch_never_hands_off_to_a_medium_owner() {
     }
     let id = app("medium-owner");
     let mut child = medium("child_owner", &[(ID, OsStr::new(id.as_str()))]);
-    let dir = child.expect("owner ");
-    assert!(dir.ends_with(r"\run"), "{dir}");
-    let base = app_folder(Path::new(&dir), &id).to_path_buf();
+    let key = PathBuf::from(child.expect("owner "));
+    assert!(key.join("run").join("instance.pipe").is_file());
+    let base = app_folder(&key, &id).to_path_buf();
 
-    match Builder::new(id.clone(), State::none()).start(&Args::new(["from-high"])) {
-        Started::Owner(claim) => {
-            assert!(
-                claim.dir().ends_with("run-high"),
-                "{}",
-                claim.dir().display()
-            );
-            claim.release();
+    let high = Builder::new(id, State::none());
+    let t = Instant::now();
+    match high.start(&Args::new(["from-high"])) {
+        Started::Alone(Reason::MoreRights { owner, .. }) => {
+            assert_eq!(owner.to_string(), "pid unknown, medium");
         }
         other => panic!("{}", describe(&other)),
     }
-    let reason = Builder::new(id, State::none())
-        .hand_off(&Args::new(["from-high"]))
-        .unwrap_err();
-    assert!(matches!(reason, Reason::NoOwner { .. }), "{reason}");
+    let reason = high.hand_off(&Args::new(["from-high"])).unwrap_err();
+    assert!(matches!(reason, Reason::MoreRights { .. }), "{reason}");
+    let found = high.probe().unwrap();
+    assert_eq!(found.to_string(), "pid unknown, medium");
+    assert!(!found.confirmed());
+    match high.exclusive() {
+        Err(Reason::StateInUse { path, .. }) => assert_eq!(path, key.join("instance.lock")),
+        other => panic!("{other:?}"),
+    }
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert!(
+        !key.join("run-high").exists(),
+        "high made its address folder"
+    );
 
     let rest = child.finish();
     assert!(!rest.iter().any(|l| l.starts_with("took ")), "{rest:?}");
     let _ = std::fs::remove_dir_all(base);
 }
 
+// A Builder::dir base made at either level is shared by the other: each
+// level meets the owner the other started there, rather than being
+// refused the folder. The base has no label, the instance folder and its
+// lock one medium label each, their own, and each address folder one label,
+// at its level.
 #[test]
-fn a_folder_made_at_one_level_is_refused_at_the_other() {
+fn a_folder_made_at_one_level_is_shared_by_the_other() {
     if !elevated() {
         return;
     }
@@ -189,6 +209,7 @@ fn a_folder_made_at_one_level_is_refused_at_the_other() {
             .dir(&high)
             .start(&Args::default()),
     );
+    let key = claim.dir().to_path_buf();
     let (tx, rx) = mpsc::channel();
     let owner = claim.serve(move |r| tx.send(r).is_ok());
     let mut child = medium(
@@ -196,12 +217,14 @@ fn a_folder_made_at_one_level_is_refused_at_the_other() {
         &[(ID, OsStr::new(APP.as_str())), (DIR, high.as_os_str())],
     );
     let outcome = child.expect("outcome ");
-    assert!(outcome.starts_with("alone RuntimeDir"), "{outcome}");
+    assert!(outcome.starts_with("alone OwnerHasMoreRights"), "{outcome}");
+    assert_quick(&child, "elapsed ");
     child.finish();
     assert!(
         rx.try_recv().is_err(),
         "the high owner took a medium launch"
     );
+    assert_layout(&high, &key, "run-high", "HI");
     owner.release();
 
     let made_at_medium = tmp.path().join("medium");
@@ -212,22 +235,85 @@ fn a_folder_made_at_one_level_is_refused_at_the_other() {
             (DIR, made_at_medium.as_os_str()),
         ],
     );
-    child.expect("owner ");
+    let key = PathBuf::from(child.expect("owner "));
+    assert_layout(&made_at_medium, &key, "run", "ME");
+    let t = Instant::now();
     match Builder::new(APP, State::none())
         .dir(&made_at_medium)
         .start(&Args::new(["from-high"]))
     {
-        Started::Alone(Reason::RuntimeDir { .. }) => {}
+        Started::Alone(Reason::MoreRights { .. }) => {}
         other => panic!("{}", describe(&other)),
     }
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     let rest = child.finish();
     assert!(!rest.iter().any(|l| l.starts_with("took ")), "{rest:?}");
 }
 
-// Every level locks one guard in the state folder, though each has a
-// runtime folder of its own: while an owner at one level holds it, a
-// launch at the other runs alone with StateInUse at once. Medium can lock
-// the guard file that high made.
+// Owners of one state at the two levels take turns: the lock and the
+// guard high made, medium takes once high lets go, and high again once
+// medium exits, each in the one instance folder. Meanwhile the other
+// level runs alone at once, with the owner's rights, not StateInUse.
+#[test]
+fn levels_take_turns_owning_one_state() {
+    if !elevated() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("dir");
+    let state = tmp.path().join("state");
+    let id = APP;
+    let env = [
+        (ID, OsStr::new(id.as_str())),
+        (DIR, dir.as_os_str()),
+        (STATE, state.as_os_str()),
+    ];
+    let high = Builder::new(APP, state.as_path()).dir(&dir);
+
+    let first = claim(high.start(&Args::default()));
+    assert!(first.guarded());
+    let key = first.dir().to_path_buf();
+    let mut child = medium("child_launch", &env);
+    let outcome = child.expect("outcome ");
+    assert!(outcome.starts_with("alone OwnerHasMoreRights"), "{outcome}");
+    assert_quick(&child, "elapsed ");
+    child.finish();
+    first.release();
+
+    let mut child = medium("child_owner", &env);
+    assert_eq!(PathBuf::from(child.expect("owner ")), key);
+    let t = Instant::now();
+    match high.start(&Args::new(["from-high"])) {
+        Started::Alone(Reason::MoreRights { .. }) => {}
+        other => panic!("{}", describe(&other)),
+    }
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    let rest = child.finish();
+    assert!(!rest.iter().any(|l| l.starts_with("took ")), "{rest:?}");
+
+    // Windows may free the locks of a process that exited a moment after
+    // it is gone, so high looks again for a while.
+    let until = Instant::now() + Duration::from_secs(5);
+    let again = loop {
+        match high.start(&Args::default()) {
+            Started::Owner(claim) => break claim,
+            Started::Alone(Reason::MoreRights { .. } | Reason::StateInUse { .. })
+                if Instant::now() < until =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => panic!("{}", describe(&other)),
+        }
+    };
+    assert_eq!(again.dir(), key);
+    assert!(again.guarded());
+    again.release();
+}
+
+// Every level locks one guard in the state folder: while an owner at one
+// level holds it, a launch at the other, given a runtime folder of its
+// own, runs alone with StateInUse at once. Medium can lock the guard file
+// that high made.
 #[test]
 fn the_guard_holds_across_levels() {
     if !elevated() {
@@ -269,9 +355,10 @@ fn the_guard_holds_across_levels() {
 
 /// A medium owner identifies a high launch from its token, though the
 /// launch connects for identification only, and refuses it at once with
-/// PRIVILEGE and its own level. The crate's own launches at high don't
-/// reach a medium owner's pipe, so a client built here connects as they
-/// would, and sends a valid REQUEST.
+/// PRIVILEGE and its own level. The crate's own launches at high read the
+/// medium owner's level from its marker and never connect, so a client
+/// built here connects as they would, through the owner's address folder,
+/// and sends a valid REQUEST.
 #[test]
 fn a_medium_owner_refuses_a_high_client_at_once() {
     if !elevated() {
@@ -282,7 +369,7 @@ fn a_medium_owner_refuses_a_high_client_at_once() {
     let dir = PathBuf::from(child.expect("owner "));
     let base = app_folder(&dir, &id).to_path_buf();
 
-    let address = std::fs::read_to_string(dir.join("instance.pipe")).unwrap();
+    let address = std::fs::read_to_string(dir.join("run").join("instance.pipe")).unwrap();
     let (named, secret) = address.trim_end().split_once(' ').unwrap();
     assert_eq!(named, id.as_str());
     let name = format!(r"\\.\pipe\instance-handoff.{named}.{secret}");
@@ -451,21 +538,30 @@ fn child_owner() {
     let _ = io::stdin().read_line(&mut String::new());
 }
 
-/// Launches once and reports how, and how long `start` took, in
-/// milliseconds.
+/// Launches once and reports how, then probes, and reports how long each
+/// took, in milliseconds.
 #[test]
 fn child_launch() {
     if !is_role("child_launch") {
         return;
     }
+    let b = child_builder();
     let t = Instant::now();
-    let started = child_builder().start(&Args::new(["from-medium"]));
+    let started = b.start(&Args::new(["from-medium"]));
     let ms = t.elapsed().as_millis();
     println!("outcome {}", describe(&started));
     println!("elapsed {ms}");
     if let Started::Owner(claim) = started {
         claim.release();
     }
+    let t = Instant::now();
+    let probed = b.probe();
+    let ms = t.elapsed().as_millis();
+    match probed {
+        Ok(info) => println!("probe ok {info}, confirmed {}", info.confirmed()),
+        Err(reason) => println!("probe err {reason:?}"),
+    }
+    println!("probe elapsed {ms}");
 }
 
 /// Reports its token, and tries what high made in the probe's folder.
@@ -606,6 +702,39 @@ fn app_folder<'a>(dir: &'a Path, id: &AppId) -> &'a Path {
     dir.ancestors()
         .find(|p| p.file_name() == Some(OsStr::new(id.as_str())))
         .unwrap_or_else(|| panic!("{} isn't in a folder named {id}", dir.display()))
+}
+
+/// Asserts that the child reported, after `prefix`, under a second.
+fn assert_quick(child: &Child, prefix: &str) {
+    let ms: u64 = child.expect(prefix).parse().unwrap();
+    assert!(ms < 1000, "{prefix}{ms} ms");
+}
+
+/// Asserts the layout under the `Builder::dir` base `base`, whose instance
+/// folder is `key`: the base unlabelled, the instance folder and its lock
+/// labelled medium, and the address folder `run` labelled `level` (as
+/// SDDL spells it), each with its own access list, for this user and
+/// SYSTEM, and at most one label, its own.
+fn assert_layout(base: &Path, key: &Path, run: &str, level: &str) {
+    let rows = [
+        (base.to_path_buf(), "0 label ACEs".to_owned()),
+        (key.to_path_buf(), "1 label ACE: ME, explicit".to_owned()),
+        (
+            key.join("instance.lock"),
+            "1 label ACE: ME, explicit".to_owned(),
+        ),
+        (key.join(run), format!("1 label ACE: {level}, explicit")),
+    ];
+    for (path, labels) in rows {
+        let sddl = full_security(&path);
+        assert!(sddl.contains("D:P"), "{}: {sddl}", path.display());
+        assert_eq!(sddl.matches("(A;").count(), 2, "{}: {sddl}", path.display());
+        assert!(
+            sddl.ends_with(&format!("({labels})")),
+            "{}: {sddl}",
+            path.display()
+        );
+    }
 }
 
 fn claim(started: Started<Args>) -> Claim<Args> {

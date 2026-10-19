@@ -348,11 +348,13 @@ pub enum Reason {
         source: BoxError,
     },
     /// The owner and this launch failed the same-user check: the socket or
-    /// pipe at this launch's address is another user's, or, on Windows
-    /// while each integrity level has its own folder, a pipe labelled at
-    /// another level than this launch's; or the check found something else
-    /// wrong or couldn't be made. Each end checks the other, and an owner
-    /// that refuses a launch says so at once. See the crate docs on
+    /// pipe at this launch's address is another user's, or on Windows its
+    /// address folder or pipe isn't labelled at the integrity level the
+    /// owner's lock shows; or the check found something else wrong or
+    /// couldn't be made. One user at two levels isn't two users: a launch
+    /// at another level than the owner's gets [`Reason::MoreRights`] or
+    /// [`Reason::OwnerHasMoreRights`]. Each end checks the other, and an
+    /// owner that refuses a launch says so at once. See the crate docs on
     /// privileges.
     #[non_exhaustive]
     Peer {
@@ -363,6 +365,11 @@ pub enum Reason {
     /// level. The request wasn't delivered, since the owner would act on it
     /// without them. It returns at once, whatever the
     /// [timeout](crate::Builder::timeout).
+    ///
+    /// On Windows a launch usually learns this from the marker in the
+    /// owner's lock, before it connects, and then never talks to the owner:
+    /// unlike the owner's greeting, the marker can't show its app, kind or
+    /// state folder.
     #[non_exhaustive]
     MoreRights {
         /// The owner.
@@ -372,8 +379,9 @@ pub enum Reason {
     },
     /// The owner has rights this launch lacks, such as a higher integrity
     /// level. The request wasn't delivered, since the owner would act on it
-    /// with rights its launch never had. It returns at once, as
-    /// [`Reason::MoreRights`] does.
+    /// with rights its launch never had. It returns at once, and like
+    /// [`Reason::MoreRights`] can come from the owner's marker alone, which
+    /// can't show its app, kind or state folder.
     #[non_exhaustive]
     OwnerHasMoreRights {
         /// The owner.
@@ -413,9 +421,10 @@ pub enum Reason {
     #[non_exhaustive]
     NoRuntimeDir {},
     /// The runtime folder can't be created, or isn't safe: not the user's,
-    /// open to others, a symlink, or on Windows made for another integrity
-    /// level or in the profiles folder outside the user's own profile.
-    /// Another user may have created it first.
+    /// open to others, a symlink, or on Windows labelled where not every
+    /// integrity level can use it (above medium, or an instance folder at
+    /// any level but medium) or in the profiles folder outside the user's
+    /// own profile. Another user may have created it first.
     #[non_exhaustive]
     RuntimeDir {
         /// The folder.
@@ -439,18 +448,18 @@ pub enum Reason {
     /// holds the state folder's [guard](crate::Guard), but not the lock in
     /// this launch's runtime folder, so this launch can't reach it: an
     /// owner in another container, one given another [`Builder::dir`], an
-    /// owner of another app id given the same state folder, on Windows one
-    /// at another integrity level, one whose runtime folder was deleted and
-    /// isn't made again yet, or an [exclusive](crate::Builder::exclusive)
-    /// run. Or one of the two has a [scope](crate::Builder::scope) and the
-    /// other hasn't: owners with scopes share the guard only with one
-    /// another. This launch let go of its lock before anyone could connect.
-    /// Only `start` and `exclusive` take the guard.
+    /// owner of another app id given the same state folder, one whose
+    /// runtime folder was deleted and isn't made again yet, or an
+    /// [exclusive](crate::Builder::exclusive) run. Or one of the two has a
+    /// [scope](crate::Builder::scope) and the other hasn't: owners with
+    /// scopes share the guard only with one another. This launch let go of
+    /// its lock before anyone could connect. Only `start` and `exclusive`
+    /// take the guard.
     ///
     /// From `exclusive`, it is any owner of the state folder, or another
     /// exclusive run, that holds the guard. Where `exclusive` takes no
     /// guard, it is an owner or another exclusive run that holds the lock
-    /// in its runtime folder.
+    /// in its runtime folder, on Windows at any integrity level.
     ///
     /// [`Builder::dir`]: crate::Builder::dir
     /// [`Builder::start`]: crate::Builder::start

@@ -46,9 +46,8 @@
 //!   at a time, and only it gets [`Started::Owner`]. The owner also holds
 //!   the state folder's [guard](Guard), where it takes one, so a launch
 //!   that took the lock in another runtime folder (another container,
-//!   another [`Builder::dir`], another app id, or on Windows another
-//!   integrity level) doesn't own that state folder too: it runs alone at
-//!   once with [`Reason::StateInUse`].
+//!   another [`Builder::dir`] or another app id) doesn't own that state
+//!   folder too: it runs alone at once with [`Reason::StateInUse`].
 //!   Two owners that both have a [scope](Builder::scope) share the guard,
 //!   and own the state folder side by side. [`Builder::exclusive`] holds
 //!   the guard alone, where it takes one, for a process's own work, so no
@@ -76,10 +75,12 @@
 //! - Only processes of the same user at the same privilege level hand off
 //!   to each other, so a request never runs with more or fewer rights than
 //!   its launch had; see [Privileges](#privileges). On Unix both ends check
-//!   the other's user id. On Windows the owner checks the launch's token:
-//!   it refuses another user, and a launch whose token is at another
-//!   integrity level, naming its own level. The launch checks that the pipe
-//!   is its own user's, at its own integrity level.
+//!   the other's user id. On Windows every integrity level finds the one
+//!   owner, and a launch at another level than the owner's learns so at
+//!   once, from the owner's lock, and hands it nothing. The owner checks
+//!   the launch's token: it refuses another user, and a launch whose token
+//!   is at another integrity level, naming its own level. The launch checks
+//!   that the pipe is its own user's, at the level the owner's lock shows.
 //! - [`Builder::start`], [`Builder::hand_off`], [`Builder::probe`] and
 //!   [`Builder::exclusive`] never panic, whatever the
 //!   [timeout](Builder::timeout). Every failure is a [`Reason`], and
@@ -188,36 +189,37 @@
 //! get two. Should two hash alike, a launch of one that reaches the
 //! other's owner gets [`Reason::OtherApp`]: [`start`](Builder::start) runs
 //! alone with it, and [`hand_off`](Builder::hand_off) and
-//! [`probe`](Builder::probe) return it. In Local AppData on Windows, the
-//! lock is one folder further down: in `run`, or in `run-high` for a
+//! [`probe`](Builder::probe) return it. On Windows every integrity level
+//! shares the instance folder and the lock in it. The owner publishes its
+//! pipe's name in a folder of its level there: `run`, or `run-high` for a
 //! process run as administrator; see [Privileges](#privileges).
 //!
 //! [`Builder::dir`] replaces the app's folder. It is never a config folder:
 //! on Windows that roams and may be a network share, where a lock would
-//! span machines. The instance folder is made in it, and on Windows the
-//! lock is then in the instance folder itself. The owner touches its files
-//! every hour, so cleaners that go by age leave them alone, and checks
-//! every minute that its lock is still in place, re-creating it when
-//! something deleted it. On Windows nothing can: the owner holds its
-//! folder, its lock and `instance.pipe` open, sharing no delete.
+//! span machines. The instance folder is made in it, as in the app's
+//! folder. The owner touches its files every hour, so cleaners that go by
+//! age leave them alone, and checks every minute that its lock is still in
+//! place, re-creating it when something deleted it. On Windows nothing
+//! can: the owner holds its folders, its lock and `instance.pipe` open,
+//! sharing no delete.
 //!
 //! The owner also holds a lock in the state folder, on
 //! `.instance-handoff.lock`: the [guard](Guard). Launches that name one
 //! state folder can still find two runtime folders: in two containers,
-//! under two [`Builder::dir`] folders, as two app ids (an app and a
-//! companion tool that share its folder), or on Windows at two integrity
-//! levels, say. The guard keeps the second from owning the state beside the
-//! first: it runs alone at once with [`Reason::StateInUse`]. Owners with a
-//! [scope](Builder::scope) take the guard shared, so they own one state
-//! folder side by side, but never beside an owner without one. On a network
-//! file system the owner takes no guard, so each host keeps an owner of its
-//! own; on Windows that is a share, which a mapped drive resolves to, or a
-//! drive that Windows says is remote. Nor does it where the file system
-//! can't lock files: see [`Guard::Local`]. A `start` that takes the lock
-//! makes the state folder first if it is missing, private, whether or not
-//! it takes the guard. [`Builder::exclusive`] takes the guard alone, with
-//! no lock in a runtime folder; where it can't take the guard, it takes the
-//! lock in the runtime folder instead, and serves nothing.
+//! under two [`Builder::dir`] folders, or as two app ids (an app and a
+//! companion tool that share its folder), say. The guard keeps the second
+//! from owning the state beside the first: it runs alone at once with
+//! [`Reason::StateInUse`]. Owners with a [scope](Builder::scope) take the
+//! guard shared, so they own one state folder side by side, but never
+//! beside an owner without one. On a network file system the owner takes
+//! no guard, so each host keeps an owner of its own; on Windows that is a
+//! share, which a mapped drive resolves to, or a drive that Windows says is
+//! remote. Nor does it where the file system can't lock files: see
+//! [`Guard::Local`]. A `start` that takes the lock makes the state folder
+//! first if it is missing, private, whether or not it takes the guard.
+//! [`Builder::exclusive`] takes the guard alone, with no lock in a runtime
+//! folder; where it can't take the guard, it takes the lock in the runtime
+//! folder instead, and serves nothing.
 //!
 //! # Privileges
 //!
@@ -226,7 +228,7 @@
 //! owner act for a process that isn't allowed to; handed to a less
 //! privileged one, it would run without the rights the user started it
 //! with. So a launch hands off only to an owner of its own user at its own
-//! privilege level, and each level has an owner of its own:
+//! privilege level:
 //!
 //! - Unix: the level is the effective user, as the kernel reports it in the
 //!   process's own user namespace. On Linux the crate reads it, and the
@@ -238,26 +240,22 @@
 //!   and illumos, root's folder is fixed, so root's own launches and
 //!   launches under `sudo` meet one owner, whether or not root is logged in
 //!   anywhere.
-//! - Windows: the level is the user and the integrity level. A launch run
-//!   as administrator (high) uses `run-high` in the instance folder and an
-//!   owner of its own, and never reaches the normal (medium) owner; nor
-//!   does a normal launch reach an elevated one. Each level's folder is
-//!   labelled at its level, so lower levels can't read it or take its
-//!   lock. A launch also checks that the owner's pipe is labelled at its
-//!   own level, and refuses another with [`Reason::Peer`]. Levels are
-//!   compared as rights too: an owner marks its level in its lock and
-//!   names it in its greeting, and refuses a request from a launch whose
-//!   token is at another level, naming its own. A launch that finds an
-//!   owner at another level, from its lock, its greeting or its refusal,
-//!   hands it nothing and returns at once, with [`Reason::MoreRights`] when
-//!   the launch has the higher level, or [`Reason::OwnerHasMoreRights`]
-//!   when the owner has; [`Builder::probe`] reports such an owner
-//!   unconfirmed. While each level has its own folder, the crate's own
-//!   launches meet no owner at another level. Every level locks the same
-//!   [guard](Guard) in a state folder, though, so while an owner at one
-//!   level holds it, a launch at the other runs alone with
-//!   [`Reason::StateInUse`]. Below medium (low integrity, AppContainer),
-//!   launches can't make or open their folder and run alone with
+//! - Windows: the level is the user and the integrity level. Every level
+//!   shares one lock per state, in the instance folder, so a launch run as
+//!   administrator (high) and a normal (medium) one meet the same owner,
+//!   but only a launch at the owner's level hands off to it. An owner marks
+//!   its level in its lock and names it in its greeting, and refuses a
+//!   request from a launch whose token is at another level, naming its
+//!   own. A launch that finds an owner at another level, from its lock,
+//!   its greeting or its refusal, hands it nothing and runs alone at once,
+//!   with [`Reason::MoreRights`] when the launch has the higher level, or
+//!   [`Reason::OwnerHasMoreRights`] when the owner has; [`Builder::probe`]
+//!   reports such an owner unconfirmed. Each owner publishes its pipe's
+//!   name in a folder of its level, labelled at that level, so lower levels
+//!   can't read it. A launch also checks that the owner's pipe is labelled
+//!   at the level the lock shows, and refuses another with
+//!   [`Reason::Peer`]. Below medium (low integrity, AppContainer), launches
+//!   can't make or open their folder and run alone with
 //!   [`Reason::RuntimeDir`].
 //!
 //! A launch whose rights were raised from a login hands off to its level's
@@ -273,19 +271,21 @@
 //! owns when the container runs in a user namespace or was started outside
 //! a login, by a daemon such as Docker's. A container started from `sudo`
 //! with no user namespace keeps the login user id, so its root counts as
-//! raised. On Windows no launch counts as raised: an elevated one owns in
-//! its own folder.
+//! raised. On Windows no launch counts as raised: an elevated one owns when
+//! no owner runs, and normal launches then run alone with
+//! [`Reason::OwnerHasMoreRights`].
 //!
 //! Two limits:
 //!
-//! - Owners at two levels are two owners. If both read and write the same
-//!   files, keep the state apart per level, or refuse to run elevated. An
-//!   elevated and a normal process on Windows share the profile; the guard
-//!   keeps them from owning one state folder at once, unless both have a
-//!   scope. Root under `sudo -E` (or wherever `HOME` is kept) would write
-//!   into the user's home, so a state folder of the user's there, or one
-//!   root would create there, gives root [`Reason::ForeignState`] instead
-//!   of the lock.
+//! - On Unix, owners at two levels are two owners. If both read and write
+//!   the same files, keep the state apart per level, or refuse to run
+//!   elevated. Root under `sudo -E` (or wherever `HOME` is kept) would
+//!   write into the user's home, so a state folder of the user's there, or
+//!   one root would create there, gives root [`Reason::ForeignState`]
+//!   instead of the lock. On Windows an elevated and a normal process
+//!   share the profile, and launches of one state meet one owner at either
+//!   level: a launch at the other level runs alone at once, and must not
+//!   write the state.
 //! - Within one Unix user, finer privileges aren't compared: supplementary
 //!   groups (`newgrp`), capabilities and LSM confinement. A sandbox that
 //!   must keep its processes from the owner hides the runtime folder from
@@ -346,9 +346,9 @@
 //!   [`Reason::ForeignState`], and so does a missing one whose nearest
 //!   folder is there, as in a `/tmp` shared with the host.
 //! - Windows: mapped drives and `SUBST` letters belong to one logon
-//!   session, and every logon session of a user at one integrity level (a
-//!   second RDP session, an OpenSSH login, a scheduled task) reaches the
-//!   same owner. Hand off canonical paths when that matters.
+//!   session, and every logon session of a user (a second RDP session, an
+//!   OpenSSH login, a scheduled task) finds the same owner, at any
+//!   integrity level. Hand off canonical paths when that matters.
 //!
 //! # Windowed apps
 //!
@@ -390,17 +390,18 @@
 //!   [`State::dir`] resolves it, then the scope. Each is written as
 //!   `tag u8 | length u32 LE | bytes` (tag 1 for the state, 2 for the
 //!   scope), and left out when there is none. A path or a scope is its
-//!   bytes on Unix, and the WTF-8 of its UTF-16 on Windows. On Windows the
-//!   folder for an integrity level other than medium is `run-low`,
-//!   `run-high`, `run-system`, or else `run-` and the level's RID in
-//!   lowercase hex;
-//! - the lock: `flock(LOCK_EX | LOCK_NB)` on `instance.lock` on Unix, held
-//!   per open file, inherited across `fork`, and released when the last
-//!   copy closes. On Windows, exclusive `LockFileEx` locks on two bytes of
-//!   it, through one handle: byte 0, which is owning, then the byte at the
-//!   owner's integrity level's RID (0x2000 at medium), which marks its
-//!   level. An owner that can't take its marker gives byte 0 back. Closing
-//!   the handle releases both;
+//!   bytes on Unix, and the WTF-8 of its UTF-16 on Windows. On Windows
+//!   each integrity level's address folder in the instance folder is `run`
+//!   at medium, and `run-low`, `run-high`, `run-system`, or else `run-` and
+//!   the level's RID in lowercase hex at the others;
+//! - the lock: `instance.lock` in the instance folder. On Unix,
+//!   `flock(LOCK_EX | LOCK_NB)` on it, held per open file, inherited across
+//!   `fork`, and released when the last copy closes. On Windows, where
+//!   every integrity level locks the same file, exclusive `LockFileEx`
+//!   locks on two bytes of it, through one handle: byte 0, which is owning,
+//!   then the byte at the owner's integrity level's RID (0x2000 at medium),
+//!   which marks its level. An owner that can't take its marker gives byte
+//!   0 back. Closing the handle releases both;
 //! - the guard: `.instance-handoff.lock` in the state folder, never
 //!   written. On Unix, `flock(LOCK_EX | LOCK_NB)` on it, or
 //!   `flock(LOCK_SH | LOCK_NB)` for an owner with a scope, held as the lock
@@ -418,7 +419,8 @@
 //!   and inode (each a little-endian u64). On Windows, a
 //!   named pipe `\\.\pipe\instance-handoff.<id>.<secret>`, where the
 //!   secret is 32 random lowercase hex digits, published as
-//!   `<id> <secret>` and a newline in `instance.pipe` beside the lock;
+//!   `<id> <secret>` and a newline in `instance.pipe` in the address folder
+//!   of the owner's level;
 //! - the exchange. The owner sends HELLO (its app id and kind, the protocol
 //!   versions it speaks, a random nonce, its payload version, whether it
 //!   serves, on Windows its integrity level, its state folder and scope,

@@ -57,8 +57,9 @@ impl Waiting {
 /// What a launch that found the lock held does about its owner.
 #[derive(Debug)]
 enum Meet {
-    /// Connect, and talk to the owner: its pipe must be labelled at this
-    /// level. `None` where there are no levels; on Windows, no label
+    /// Connect, and talk to the owner: on Windows through the address
+    /// folder of this level, and its pipe must be labelled at this level.
+    /// `None` where there are no levels; on Windows, no folder or label
     /// matches it.
     Talk(Option<Level>),
     /// Look again until the deadline: the owner is still starting.
@@ -75,8 +76,9 @@ fn meet(own: Option<Level>, owner: OwnerLevel, probe: bool) -> Meet {
         OwnerLevel::Same => Meet::Talk(own),
         OwnerLevel::Starting => Meet::Wait,
         // Windows reads the launch's own level to look for the marker, so
-        // here it is known. Were it not, `Talk(None)` matches no pipe's
-        // label, so nothing is sent to an owner at another level.
+        // here it is known. Were it not, `Talk(None)` matches no address
+        // folder or pipe's label, so nothing is sent to an owner at another
+        // level.
         OwnerLevel::Other(owner) => match own.and_then(|own| rights(own, owner, probe)) {
             Some(answer) => Meet::Report(answer),
             None => Meet::Talk(own),
@@ -1432,9 +1434,10 @@ mod tests {
     // An owner at another level, as its marker shows it, is answered at
     // once: start and hand_off are refused, a probe is told it runs,
     // unconfirmed, and a committed launch whose owner died is handed off
-    // unconfirmed, never alone (0004). Each level still locks in its own
-    // folder, so the owner is forged: a handle that holds byte 0 and
-    // another level's marker.
+    // unconfirmed, never alone (0004). CI runs only at high and medium, so
+    // the owner is forged: a handle that holds byte 0 and the marker of a
+    // level below or above both. tests/levels.rs meets real owners at the
+    // other level.
     #[cfg(windows)]
     #[test]
     fn an_owner_at_another_level_is_answered_at_once() {
