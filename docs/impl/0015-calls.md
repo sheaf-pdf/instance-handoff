@@ -83,7 +83,12 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
 4. On Windows, `Claim::dir`, `Owner::dir` and `runtime_dir` return the shared key folder. *Recommended.*
 5. An existing key folder with no label counts as medium. *Recommended.*
 6. A `Builder::dir` base stays unlabelled, like `<LocalAppData>\<id>`. Only `i-<hash>` gets the explicit medium label. *Recommended; the label is no longer protected, as 5.8 now says.* A base labelled above medium is refused with `RuntimeDir`. *Our call.*
-7. A Local AppData that resolves into another user's profile gives `RuntimeDir`, naming the path. A redirect outside the profiles folder stays allowed. *Recommended.*
+7. A Local AppData that resolves into another user's profile gives `RuntimeDir`, naming the path. A redirect outside the profiles folder stays allowed. *Recommended.* Slice 31 settled what this leaves open. *Our call (slice 31).*
+   - Anywhere in the profiles folder (`GetProfilesDirectoryW`) outside this user's profile (`GetUserProfileDirectoryW`) counts as another user's. So Public and the profiles folder itself are refused too.
+   - Only final paths are compared, name by name and without case. A verbatim prefix or a trailing separator makes no difference.
+   - If the final path of Local AppData, the profiles folder or the user's profile can't be read, the launch goes on with a warning in the log, as for an owner that can't be read (3.2). A path with its links resolved is never compared with one without.
+   - `RuntimeDir` names Local AppData as the shell gives it. Its source names the final path.
+   - The check runs as the folder is opened, on the handle already checked to be safe. So `Builder::runtime_dir` still returns a path in it, as it does for any unsafe folder.
 8. Every label the crate sets is explicit, and none is protected. A protected label (`S:P`) needs a privilege the crate's processes don't have enabled. On Windows CI, both levels failed to make a folder with one (error 1314, run 39221106656), and the crate never enables privileges. The key folder's label doesn't inherit, so each object in it carries only its own explicit label. The SDDL tests check that each object has exactly one label. *Changed after slice 3's run.*
 
 ## 6. Across Windows levels (slices 20 to 23)

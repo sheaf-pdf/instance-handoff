@@ -341,7 +341,8 @@ pub enum Reason {
     NoRuntimeDir {},
     /// The runtime folder can't be created, or isn't safe: not the user's,
     /// open to others, a symlink, or on Windows made for another integrity
-    /// level. Another user may have created it first.
+    /// level or in the profiles folder outside the user's own profile.
+    /// Another user may have created it first.
     #[non_exhaustive]
     RuntimeDir {
         /// The folder.

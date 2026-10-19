@@ -162,7 +162,11 @@
 //! - macOS: `<id>` in the per-user temporary folder
 //!   (`confstr(_CS_DARWIN_USER_TEMP_DIR)` with its links resolved, not
 //!   `$TMPDIR`), the same for GUI apps, agents, ssh and cron.
-//! - Windows: `<id>` in the Local AppData known folder.
+//! - Windows: `<id>` in the Local AppData known folder. If Local AppData
+//!   resolves into the profiles folder (`C:\Users`) but outside the user's
+//!   own profile (into another user's profile or Public, say), launches run
+//!   alone with [`Reason::RuntimeDir`]. Redirected anywhere else, it is
+//!   used.
 //! - Android: `$TMPDIR/<id>`.
 //! - Anywhere else: nothing; launches run alone with
 //!   [`Reason::Unsupported`].

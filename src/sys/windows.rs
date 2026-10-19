@@ -8,6 +8,11 @@
 //! lose the ones the user elevated for. Each level's folder is labelled at
 //! that level, so lower levels can neither read it nor squat its lock.
 //!
+//! A launch refuses a Local AppData that resolves into the profiles folder
+//! (`C:\Users`) but outside its user's profile (into another user's
+//! profile or Public, say): its folders would sit where another user keeps
+//! files. One redirected outside the profiles folder is used.
+//!
 //! Each folder from the base down gets an access list of its own, for this
 //! user and SYSTEM, whatever its parent hands down; the missing parents of
 //! a `Builder::dir` base are made as Windows makes any folder. In Local
@@ -109,7 +114,10 @@ use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, GetCurrentThread, INFINITE, OpenProcessToken, OpenThreadToken,
     SetEvent, WaitForMultipleObjects, WaitForSingleObject,
 };
-use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+use windows_sys::Win32::UI::Shell::{
+    FOLDERID_LocalAppData, GetProfilesDirectoryW, GetUserProfileDirectoryW, KF_FLAG_DEFAULT,
+    SHGetKnownFolderPath,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, WSF_VISIBLE};
 
 use crate::id::valid_id;
@@ -497,6 +505,11 @@ pub(crate) fn final_path(path: &Path) -> io::Result<PathBuf> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
+    final_path_of(&file)
+}
+
+/// The final path of the open `file`, as [`final_path`] gives it.
+fn final_path_of(file: &File) -> io::Result<PathBuf> {
     let mut buf = vec![0u16; 260];
     loop {
         // SAFETY: an open handle, and a buffer valid for writes of its
@@ -606,6 +619,107 @@ fn is_drive(path: &[u16]) -> bool {
     path.first()
         .is_some_and(|&l| u8::try_from(l).is_ok_and(|l| l.is_ascii_alphabetic()))
         && starts_with(&path[1..], r":\")
+}
+
+/// Refuses Local AppData, open as `dir`, if its final path is in the
+/// profiles folder but outside this user's profile ([`in_another_profile`]).
+/// Only final paths are compared: where its own or a profile folder's
+/// can't be read, nothing is refused.
+fn check_profile(dir: &File) -> io::Result<()> {
+    match final_path_of(dir).and_then(|path| Ok((path, profile_folders()?))) {
+        Ok((path, (profiles, mine))) if in_another_profile(&path, &profiles, &mine) => {
+            Err(denied(&format!(
+                "{} is in the profiles folder, outside this user's profile",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => {
+            log::warn!(
+                "instance-handoff: can't read the final paths of Local AppData and the profile folders, so they aren't compared: {e}"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The profiles folder (`C:\Users`) and this user's profile, each with its
+/// links resolved. An error if either can't be read or resolved.
+fn profile_folders() -> io::Result<(PathBuf, PathBuf)> {
+    // SAFETY: `written_path` passes a buffer valid for writes of `*len` units.
+    let profiles = written_path(|buf, len| unsafe { GetProfilesDirectoryW(buf, len) })?;
+    let mut token: HANDLE = null_mut();
+    // SAFETY: the current-process pseudo handle; `token` receives a handle
+    // that `OwnedHandle` closes.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    // SAFETY: a token opened with TOKEN_QUERY, as the call needs, and a
+    // buffer valid for writes of `*len` units.
+    let mine = written_path(|buf, len| unsafe {
+        GetUserProfileDirectoryW(token.as_raw_handle(), buf, len)
+    })?;
+    Ok((final_path(&profiles)?, final_path(&mine)?))
+}
+
+/// The absolute path that `call` writes to a buffer of `*len` UTF-16
+/// units. A call that fails and asks for a longer buffer gets one.
+fn written_path(mut call: impl FnMut(*mut u16, *mut u32) -> i32) -> io::Result<PathBuf> {
+    let mut buf = vec![0u16; 260];
+    loop {
+        let mut len = buf.len() as u32;
+        if call(buf.as_mut_ptr(), &mut len) != 0 {
+            break;
+        }
+        let e = io::Error::last_os_error();
+        if len as usize <= buf.len() {
+            return Err(e);
+        }
+        buf.resize(len as usize, 0);
+    }
+    let n = buf.iter().position(|&u| u == 0).unwrap_or(buf.len());
+    let path = PathBuf::from(OsString::from_wide(&buf[..n]));
+    if !path.is_absolute() {
+        return Err(io::Error::other(format!(
+            "not absolute: {}",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+/// Whether the folder `path` is in the profiles folder `profiles`, or is
+/// that folder, but isn't in `mine`, this user's profile: it is then in
+/// another user's profile, in Public, or where one may be made. Names are
+/// compared whole and without case, and a verbatim prefix or a trailing
+/// separator makes no difference.
+fn in_another_profile(path: &Path, profiles: &Path, mine: &Path) -> bool {
+    let names = |path: &Path| -> Vec<Vec<u16>> {
+        plain_path(path.as_os_str().encode_wide().collect())
+            .components()
+            .map(|name| upper(name.as_os_str()))
+            .collect()
+    };
+    let path = names(path);
+    path.starts_with(&names(profiles)) && !path.starts_with(&names(mine))
+}
+
+/// `name` with each UTF-16 unit made upper case on its own, as NTFS
+/// compares names, near enough. A letter whose capital isn't one unit,
+/// such as `ß`, is kept.
+fn upper(name: &OsStr) -> Vec<u16> {
+    name.encode_wide()
+        .map(|unit| {
+            let mut up = char::from_u32(u32::from(unit))
+                .into_iter()
+                .flat_map(char::to_uppercase);
+            match (up.next(), up.next()) {
+                (Some(c), None) => u16::try_from(u32::from(c)).unwrap_or(unit),
+                _ => unit,
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -812,8 +926,9 @@ fn create_file_with_sd(path: &Path, sddl: &str) -> io::Result<File> {
 pub(crate) fn open_folder(place: &Place, create: bool) -> Result<Option<Folder>, Reason> {
     let mut path = place.base.clone();
     let missing = |e: &io::Error| e.kind() == io::ErrorKind::NotFound && !create;
-    // Local AppData isn't the crate's, so it need only be safe. A
-    // `Builder::dir` base is, and belongs to this process's level.
+    // Local AppData isn't the crate's, so it need only be safe, and not in
+    // the profiles folder outside this user's profile. A `Builder::dir`
+    // base is the crate's, and belongs to this process's level.
     let made = (place.kind == Base::Create).then_some(Role::Level);
     if let (Some(role), true) = (made, create) {
         if let Some(parent) = path.parent() {
@@ -821,7 +936,14 @@ pub(crate) fn open_folder(place: &Place, create: bool) -> Result<Option<Folder>,
         }
         create_private_dir(&path, role).map_err(|e| Reason::runtime_dir(&path, e))?;
     }
-    let mut dir = match open_dir(&path).and_then(|d| check_dir(&d, made).map(|()| d)) {
+    let checked = |dir: File| {
+        check_dir(&dir, made)?;
+        if place.kind == Base::Known {
+            check_profile(&dir)?;
+        }
+        Ok(dir)
+    };
+    let mut dir = match open_dir(&path).and_then(checked) {
         Ok(dir) => dir,
         Err(e) if missing(&e) => return Ok(None),
         Err(e) => return Err(Reason::runtime_dir(&path, e)),
@@ -2252,12 +2374,20 @@ mod tests {
     }
 
     // The level folder comes last, below the instance folder that every
-    // level shares.
+    // level shares. The runner's Local AppData is in the profiles folder,
+    // so the profile check is live, and in the runner's own profile, so it
+    // passes.
     #[test]
     fn the_default_folder_passes_the_check() {
         let mut place = default_place(&AppId::headless(APP)).unwrap();
         let base = open_dir(&place.base).unwrap();
         check_dir(&base, None).unwrap();
+        let (profiles, mine) = profile_folders().unwrap();
+        let local = final_path(&place.base).unwrap();
+        let nowhere = Path::new(r"\\nowhere\x");
+        assert!(in_another_profile(&local, &profiles, nowhere), "{local:?}");
+        assert!(!in_another_profile(&local, &profiles, &mine), "{local:?}");
+        check_profile(&base).unwrap();
         let level = level_folder(me().unwrap().integrity);
         place.push(KEY);
         assert_eq!(place.path(), place.base.join(APP).join(KEY).join(level));
@@ -2559,6 +2689,67 @@ mod tests {
             assert_ne!(unsafe { ConvertStringSidToSidW(s.as_ptr(), &mut sid) }, 0);
             let _sid = Local(sid);
             assert_eq!(trusted(sid, me), want, "{sid_string}");
+        }
+    }
+
+    // Where Local AppData may lead, for alice, whose profile is
+    // C:\Users\alice unless a row says otherwise. A redirect outside the
+    // profiles folder is allowed.
+    #[test]
+    fn local_appdata_in_another_users_profile_is_refused() {
+        let (users, alice) = (r"C:\Users", r"C:\Users\alice");
+        // The same folders verbatim, and with trailing separators.
+        let (users_v, alice_v) = (r"\\?\C:\Users", r"\\?\C:\Users\alice");
+        let (users_t, alice_t) = (r"C:\Users\", r"C:\Users\alice\");
+        // (case, Local AppData's final path, profiles folder, this user's
+        // profile, refused)
+        #[rustfmt::skip]
+        let rows = [
+            ("her own", r"C:\Users\alice\AppData\Local", users, alice, false),
+            ("bob's", r"C:\Users\bob\AppData\Local", users, alice, true),
+            ("Public", r"C:\Users\Public\AppData\Local", users, alice, true),
+            ("the profiles folder", r"C:\Users", users, alice, true),
+            ("her own, other case", r"c:\USERS\Alice\appdata\local", users, alice, false),
+            ("bob's, other case", r"c:\users\BOB\AppData\Local", users, alice, true),
+            ("JÜRGEN, for jürgen", r"C:\Users\JÜRGEN\AppData", users, r"C:\Users\jürgen", false),
+            ("her own, verbatim", r"\\?\C:\Users\alice\AppData\Local", users, alice, false),
+            ("bob's, verbatim", r"\\?\C:\Users\bob\AppData\Local", users, alice, true),
+            ("verbatim folders", r"C:\Users\alice\AppData\Local", users_v, alice_v, false),
+            ("bob's, verbatim folders", r"C:\Users\bob\AppData\Local", users_v, alice_v, true),
+            ("her own, trailing", r"C:\Users\alice\AppData\Local\", users_t, alice_t, false),
+            ("bob's, trailing", r"C:\Users\bob\", users_t, alice_t, true),
+            ("alice's, for al", r"C:\Users\alice\AppData\Local", users, r"C:\Users\al", true),
+            ("beside the profiles folder", r"C:\Users2\bob\AppData\Local", users, alice, false),
+            ("on another drive", r"D:\Data\alice\Local", users, alice, false),
+            ("on a share", r"\\server\share\alice\Local", users, alice, false),
+            ("her own, elsewhere", r"D:\Profiles\alice\Local", users, r"D:\Profiles\alice", false),
+            ("bob's, hers elsewhere", r"C:\Users\bob", users, r"D:\Profiles\alice", true),
+        ];
+        for (case, path, profiles, mine, refused) in rows {
+            let got = in_another_profile(Path::new(path), Path::new(profiles), Path::new(mine));
+            assert_eq!(got, refused, "{case}: {path}");
+        }
+    }
+
+    // A Local AppData that is the profiles folder itself is refused when it
+    // is opened. C:\Users is SYSTEM's and read-only to others, so it is safe
+    // and only the profile check refuses it. Nothing is created, so the
+    // runner's C:\Users is left as it is even if the check fails to refuse.
+    #[test]
+    fn local_appdata_in_the_profiles_folder_is_refused_when_opened() {
+        let (profiles, _) = profile_folders().unwrap();
+        let place = Place {
+            base: profiles.clone(),
+            kind: Base::Known,
+            subs: vec![APP.into(), KEY.into()],
+            level: Some(level_folder(me().unwrap().integrity).into()),
+        };
+        match open_folder(&place, false) {
+            Err(Reason::RuntimeDir { path, source }) => {
+                assert_eq!(path, profiles);
+                assert!(source.to_string().contains("profiles folder"), "{source}");
+            }
+            other => panic!("{other:?}"),
         }
     }
 
