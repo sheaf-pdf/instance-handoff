@@ -33,6 +33,13 @@ test:
 test-medium:
     pwsh -NoProfile -File .github/scripts/test-at-medium.ps1
 
+# The probe in tests/levels.rs reports what a medium process may do with a
+# high one's files, folders and locks, and the reverse. Needs an elevated
+# process.
+# Windows only: probe what each integrity level may do with the other's files.
+levels:
+    cargo test --locked --all-features --test levels -- --ignored --nocapture
+
 # Build the API docs, failing on warnings.
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features

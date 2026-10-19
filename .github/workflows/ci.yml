@@ -67,6 +67,9 @@ jobs:
       - name: Test at medium integrity
         if: matrix.os == 'windows-latest'
         run: just test-medium
+      - name: Probe what each integrity level may do with the other's files
+        if: matrix.os == 'windows-latest'
+        run: just levels
 
   msrv:
     name: Minimum Rust version

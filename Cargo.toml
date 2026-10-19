@@ -51,5 +51,20 @@ tokio = { version = "1.38", features = ["rt", "sync", "macros", "signal"] }
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2.170"
 
+# tests/levels.rs starts children at medium integrity and probes labels and
+# locks.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_AppLocker",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
 [package.metadata.docs.rs]
 all-features = true
