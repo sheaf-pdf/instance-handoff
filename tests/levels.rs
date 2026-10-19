@@ -27,8 +27,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use instance_handoff::{
-    AppId, Args, Builder, Claim, ElevatedOwner, Kind, Level, Payload, Reason, Rights, Started,
-    State,
+    AppId, Args, Builder, Claim, ElevatedOwner, Ineligible, Kind, Level, Payload, Reason, Rights,
+    Started, State,
 };
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_NO_SUCH_LOGON_SESSION, GENERIC_READ,
@@ -129,7 +129,7 @@ fn a_medium_launch_never_hands_off_to_a_high_owner() {
         return;
     }
     let id = app("high-owner");
-    let claim = claim(Builder::new(id.clone(), State::none()).start(&Args::default()));
+    let claim = claim(at_high(id.clone(), State::none()).start(&Args::default()));
     let key = claim.dir().to_path_buf();
     assert!(key.join("instance.lock").is_file(), "{}", key.display());
     assert!(key.join("run-high").join("instance.pipe").is_file());
@@ -169,7 +169,7 @@ fn a_high_launch_never_hands_off_to_a_medium_owner() {
     assert!(key.join("run").join("instance.pipe").is_file());
     let base = app_folder(&key, &id).to_path_buf();
 
-    let high = Builder::new(id, State::none());
+    let high = at_high(id, State::none());
     let t = Instant::now();
     match high.start(&Args::new(["from-high"])) {
         Started::Alone(Reason::MoreRights { owner, .. }) => {
@@ -271,7 +271,7 @@ fn a_folder_made_at_one_level_is_shared_by_the_other() {
 
     let high = tmp.path().join("high");
     let claim = claim(
-        Builder::new(APP, State::none())
+        at_high(APP, State::none())
             .dir(&high)
             .start(&Args::default()),
     );
@@ -334,7 +334,7 @@ fn levels_take_turns_owning_one_state() {
         (DIR, dir.as_os_str()),
         (STATE, state.as_os_str()),
     ];
-    let high = Builder::new(APP, state.as_path()).dir(&dir);
+    let high = at_high(APP, state.as_path()).dir(&dir);
 
     let first = claim(high.start(&Args::default()));
     assert!(first.guarded());
@@ -394,7 +394,7 @@ fn the_guard_holds_across_levels() {
         (DIR, at_medium.as_os_str()),
         (STATE, state.as_os_str()),
     ];
-    let high = Builder::new(APP, state.as_path()).dir(tmp.path().join("high"));
+    let high = at_high(APP, state.as_path()).dir(tmp.path().join("high"));
 
     // High owns first, and makes the state folder and the guard file.
     let owner = claim(high.start(&Args::default()));
@@ -430,11 +430,9 @@ fn a_low_launch_is_excluded() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("dir");
-    // Allowed any rights, so that it owns at high with UAC on too.
     let claim = claim(
-        Builder::new(APP, State::none())
+        at_high(APP, State::none())
             .dir(&dir)
-            .elevated_owner(ElevatedOwner::Allow)
             .start(&Args::default()),
     );
     let (tx, rx) = mpsc::channel();
@@ -453,6 +451,79 @@ fn a_low_launch_is_excluded() {
     child.finish();
     assert!(rx.try_recv().is_err(), "the owner took a low launch");
     owner.release();
+}
+
+// Under NotAboveNormal no launch at high owns. With nobody owning, start
+// runs alone at once with MayNotOwn, and exclusive fails with it, both
+// making nothing. Beside a medium owner, start hands off as hand_off
+// does: MoreRights, or with hand_down the request handed down. By default
+// only a raised launch, with the full half of a split token, is kept from
+// owning: CI's runner, the built-in Administrator, isn't raised, so the
+// expectations come from this process's own token, and only a machine
+// with UAC on shows the raised case.
+#[test]
+fn raised_and_not_above_normal_at_high() {
+    if !elevated() {
+        return;
+    }
+    let raised = full_token();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("dir");
+    let high = Builder::new(APP, State::none()).dir(&dir);
+    let strict = high.clone().elevated_owner(ElevatedOwner::NotAboveNormal);
+    // Raised comes before above normal.
+    let why = if raised {
+        Ineligible::Raised
+    } else {
+        Ineligible::AboveNormal
+    };
+
+    let t = Instant::now();
+    match strict.start(&Args::default()) {
+        Started::Alone(Reason::MayNotOwn { why: got, .. }) => assert_eq!(got, why),
+        other => panic!("{}", describe(&other)),
+    }
+    match strict.exclusive() {
+        Err(Reason::MayNotOwn { why: got, .. }) => assert_eq!(got, why),
+        other => panic!("{other:?}"),
+    }
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert!(!dir.exists(), "a launch that may not own made its folder");
+
+    match high.start(&Args::default()) {
+        Started::Owner(claim) if !raised => claim.release(),
+        Started::Alone(Reason::MayNotOwn {
+            why: Ineligible::Raised,
+            ..
+        }) if raised => {}
+        other => panic!("raised {raised}: {}", describe(&other)),
+    }
+
+    let id = APP;
+    let env = [(ID, OsStr::new(id.as_str())), (DIR, dir.as_os_str())];
+    let mut child = medium("child_owner", &env);
+    child.expect("owner ");
+    let t = Instant::now();
+    match strict.start(&Args::new(["kept"])) {
+        Started::Alone(Reason::MoreRights { .. }) => {}
+        other => panic!("{}", describe(&other)),
+    }
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    let given = Rights::Level {
+        launch: Level::HIGH,
+        owner: Level::MEDIUM,
+    };
+    let down = Args::new(["handed down"]);
+    match strict.clone().hand_down(true).start(&down) {
+        Started::HandedOff(info) => assert_eq!(info.handed_down(), Some(&given)),
+        other => panic!("{}", describe(&other)),
+    }
+    assert_eq!(
+        child.expect("took "),
+        format!("{down:?}, handed down {:?}", Some(&given))
+    );
+    let rest = child.finish();
+    assert!(!rest.iter().any(|l| l.starts_with("took ")), "{rest:?}");
 }
 
 /// A medium owner identifies a high launch from its token, though the
@@ -890,6 +961,24 @@ fn app(name: &str) -> AppId {
         Kind::Headless,
     )
     .unwrap()
+}
+
+/// A builder for high's launches that must be able to own. With UAC on,
+/// high is the full half of a split token, which by default doesn't own,
+/// so this allows any rights. CI's runner, the built-in Administrator,
+/// isn't raised, and owns either way.
+fn at_high(id: AppId, state: impl Into<State>) -> Builder {
+    Builder::new(id, state).elevated_owner(ElevatedOwner::Allow)
+}
+
+/// Whether this process's token is the full half of a split one, as Run
+/// as administrator gives with UAC on: the crate counts it as raised.
+fn full_token() -> bool {
+    let token = own_token();
+    // SAFETY: the class's information is a TOKEN_ELEVATION_TYPE, a number.
+    let elevation =
+        unsafe { token_value::<TOKEN_ELEVATION_TYPE>(token.as_raw_handle(), TokenElevationType) };
+    elevation.unwrap() == TokenElevationTypeFull
 }
 
 /// The folder named after `id` that `dir` is in: the one the crate made

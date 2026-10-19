@@ -172,22 +172,33 @@ pub enum ElevatedOwner {
     /// ([`Ineligible::Raised`]). On Unix that is root whose person is
     /// known and isn't root: `sudo`, `run0`, `pkexec`, `doas`, and on Linux
     /// `su`. Root's own login and systemd's services still own. On Windows
-    /// no launch counts as raised. See the crate docs on privileges, which
-    /// also cover containers.
+    /// it is a launch with the full half of a token that UAC split: Run as
+    /// administrator, or Windows `sudo`, with UAC on. An administrator with
+    /// UAC off has no split token, and nor has the built-in Administrator
+    /// unless Admin Approval Mode covers it, so their elevated launches
+    /// still own. An elevated OpenSSH logon owns too if, as expected, its
+    /// token isn't split. See the crate docs on privileges, which also
+    /// cover containers.
     ///
     /// [`Ineligible::Raised`]: crate::Ineligible::Raised
     #[default]
     NotRaised,
     /// Also no owner with more rights than a normal process
     /// ([`Ineligible::AboveNormal`]): on Unix, no root launch owns, so
-    /// root never keeps the state. On Windows this is the same as
-    /// `NotRaised`.
+    /// root never keeps the state. On Windows no launch above medium
+    /// integrity owns, raised or not, though one at the UIAccess level
+    /// ([`Level::UI_ACCESS`], medium with UIAccess), as accessibility tools
+    /// run, still does. Medium plus counts as above medium, and so does
+    /// high with UIAccess.
     ///
     /// [`Ineligible::AboveNormal`]: crate::Ineligible::AboveNormal
+    /// [`Level::UI_ACCESS`]: crate::Level::UI_ACCESS
     NotAboveNormal,
     /// A launch's rights never keep it from owning. A launch under `sudo`
     /// becomes root's owner when root has none, and root's later launches
-    /// hand off to it.
+    /// hand off to it. On Windows a launch run as administrator becomes
+    /// the owner when nobody is, and normal launches then run alone with
+    /// [`Reason::OwnerHasMoreRights`].
     Allow,
 }
 

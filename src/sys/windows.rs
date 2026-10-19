@@ -131,10 +131,10 @@ use windows_sys::Win32::Security::Cryptography::{
 use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, GetSidSubAuthority,
     GetSidSubAuthorityCount, GetTokenInformation, IsWellKnownSid, LABEL_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PSID, RevertToSelf, SECURITY_ATTRIBUTES, TOKEN_MANDATORY_LABEL,
-    TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenIsAppContainer, TokenRestrictedSids,
-    TokenSessionId, TokenUser, WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid,
-    WinCreatorOwnerSid, WinLocalSystemSid,
+    OWNER_SECURITY_INFORMATION, PSID, RevertToSelf, SECURITY_ATTRIBUTES, TOKEN_ELEVATION_TYPE,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenElevationType, TokenElevationTypeFull,
+    TokenIntegrityLevel, TokenIsAppContainer, TokenRestrictedSids, TokenSessionId, TokenUser,
+    WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid, WinCreatorOwnerSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DELETE, FILE_ADD_FILE,
@@ -338,14 +338,26 @@ fn sandbox(token: HANDLE) -> io::Result<Sandbox> {
     })
 }
 
+/// Whether UAC split a token, and if so which half it is. Only this
+/// process's own token is read so: an owner doesn't ask it of a client.
+fn elevation_type(token: HANDLE) -> io::Result<TOKEN_ELEVATION_TYPE> {
+    // The class's information is one TOKEN_ELEVATION_TYPE, an i32.
+    Ok(token_u32(token, TokenElevationType)? as TOKEN_ELEVATION_TYPE)
+}
+
 /// This process's token, as read once.
 struct Me {
     id: Identity,
     sandbox: Sandbox,
+    /// Its `TokenElevationType`, or `None` where it couldn't be read.
+    elevation: Option<TOKEN_ELEVATION_TYPE>,
 }
 
-/// This process's user and integrity level, and what a sandbox did to its
-/// token. If any of them can't be read, none is (call 7.8).
+/// This process's user and integrity level, what a sandbox did to its
+/// token, and its elevation type. If the user, the level or the sandbox
+/// can't be read, none is (call 7.8). An elevation type that can't be read
+/// is `None`, and leaves the rest read: it only keeps a launch from owning
+/// (call 7.5).
 fn mine() -> io::Result<&'static Me> {
     static ME: OnceLock<Result<Me, i32>> = OnceLock::new();
     let me = ME.get_or_init(|| {
@@ -358,7 +370,11 @@ fn mine() -> io::Result<&'static Me> {
         let token = unsafe { OwnedHandle::from_raw_handle(token) };
         let raw = token.as_raw_handle();
         match (identity(raw), sandbox(raw)) {
-            (Ok(id), Ok(sandbox)) => Ok(Me { id, sandbox }),
+            (Ok(id), Ok(sandbox)) => Ok(Me {
+                id,
+                sandbox,
+                elevation: elevation_type(raw).ok(),
+            }),
             (Err(e), _) | (_, Err(e)) => Err(e.raw_os_error().unwrap_or(0)),
         }
     });
@@ -371,18 +387,29 @@ fn me() -> io::Result<&'static Identity> {
     mine().map(|me| &me.id)
 }
 
-/// Whether this launch's rights were raised from a login. Elevation isn't
-/// read here, so no launch is: an elevated one owns when nobody does, and
-/// launches at other levels then find it.
-pub(crate) fn raised() -> bool {
-    false
+/// Whether a token of this elevation type has rights raised from a login:
+/// it is the full half of a token that UAC split, as Run as administrator
+/// and Windows `sudo` give an administrator. A token that UAC didn't split
+/// isn't, though it may be at high integrity: any administrator's with UAC
+/// off, the built-in Administrator's (RID 500) unless Admin Approval Mode
+/// covers it, and, as expected but not yet measured, an elevated OpenSSH
+/// logon's. Nor is a type this doesn't know, or one that couldn't be read,
+/// since this only keeps launches from owning.
+fn raised_from(elevation: Option<TOKEN_ELEVATION_TYPE>) -> bool {
+    elevation == Some(TokenElevationTypeFull)
 }
 
-/// Whether this launch has more rights than a normal process. Integrity
-/// levels aren't compared here, so no launch has: a launch at any level
-/// may own, and launches at the others find it.
+/// Whether this launch's rights were raised from a login: its token is
+/// the full half of a split one.
+pub(crate) fn raised() -> bool {
+    mine().is_ok_and(|me| raised_from(me.elevation))
+}
+
+/// Whether this launch has more rights than a normal process: its
+/// integrity level is above medium, and isn't UIAccess. A launch whose
+/// level couldn't be read hasn't.
 pub(crate) fn above_normal() -> bool {
-    false
+    level().is_some_and(crate::Level::above_normal)
 }
 
 /// Why a process whose token has this integrity level and `sandbox` may
@@ -4005,6 +4032,92 @@ mod tests {
         // SAFETY: tokens open for query.
         assert_eq!(unsafe { IsTokenRestricted(basic.as_raw_handle()) }, 0);
         assert_ne!(unsafe { IsTokenRestricted(restricted.as_raw_handle()) }, 0);
+    }
+
+    // Only the full half of a token that UAC split is raised.
+    #[test]
+    fn raised_launches() {
+        use windows_sys::Win32::Security::{TokenElevationTypeDefault, TokenElevationTypeLimited};
+        let (full, limited, default) = (
+            Some(TokenElevationTypeFull),
+            Some(TokenElevationTypeLimited),
+            Some(TokenElevationTypeDefault),
+        );
+        // (launch, elevation type, raised)
+        let rows = [
+            ("Run as administrator, UAC on", full, true),
+            ("Windows sudo", full, true),
+            ("an administrator's normal launch", limited, false),
+            ("the built-in Administrator (RID 500)", default, false),
+            ("RID 500 under Admin Approval Mode, elevated", full, true),
+            ("an administrator, UAC off", default, false),
+            ("an elevated OpenSSH logon, as expected", default, false),
+            ("a standard user", default, false),
+            ("a type Windows might add", Some(4), false),
+            ("unread", None, false),
+        ];
+        for (launch, elevation, raised) in rows {
+            assert_eq!(raised_from(elevation), raised, "{launch}: {elevation:?}");
+        }
+    }
+
+    // The elevation type is read, and raised and above_normal agree with
+    // facts read apart from it: only a split token has a linked half, and
+    // only its full half is elevated; the tests run at medium, or at high
+    // or above. On CI's runner both tokens are unsplit, of the default
+    // type: the built-in Administrator's at high, and the SAFER token of
+    // the medium run (docs/design/0015-windows-measurements.md). So
+    // neither run is raised there, and only the high one is above normal.
+    // Only a machine with UAC on has a full token to show.
+    #[test]
+    fn the_tests_elevation_type_is_read() {
+        use crate::Level;
+        use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
+        use windows_sys::Win32::Security::{
+            TOKEN_ELEVATION, TOKEN_LINKED_TOKEN, TokenElevation, TokenElevationTypeDefault,
+            TokenElevationTypeLimited, TokenLinkedToken,
+        };
+        let me = mine().unwrap();
+        let level = Level::from_rid(me.id.integrity);
+        let Some(elevation) = me.elevation else {
+            panic!("no elevation type at {level}");
+        };
+        let types = [
+            TokenElevationTypeDefault,
+            TokenElevationTypeFull,
+            TokenElevationTypeLimited,
+        ];
+        assert!(types.contains(&elevation), "type {elevation}");
+
+        let mut token: HANDLE = null_mut();
+        // SAFETY: the current-process pseudo handle; `token` receives a
+        // handle that `OwnedHandle` closes.
+        let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        assert_ne!(ok, 0, "OpenProcessToken: {}", io::Error::last_os_error());
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let split = match token_info(token.as_raw_handle(), TokenLinkedToken) {
+            Ok(info) => {
+                // SAFETY: the buffer holds a TOKEN_LINKED_TOKEN, whose
+                // handle the call opened for the caller to close.
+                let linked = unsafe { (*(info.as_ptr() as *const TOKEN_LINKED_TOKEN)).LinkedToken };
+                drop(unsafe { OwnedHandle::from_raw_handle(linked) });
+                true
+            }
+            Err(e) if e.raw_os_error() == Some(ERROR_NO_SUCH_LOGON_SESSION as i32) => false,
+            Err(e) => panic!("TokenLinkedToken: {e}"),
+        };
+        let info = token_info(token.as_raw_handle(), TokenElevation).unwrap();
+        // SAFETY: the buffer holds a TOKEN_ELEVATION.
+        let elevated = unsafe { (*(info.as_ptr() as *const TOKEN_ELEVATION)).TokenIsElevated } != 0;
+        let facts = format!("type {elevation}, split {split}, elevated {elevated}, {level}");
+        assert_eq!(split, elevation != TokenElevationTypeDefault, "{facts}");
+        assert_eq!(raised(), split && elevated, "{facts}");
+
+        if level == Level::MEDIUM {
+            assert!(!above_normal(), "{facts}");
+        } else if level >= Level::HIGH {
+            assert!(above_normal(), "{facts}");
+        }
     }
 
     // Whose folders a launch may keep its state in, by owner SID.

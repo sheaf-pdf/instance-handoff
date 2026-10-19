@@ -319,9 +319,17 @@
 //! owns when the container runs in a user namespace or was started outside
 //! a login, by a daemon such as Docker's. A container started from `sudo`
 //! with no user namespace keeps the login user id, so its root counts as
-//! raised. On Windows no launch counts as raised: an elevated one owns when
-//! no owner runs, and normal launches then run alone with
-//! [`Reason::OwnerHasMoreRights`].
+//! raised. On Windows that is a launch with the full half of a token that
+//! UAC split, as Run as administrator and Windows `sudo` give an
+//! administrator with UAC on. An administrator with UAC off has no split
+//! token, and nor has the built-in Administrator (RID 500) unless Admin
+//! Approval Mode covers it, so their elevated launches still own when no
+//! owner runs, and normal launches then run alone with
+//! [`Reason::OwnerHasMoreRights`]. An elevated OpenSSH logon owns too if,
+//! as expected, its token isn't split. Under
+//! [`ElevatedOwner::NotAboveNormal`] none of these own: on Windows no
+//! launch above medium integrity owns, except one at the UIAccess level
+//! ([`Level::UI_ACCESS`]), and on Unix no root launch does.
 //!
 //! Two limits:
 //!

@@ -1544,7 +1544,8 @@ mod tests {
         }
     }
 
-    // Raised: rights raised from a login. Above normal: root, on Unix.
+    // Raised: rights raised from a login. Above normal: root on Unix, and
+    // above medium, except UIAccess, on Windows.
     #[test]
     fn who_may_own() {
         use ElevatedOwner::*;

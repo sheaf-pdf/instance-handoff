@@ -253,13 +253,14 @@ pub enum Ineligible {
     /// [windowed]: crate::Kind::Windowed
     /// [`ElevatedOwner`]: crate::ElevatedOwner
     NoWindows,
-    /// Its rights were raised from a login, as under `sudo`, and
-    /// [`ElevatedOwner::Allow`] wasn't set.
+    /// Its rights were raised from a login, as under `sudo` or, with UAC
+    /// on, Run as administrator, and [`ElevatedOwner::Allow`] wasn't set.
     ///
     /// [`ElevatedOwner::Allow`]: crate::ElevatedOwner::Allow
     Raised,
-    /// It has more rights than a normal process (on Unix, it is root), under
-    /// [`ElevatedOwner::NotAboveNormal`].
+    /// It has more rights than a normal process (on Unix, it is root; on
+    /// Windows, its integrity level is above medium, and isn't UIAccess),
+    /// under [`ElevatedOwner::NotAboveNormal`].
     ///
     /// [`ElevatedOwner::NotAboveNormal`]: crate::ElevatedOwner::NotAboveNormal
     AboveNormal,

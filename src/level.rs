@@ -40,6 +40,15 @@ impl Level {
     pub(crate) const fn from_rid(rid: u32) -> Level {
         Level(rid)
     }
+
+    /// Whether a process at this level has more rights than a normal one:
+    /// it is above medium, and isn't UIAccess, which accessibility tools
+    /// run at to reach other windows. Medium plus counts as above (call
+    /// 7.5).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn above_normal(self) -> bool {
+        self > Level::MEDIUM && self != Level::UI_ACCESS
+    }
 }
 
 impl fmt::Display for Level {
@@ -136,6 +145,28 @@ mod tests {
         );
         assert_eq!(Level(0x3010).to_string(), "0x3010");
         assert_eq!(Level(0).to_string(), "0x0");
+    }
+
+    // Above medium is above normal, except UIAccess (call 7.5).
+    #[test]
+    fn levels_above_medium_but_ui_access_are_above_normal() {
+        // (level, above normal)
+        let rows = [
+            (Level(0), false),
+            (Level::LOW, false),
+            (Level::MEDIUM, false),
+            (Level::UI_ACCESS, false),
+            (Level::MEDIUM_PLUS, true),
+            (Level::HIGH, true),
+            // High with UIAccess.
+            (Level(0x3010), true),
+            (Level::SYSTEM, true),
+            // A protected process.
+            (Level(0x5000), true),
+        ];
+        for (level, above) in rows {
+            assert_eq!(level.above_normal(), above, "{level}");
+        }
     }
 
     // The RIDs Windows defines. UIAccess has no constant of its own: it is

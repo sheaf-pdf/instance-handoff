@@ -163,7 +163,11 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
    - The docs say "a setuid or setgid program that runs with its rights", not "a setuid or setgid program", for the cases above.
 3. **Raised on Unix.** `SUDO_UID`, `PKEXEC_UID`, `DOAS_USER` and `loginuid` are enough for 0.1. `su` on the BSDs and macOS goes undetected, since they have no `loginuid`. `run0` sets `SUDO_UID`: its man page lists it, with `SUDO_USER` and `SUDO_GID`, since systemd 256 (checked in slice 34 against systemd 259). *Our call.* A variable that isn't a number, or a `DOAS_USER` that names no user, counts as unset. *Our call (slice 34).*
 4. On Unix, `NotAboveNormal` means no root owner. *Recommended.*
-5. UIAccess (0x2010) may own under `NotAboveNormal`, as the sketch says. MEDIUM_PLUS (0x2100) counts as above normal. *Our call.*
+5. UIAccess (0x2010) may own under `NotAboveNormal`, as the sketch says. MEDIUM_PLUS (0x2100) counts as above normal. *Our call.* Slice 35 settled what this leaves open. *Our call (slice 35).*
+   - Only 0x2010 itself is UIAccess. Any other level above medium, high with UIAccess (0x3010) among them, is above normal. A level that can't be read isn't.
+   - A Windows launch is raised only when its token's elevation type is `TokenElevationTypeFull`. A type that can't be read, or one Windows might add, isn't, as on Unix a person the launch can't see isn't (7.3): this only keeps launches from owning.
+   - Only a launch's own elevation type is read, once, with its user, level and sandbox (7.8); an owner doesn't read a client's. One that can't be read leaves the rest read.
+   - The docs don't promise all that R36 says of unsplit tokens. The built-in Administrator's token is split, and its Run as administrator raised, when Admin Approval Mode covers it (`FilterAdministratorToken`); the runner has it off. An elevated OpenSSH logon isn't measured, so the docs give its default type as expected; slice 46 reads it.
 6. **Can show windows.** Unknown counts as able everywhere.
    - Linux and the BSDs: `DISPLAY` or `WAYLAND_DISPLAY` is set.
    - macOS: `SessionGetInfo`'s graphic-access bit.
