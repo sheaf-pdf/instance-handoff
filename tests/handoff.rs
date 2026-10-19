@@ -154,11 +154,10 @@ fn probe_reports_each_state() {
 #[test]
 fn stop_closes_the_channel_and_tells_on_end() {
     let dir = dir();
-    let ended = Arc::new(Mutex::new(None));
-    let seen = ended.clone();
+    let (end_tx, end_rx) = mpsc::channel();
     let (tx, rx) = mpsc::channel::<Request<Args>>();
     let owner = claim(builder(&dir).start(&Args::default()))
-        .on_end(move |why| *seen.lock().unwrap() = Some(why))
+        .on_end(move |why| end_tx.send(why).unwrap())
         .serve(move |r| tx.send(r).is_ok());
     owner.stop();
     assert!(owner.is_stopped());
@@ -167,8 +166,12 @@ fn stop_closes_the_channel_and_tells_on_end() {
         rx.recv_timeout(Duration::from_secs(2)),
         Err(mpsc::RecvTimeoutError::Disconnected)
     ));
+    // Set before the handler is dropped; on_end runs just after the drop.
     assert_eq!(owner.ended(), Some(End::Stopped));
-    assert_eq!(*ended.lock().unwrap(), Some(End::Stopped));
+    assert_eq!(
+        end_rx.recv_timeout(Duration::from_secs(2)),
+        Ok(End::Stopped)
+    );
 
     let t = Instant::now();
     let reason = alone(builder(&dir).timeout(SHORT).start(&args(&["late"])));
