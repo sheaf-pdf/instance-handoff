@@ -10,6 +10,7 @@
 #![cfg_attr(not(any(unix, windows)), allow(unused))]
 
 use std::error::Error;
+use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::Arc;
 
@@ -25,10 +26,13 @@ fn main() {}
 #[cfg(any(unix, windows))]
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::from_env();
+    let state = state_dir().ok_or(
+        "nowhere to keep the state: set HOME (LOCALAPPDATA on Windows) to an absolute path",
+    )?;
     // Blocks for a few milliseconds, and at most the timeout plus a few
     // seconds: before the runtime, not on a worker. Inside a runtime, use
     // spawn_blocking.
-    let claim = match Builder::new(APP, State::none()).start(&args) {
+    let claim = match Builder::new(APP, State::dir(state)).start(&args) {
         Started::Owner(claim) => claim,
         Started::HandedOff(_) => return Ok(()),
         // A service must not run twice; Reason is an Error.
@@ -70,10 +74,28 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         if !matches!(owner.ended(), Some(End::LostLock | End::LostState)) {
-            // ...flush state here, still holding the lock...
+            // ...flush state to owner.state_dir() here, still holding the
+            // lock...
         }
     });
     Ok(())
+}
+
+/// The folder the service keeps its state in. An app passes the folder its
+/// storage layer writes, computed by the same function (`dirs::data_dir()`
+/// joined with the app's own name, say), so that the owner owns what the
+/// app writes. This example has no storage layer, so it takes a folder
+/// under HOME, or on Windows under LOCALAPPDATA.
+#[cfg(any(unix, windows))]
+fn state_dir() -> Option<PathBuf> {
+    let (var, name) = if cfg!(windows) {
+        ("LOCALAPPDATA", "example-syncd")
+    } else {
+        ("HOME", ".example-syncd")
+    };
+    let base = PathBuf::from(std::env::var_os(var)?);
+    // An empty or relative one would put the state in the working folder.
+    base.is_absolute().then(|| base.join(name))
 }
 
 #[cfg(any(unix, windows))]
