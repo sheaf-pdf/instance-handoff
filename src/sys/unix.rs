@@ -30,9 +30,26 @@ const SOCKET_FILE: &str = "instance.sock";
 /// Connections open at once; more are accepted and closed, and retry.
 const MAX_CONNECTIONS: usize = 64;
 
+/// The effective user id, as the kernel reports it in this process's own
+/// namespace. On Linux it comes from the system call, not from the C
+/// library's `geteuid`, which fakeroot replaces to report root.
 fn euid() -> libc::uid_t {
-    // SAFETY: geteuid has no preconditions and can't fail.
-    unsafe { libc::geteuid() }
+    #[cfg(target_os = "linux")]
+    {
+        // 32-bit x86, arm and sparc keep the 16-bit call under the plain
+        // name. On m68k, libc's SYS_geteuid is already the 32-bit one.
+        #[cfg(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc"))]
+        let nr = libc::SYS_geteuid32;
+        #[cfg(not(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc")))]
+        let nr = libc::SYS_geteuid;
+        // SAFETY: geteuid takes no arguments and can't fail.
+        unsafe { libc::syscall(nr) as libc::uid_t }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: geteuid has no preconditions and can't fail.
+        unsafe { libc::geteuid() }
+    }
 }
 
 fn cvt(r: libc::c_int) -> io::Result<libc::c_int> {
@@ -278,13 +295,57 @@ fn fstat(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
     Ok(st)
 }
 
+// The kernel writes all 256 bytes of its struct. A module-level constant,
+// so that `cargo check` and clippy evaluate it for every target, not only
+// a build.
+#[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+const _: () = assert!(std::mem::size_of::<libc::statx>() == 256);
+
+/// A file's owner and mode, as the kernel reports them. On Linux with glibc
+/// or musl they come from the `statx` system call, not from the C library's
+/// `fstat`, which fakeroot replaces to report root as the owner. Elsewhere,
+/// and where the kernel (before 4.11) or a seccomp filter refuses `statx`,
+/// they come from `fstat`.
+fn owner_mode(fd: BorrowedFd<'_>) -> io::Result<(libc::uid_t, libc::mode_t)> {
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    {
+        const WANT: libc::c_uint = libc::STATX_UID | libc::STATX_MODE;
+        // SAFETY: statx is plain data; the kernel fills it in.
+        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+        // SAFETY: the empty path with AT_EMPTY_PATH names `fd` itself, and
+        // `stx` is valid for writes of the kernel's struct, checked above.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                fd.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                WANT,
+                &mut stx as *mut libc::statx,
+            )
+        };
+        if r == 0 {
+            if stx.stx_mask & WANT != WANT {
+                return Err(denied("its owner or mode is unknown"));
+            }
+            return Ok((stx.stx_uid, stx.stx_mode.into()));
+        }
+        let e = io::Error::last_os_error();
+        if !matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) {
+            return Err(e);
+        }
+    }
+    let st = fstat(fd)?;
+    Ok((st.st_uid, st.st_mode))
+}
+
 /// This user's, and writable by nobody else.
 fn check_trusted(fd: BorrowedFd<'_>) -> io::Result<()> {
-    let st = fstat(fd)?;
-    if st.st_uid != euid() {
+    let (uid, mode) = owner_mode(fd)?;
+    if uid != euid() {
         return Err(denied("owned by another user"));
     }
-    if st.st_mode & 0o022 != 0 {
+    if mode & 0o022 != 0 {
         return Err(denied("other users can write to it"));
     }
     Ok(())
@@ -293,11 +354,11 @@ fn check_trusted(fd: BorrowedFd<'_>) -> io::Result<()> {
 /// This user's alone: nobody else can read it either, or they could lock
 /// the lock file.
 fn check_private(fd: BorrowedFd<'_>) -> io::Result<()> {
-    let st = fstat(fd)?;
-    if st.st_uid != euid() {
+    let (uid, mode) = owner_mode(fd)?;
+    if uid != euid() {
         return Err(denied("owned by another user"));
     }
-    if st.st_mode & 0o077 != 0 {
+    if mode & 0o077 != 0 {
         return Err(denied("other users can open it"));
     }
     Ok(())
@@ -1522,6 +1583,22 @@ mod tests {
             base(linux_rule(&snap, &ID)).unwrap().0,
             PathBuf::from("/run/user/1000/snap.app")
         );
+    }
+
+    // Outside fakeroot, the system calls and the C library agree.
+    #[test]
+    fn the_kernel_and_the_c_library_agree() {
+        // SAFETY: geteuid has no preconditions and can't fail.
+        assert_eq!(euid(), unsafe { libc::geteuid() });
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = open_folder(&Place::dir(tmp.path().join("run")), true)
+            .unwrap()
+            .unwrap();
+        let lock = folder.lock().unwrap().unwrap();
+        for fd in [folder.fd.as_fd(), lock.0.as_fd()] {
+            let st = fstat(fd).unwrap();
+            assert_eq!(owner_mode(fd).unwrap(), (st.st_uid, st.st_mode));
+        }
     }
 
     #[test]

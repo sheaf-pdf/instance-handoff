@@ -345,6 +345,88 @@ fn a_launch_hands_off_to_another_process() {
     );
 }
 
+/// Not a test: a launch that `launch_under_fakeroot` starts. It prints the
+/// effective user the C library reports, then hands off and prints the
+/// owner's process id, or why it couldn't.
+#[cfg(target_os = "linux")]
+#[test]
+fn launch_process() {
+    if std::env::var_os(ROLE).is_none() {
+        return;
+    }
+    let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
+    // SAFETY: geteuid has no preconditions and can't fail.
+    println!("geteuid {}", unsafe { libc::geteuid() });
+    match Builder::new(APP)
+        .dir(dir)
+        .hand_off(&Args::new(["fakeroot"]))
+    {
+        Ok(info) => println!("handed off to {:?}", info.pid()),
+        Err(reason) => println!("ran alone: {reason}"),
+    }
+}
+
+/// Runs `launch_process` under fakeroot, and returns its output lines.
+/// `None`, with a message, when fakeroot isn't installed, unless
+/// INSTANCE_HANDOFF_REQUIRE_FAKEROOT is set.
+#[cfg(target_os = "linux")]
+fn launch_under_fakeroot(dir: &Path) -> Option<Vec<String>> {
+    const REQUIRE: &str = "INSTANCE_HANDOFF_REQUIRE_FAKEROOT";
+    let run = Command::new("fakeroot")
+        .arg("--")
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "launch_process",
+            "--nocapture",
+            "--test-threads=1",
+            "-q",
+        ])
+        .env(ROLE, "launch")
+        .env(DIR, dir)
+        .output();
+    let out = match run {
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound && std::env::var_os(REQUIRE).is_none() =>
+        {
+            eprintln!("skipped: fakeroot isn't installed; set {REQUIRE} to fail instead");
+            return None;
+        }
+        run => run.expect("fakeroot starts"),
+    };
+    assert!(
+        out.status.success(),
+        "{}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    Some(stdout.lines().map(str::to_owned).collect())
+}
+
+// fakeroot tells the C library that this user is root and owns every
+// file. The launch reads both from the kernel, so it is still the user's
+// and meets the user's owner.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launch_under_fakeroot_hands_off_to_the_users_owner() {
+    let (_tmp, dir) = dir();
+    let owner = Owner::start(&dir);
+    let Some(lines) = launch_under_fakeroot(&dir) else {
+        return;
+    };
+    assert!(
+        lines.iter().any(|l| l == "geteuid 0"),
+        "fakeroot had no effect: {lines:?}"
+    );
+    let handed = format!("handed off to {:?}", Some(owner.pid()));
+    assert!(lines.contains(&handed), "{lines:?}");
+    assert_eq!(
+        owner.took(Duration::from_secs(5)).as_deref(),
+        Some(hex(b"fakeroot").as_str())
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_stopped_owner_never_delivers_a_launch_that_ran_alone() {

@@ -167,13 +167,17 @@
 //! with. So a launch hands off only to an owner of its own user at its own
 //! privilege level, and each level has an owner of its own:
 //!
-//! - Unix: the level is the effective user. Root (`sudo`, `su`, `doas`,
-//!   `pkexec`) is another user, with its own folder and owner, and so is the
-//!   user a setuid program runs as. On Linux with systemd, root has
-//!   `/run/user/0` only while it is logged in somewhere (a console, SSH):
-//!   root's launches then meet one owner, like any user's, and launches
-//!   under `sudo` meet that owner too. Otherwise launches under `sudo` run
-//!   alone with [`Reason::NoSession`].
+//! - Unix: the level is the effective user, as the kernel reports it in the
+//!   process's own user namespace. On Linux the crate reads it, and the
+//!   owners of its folders, with system calls rather than through the C
+//!   library, so `fakeroot` doesn't change them: a launch under `fakeroot`
+//!   is still its user's, and hands off to that user's owner. Root (`sudo`,
+//!   `su`, `doas`, `pkexec`) is another user, with its own folder and
+//!   owner, and so is the user a setuid program runs as. On Linux with
+//!   systemd, root has `/run/user/0` only while it is logged in somewhere
+//!   (a console, SSH): root's launches then meet one owner, like any
+//!   user's, and launches under `sudo` meet that owner too. Otherwise
+//!   launches under `sudo` run alone with [`Reason::NoSession`].
 //! - Windows: the level is the user and the integrity level. A launch run
 //!   as administrator (high) uses `<id>\run-high` and an owner of its own,
 //!   and never reaches the normal (medium) owner; nor does a normal launch
