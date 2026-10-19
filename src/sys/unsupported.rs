@@ -99,6 +99,21 @@ impl Drop for Lock {
     fn drop(&mut self) {}
 }
 
+#[derive(Debug)]
+pub(crate) struct Guard(());
+
+impl Drop for Guard {
+    fn drop(&mut self) {}
+}
+
+pub(crate) fn make_state_dir(_: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+pub(crate) fn take_guard(_: &Path) -> Result<Option<Guard>, Reason> {
+    Ok(None)
+}
+
 pub(crate) struct Conn(());
 
 impl Conn {
@@ -138,12 +153,16 @@ impl Waker {
 #[derive(Debug)]
 pub(crate) struct Held {
     pub(crate) lock: Option<Lock>,
+    pub(crate) guard: Option<Guard>,
 }
 
 impl Held {
     #[cfg(test)]
     pub(crate) fn detached() -> Held {
-        Held { lock: None }
+        Held {
+            lock: None,
+            guard: None,
+        }
     }
 
     pub(crate) fn unlink_socket(&self) {}
@@ -156,11 +175,15 @@ pub(crate) struct Claimed {
 }
 
 impl Claimed {
-    pub(crate) fn new(_: Folder, _: Lock, _: &AppId) -> Claimed {
+    pub(crate) fn new(_: Folder, _: Lock, _: Option<Guard>, _: &AppId) -> Claimed {
         unreachable!()
     }
 
     pub(crate) fn forked(&self) -> bool {
+        unreachable!()
+    }
+
+    pub(crate) fn guarded(&self) -> bool {
         unreachable!()
     }
 

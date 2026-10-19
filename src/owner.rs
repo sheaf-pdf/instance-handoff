@@ -15,9 +15,9 @@ use crate::{AppId, Builder, End, IntoAnswer, Payload, Request, sys};
 ///
 /// A `Claim` starts no thread, so a Unix daemon may fork while holding one
 /// and serve it in the child (see the crate docs). Dropping a `Claim` that
-/// was never served keeps the lock until the process exits, turns later
-/// launches away at once as [`Claim::decline_all`] does, and logs a
-/// warning; see [`Claim::release`].
+/// was never served keeps the lock, and the [guard](crate::Guard), until
+/// the process exits, turns later launches away at once as
+/// [`Claim::decline_all`] does, and logs a warning; see [`Claim::release`].
 #[must_use = "serve the Claim, or later launches are turned away"]
 pub struct Claim<T> {
     claimed: Option<Box<sys::Claimed>>,
@@ -36,6 +36,7 @@ impl<T> fmt::Debug for Claim<T> {
             .field("app_id", &self.ctx.app_id)
             .field("dir", &self.dir())
             .field("state_dir", &self.state_dir())
+            .field("guarded", &self.guarded())
             .finish_non_exhaustive()
     }
 }
@@ -50,11 +51,12 @@ impl<T> Claim<T> {
         place: sys::Place,
         folder: sys::Folder,
         lock: sys::Lock,
+        guard: Option<sys::Guard>,
         state: Option<PathBuf>,
         instance_key: Vec<u8>,
     ) -> Claim<T> {
         Claim {
-            claimed: Some(Box::new(sys::Claimed::new(folder, lock, &b.app_id))),
+            claimed: Some(Box::new(sys::Claimed::new(folder, lock, guard, &b.app_id))),
             place,
             state,
             ctx: Box::new(Ctx {
@@ -113,6 +115,17 @@ impl<T> Claim<T> {
         self.state.as_deref()
     }
 
+    /// Whether this process holds the state folder's
+    /// [guard](crate::Guard). It doesn't under [`Guard::Off`], for
+    /// [`State::none`], with a [scope](crate::Builder::scope), on Windows,
+    /// or where the file system can't lock files.
+    ///
+    /// [`Guard::Off`]: crate::Guard::Off
+    /// [`State::none`]: crate::State::none
+    pub fn guarded(&self) -> bool {
+        self.claimed().guarded()
+    }
+
     /// Why later launches can't reach this process, if they can't: the
     /// socket couldn't be made. This process still owns the lock; later
     /// launches wait out their timeout and run alone.
@@ -120,9 +133,9 @@ impl<T> Claim<T> {
         self.claimed().listener.as_ref().err()
     }
 
-    /// Give the lock up without ever serving. In a process forked after
-    /// `start`, this only closes the fork's copies: the lock stays with the
-    /// process that serves it.
+    /// Give the lock and the guard up without ever serving. In a process
+    /// forked after `start`, this only closes the fork's copies: both stay
+    /// with the process that serves them.
     pub fn release(mut self) {
         if let Some(claimed) = self.claimed.take() {
             claimed.release();
@@ -189,14 +202,16 @@ impl<T: Payload> Claim<T> {
 
 impl<T> Drop for Claim<T> {
     /// Unless served, declined or released: [`Claim::decline_all`], and a
-    /// warning through `log`. The lock stays held until the process exits.
+    /// warning through `log`. The lock and the guard stay held until the
+    /// process exits.
     fn drop(&mut self) {
         let Some(claimed) = self.claimed.take() else {
             return;
         };
         // A forked copy (a helper that doesn't serve): touch nothing, so the
         // process that serves stays reachable, and keep this process's share
-        // of the lock until it exits, as any dropped Claim does.
+        // of the lock and the guard until it exits, as any dropped Claim
+        // does.
         if claimed.forked() {
             claimed.abandon();
             return;
@@ -207,8 +222,8 @@ impl<T> Drop for Claim<T> {
             self.ctx.app_id
         );
         let (held, listener, _) = claimed.into_parts();
-        // The thread keeps `shared`, and with it the lock, until the
-        // process exits: nothing ever closes it.
+        // The thread keeps `shared`, and with it the lock and the guard,
+        // until the process exits: nothing ever closes them.
         let shared = Shared::new(held);
         if !spawn(
             Core::<()>::new(None, None, shared.clone(), Ctx::clone(&self.ctx)),
@@ -264,8 +279,9 @@ fn nonce() -> u64 {
 /// The running owner. `Send` and `Sync`, so it can live on `main`'s stack, in
 /// an app struct, in an async task or in a GUI framework's global.
 ///
-/// Dropping it stops serving but keeps the lock until the process exits;
-/// see [`Owner::release`] and the crate docs' "Quitting".
+/// Dropping it stops serving but keeps the lock, and the
+/// [guard](crate::Guard), until the process exits; see [`Owner::release`]
+/// and the crate docs' "Quitting".
 #[must_use = "keep the Owner for the life of the app: dropping it stops serving later launches"]
 pub struct Owner {
     app_id: AppId,
@@ -342,10 +358,10 @@ impl Owner {
         self.listen_error.as_ref()
     }
 
-    /// Stop, remove the socket and give up the lock, so another process can
-    /// become the owner while this one runs on. A handler call in progress
-    /// may still finish, and its launch is still answered; no call starts
-    /// after `release` returns.
+    /// Stop, remove the socket and give up the guard and the lock, so
+    /// another process can become the owner while this one runs on. A
+    /// handler call in progress may still finish, and its launch is still
+    /// answered; no call starts after `release` returns.
     pub fn release(self) {
         self.close(false);
     }
@@ -359,12 +375,18 @@ impl Owner {
             if self.shared.ended() != Some(End::LostLock) {
                 held.unlink_socket();
             }
-            if let Some(lock) = held.lock.take() {
-                if keep_lock {
-                    // Held until the process exits, so a mistaken drop can
-                    // never let a second owner start beside this one.
-                    std::mem::forget(lock);
-                }
+            let guard = held.guard.take();
+            let lock = held.lock.take();
+            if keep_lock {
+                // Held until the process exits, so a mistaken drop can
+                // never let a second owner start beside this one.
+                std::mem::forget(guard);
+                std::mem::forget(lock);
+            } else {
+                // The guard first: a launch that takes the freed lock finds
+                // the guard free too.
+                drop(guard);
+                drop(lock);
             }
         }
         self.shared.waker.wake();
@@ -372,8 +394,8 @@ impl Owner {
 }
 
 impl Drop for Owner {
-    /// Stop serving and close the socket. The lock stays held until the
-    /// process exits.
+    /// Stop serving and close the socket. The lock and the guard stay held
+    /// until the process exits.
     fn drop(&mut self) {
         self.close(true);
     }

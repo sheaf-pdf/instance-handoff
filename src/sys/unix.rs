@@ -1,5 +1,6 @@
 //! Unix: the runtime folder, an `flock` on `instance.lock`, an AF_UNIX
-//! socket beside it, and a `poll` loop on the crate's thread.
+//! socket beside it, another `flock` on the guard in the state folder, and
+//! a `poll` loop on the crate's thread.
 
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{self, Read};
@@ -1204,6 +1205,92 @@ impl Conn {
 }
 
 // ---------------------------------------------------------------------------
+// The state folder and its guard
+// ---------------------------------------------------------------------------
+
+/// Creates the canonical `state` folder when nothing is at its path: the
+/// folders above it as `create_dir_all` makes them, and the last one
+/// private (0700). Whatever is there already is left as it is, for
+/// [`take_guard`] to open or refuse.
+pub(crate) fn make_state_dir(state: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(state) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = state.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            make_dir(state)
+        }
+        found => found.map(drop),
+    }
+}
+
+/// The held guard: an `flock` on `.instance-handoff.lock` in the state
+/// folder. Like [`Lock`], it is released when the last descriptor closes
+/// and never unlocked explicitly, so a forked child that keeps a copy keeps
+/// the guard.
+#[derive(Debug)]
+pub(crate) struct Guard(#[allow(dead_code)] OwnedFd);
+
+/// Takes the guard in the canonical `state` folder, which
+/// [`make_state_dir`] has made. [`Reason::StateInUse`] when another process
+/// holds it. `None` where the file system can't lock files: the owner goes
+/// unguarded.
+pub(crate) fn take_guard(state: &Path) -> Result<Option<Guard>, Reason> {
+    let path = state.join(naming::GUARD_FILE);
+    let fd = match open_guard(state) {
+        Ok(fd) => fd,
+        Err(source) => return Err(Reason::Lock { path, source }),
+    };
+    match flock_nb(fd.as_fd()) {
+        Ok(true) => Ok(Some(Guard(fd))),
+        Ok(false) => Err(Reason::StateInUse { path }),
+        Err(e) if locks_unsupported(&e) => {
+            log::warn!(
+                "instance-handoff: {} can't be locked, so this owner holds no guard: {e}",
+                path.display()
+            );
+            Ok(None)
+        }
+        Err(source) => Err(Reason::Lock { path, source }),
+    }
+}
+
+/// Opens the guard file in `state`, creating it. Read-only, since `flock`
+/// needs no more on a local disk, so a guard file that exists can be
+/// locked in a folder that is read-only. Non-blocking, so a FIFO in its
+/// place can't hold the launch up.
+fn open_guard(state: &Path) -> io::Result<OwnedFd> {
+    let dir = open_dir(None, state, true)?;
+    let c = cstr(OsStr::new(naming::GUARD_FILE))?;
+    let flags =
+        libc::O_RDONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    let mode: libc::c_uint = 0o600;
+    // SAFETY: `c` is a valid C string and `dir` an open folder.
+    let fd = cvt(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, mode) })?;
+    // SAFETY: openat returned a new descriptor that nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if fstat(fd.as_fd())?.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+    }
+    if owner_mode(fd.as_fd())?.0 != euid() {
+        return Err(denied("owned by another user"));
+    }
+    Ok(fd)
+}
+
+/// Whether `e`, from `flock` on the guard file [`open_guard`] just opened,
+/// says that the file system can't lock it. `ENOTSUP` is `EOPNOTSUPP` on
+/// Linux and FreeBSD, and a number of its own elsewhere. `EBADF`, on a
+/// descriptor just opened, is NFS: its client emulates `flock` with POSIX
+/// locks on the server, and an exclusive one needs a descriptor open for
+/// writing (flock(2)), which the guard's isn't.
+fn locks_unsupported(e: &io::Error) -> bool {
+    e.raw_os_error().is_some_and(|code| {
+        [libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOTSUP, libc::EBADF].contains(&code)
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Peer credentials
 // ---------------------------------------------------------------------------
 
@@ -1332,11 +1419,12 @@ impl Waker {
     }
 }
 
-/// The folder, the lock and the socket, as the owner holds them.
+/// The folder, the lock, the guard and the socket, as the owner holds them.
 #[derive(Debug)]
 pub(crate) struct Held {
     pub(crate) folder: Option<Folder>,
     pub(crate) lock: Option<Lock>,
+    pub(crate) guard: Option<Guard>,
     /// The socket file this process bound.
     socket: Option<SocketKey>,
 }
@@ -1347,6 +1435,7 @@ impl Held {
         Held {
             folder: None,
             lock: None,
+            guard: None,
             socket: None,
         }
     }
@@ -1360,19 +1449,25 @@ impl Held {
     }
 }
 
-/// What `start` hands over to a `Claim`: the folder, the lock, and the
-/// listening socket, bound by this process.
+/// What `start` hands over to a `Claim`: the folder, the lock, the guard
+/// if it took one, and the listening socket, bound by this process.
 #[derive(Debug)]
 pub(crate) struct Claimed {
     pub(crate) folder: Folder,
     pub(crate) lock: Lock,
+    guard: Option<Guard>,
     pub(crate) listener: io::Result<UnixListener>,
     socket: Option<SocketKey>,
     pid: u32,
 }
 
 impl Claimed {
-    pub(crate) fn new(folder: Folder, lock: Lock, _app_id: &AppId) -> Claimed {
+    pub(crate) fn new(
+        folder: Folder,
+        lock: Lock,
+        guard: Option<Guard>,
+        _app_id: &AppId,
+    ) -> Claimed {
         let (listener, socket) = match folder.listen() {
             Ok((l, key)) => (Ok(l), key),
             Err(e) => (Err(e), None),
@@ -1380,6 +1475,7 @@ impl Claimed {
         Claimed {
             folder,
             lock,
+            guard,
             listener,
             socket,
             pid: std::process::id(),
@@ -1390,6 +1486,10 @@ impl Claimed {
     /// called `start`.
     pub(crate) fn forked(&self) -> bool {
         self.pid != std::process::id()
+    }
+
+    pub(crate) fn guarded(&self) -> bool {
+        self.guard.is_some()
     }
 
     /// Ready to serve in this process. After a fork, the child binds a
@@ -1406,6 +1506,7 @@ impl Claimed {
         let held = Held {
             folder: Some(self.folder),
             lock: Some(self.lock),
+            guard: self.guard,
             socket,
         };
         match listener {
@@ -1415,17 +1516,22 @@ impl Claimed {
     }
 
     /// A forked copy that won't serve: close the socket and the folder, and
-    /// keep the lock's descriptor open until the process exits.
+    /// keep the lock's and the guard's descriptors open until the process
+    /// exits.
     pub(crate) fn abandon(self) {
+        std::mem::forget(self.guard);
         std::mem::forget(self.lock);
     }
 
-    /// Gives the lock up without serving. A forked copy only closes its
-    /// descriptors: the lock stays with the process that still holds it.
+    /// Gives the guard and the lock up without serving, the guard first, so
+    /// a launch that takes the freed lock finds the guard free too. A forked
+    /// copy only closes its descriptors: both stay with the process that
+    /// still holds them.
     pub(crate) fn release(self) {
         if !self.forked() {
             self.folder.remove_own_socket(&self.lock, self.socket);
         }
+        drop(self.guard);
         drop(self.lock);
     }
 }
@@ -1637,6 +1743,10 @@ fn check_lock<T: Payload>(
                     "instance-handoff {app_id}: the runtime folder was removed, and another \
                      process now holds the lock: this process is no longer the owner"
                 );
+                // An owner told to stop writing the state gives its guard up
+                // too, so the launch that holds the lock, or the next one,
+                // can own the state folder.
+                drop(held.guard.take());
                 drop(held);
                 // The files at the path are the new owner's: remove nothing.
                 *listener = None;
@@ -2151,6 +2261,107 @@ mod tests {
         assert!(folder.holds(&lock));
         drop(lock);
         assert!(!folder.lock_held().unwrap());
+    }
+
+    // Frozen with the guard's name: a private file in a state folder made
+    // private where that is missing, never written, and an exclusive flock,
+    // which no other open file shares.
+    #[test]
+    fn the_guard_is_private_and_exclusive() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("missing").join("state");
+        make_state_dir(&state).unwrap();
+        let guard = take_guard(&state).unwrap().expect("a local folder locks");
+        let file = state.join(".instance-handoff.lock");
+        assert_eq!(mode(&state), 0o700);
+        assert_eq!(mode(&file), 0o600);
+        let other = std::fs::File::open(&file).unwrap();
+        // SAFETY: flock on an open file.
+        let shared = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        assert_eq!(shared, -1);
+        let err = take_guard(&state).unwrap_err();
+        assert!(
+            matches!(&err, Reason::StateInUse { path } if *path == file),
+            "{err}"
+        );
+        drop(guard);
+        assert!(take_guard(&state).unwrap().is_some());
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), 0);
+    }
+
+    // A lock needs no write, so a guard file that exists is locked in a
+    // folder this user can't write to, but one that doesn't can't be made
+    // there. Root may write anywhere, so this needs another user.
+    #[test]
+    fn a_read_only_state_folder_locks_only_a_guard_that_exists() {
+        use std::os::unix::fs::PermissionsExt;
+        if euid() == 0 {
+            return;
+        }
+        let set_mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        set_mode(&state, 0o500);
+        let err = take_guard(&state).unwrap_err();
+        assert!(matches!(err, Reason::Lock { .. }), "{err}");
+        set_mode(&state, 0o700);
+        drop(take_guard(&state).unwrap().unwrap());
+        set_mode(&state, 0o500);
+        assert!(take_guard(&state).unwrap().is_some());
+        set_mode(&state, 0o700);
+    }
+
+    // Opened without blocking, a FIFO in the guard's place is refused at
+    // once rather than waited on.
+    #[test]
+    fn a_guard_that_isnt_a_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = cstr(tmp.path().join(".instance-handoff.lock").as_os_str()).unwrap();
+        // SAFETY: `fifo` is a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let err = take_guard(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, Reason::Lock { .. }) && err.to_string().contains("not a file"),
+            "{err}"
+        );
+    }
+
+    // A state folder that exists keeps its mode, and whatever is at the
+    // path is left for the guard to refuse.
+    #[test]
+    fn only_a_missing_state_folder_is_made() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        make_state_dir(&state).unwrap();
+        assert_eq!(mode(&state), 0o755);
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        make_state_dir(&file).unwrap();
+        assert!(file.is_file());
+        assert!(matches!(take_guard(&file), Err(Reason::Lock { .. })));
+        assert!(make_state_dir(&file.join("state")).is_err());
+    }
+
+    // EBADF is NFS refusing an exclusive lock on a descriptor that isn't
+    // open for writing.
+    #[test]
+    fn file_systems_without_locks_leave_the_owner_unguarded() {
+        let error = io::Error::from_raw_os_error;
+        for code in [libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOTSUP, libc::EBADF] {
+            assert!(locks_unsupported(&error(code)), "{code}");
+        }
+        for code in [libc::EACCES, libc::EROFS, libc::EIO] {
+            assert!(!locks_unsupported(&error(code)), "{code}");
+        }
     }
 
     #[test]

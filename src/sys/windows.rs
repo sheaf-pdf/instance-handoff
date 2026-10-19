@@ -866,6 +866,28 @@ fn try_lock(file: &File) -> io::Result<bool> {
     }
 }
 
+/// The state folder's guard. Windows owners take none, so there is never
+/// one to hold.
+#[derive(Debug)]
+pub(crate) enum Guard {}
+
+// Owners drop or forget a guard as they do a lock.
+impl Drop for Guard {
+    fn drop(&mut self) {}
+}
+
+/// Makes nothing yet: a missing state folder is made with its access list
+/// once Windows owners take the guard.
+pub(crate) fn make_state_dir(_state: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Windows owners take no guard: nothing is made or locked in the state
+/// folder.
+pub(crate) fn take_guard(_state: &Path) -> Result<Option<Guard>, Reason> {
+    Ok(None)
+}
+
 /// Where a launch connects.
 struct Address {
     pipe: OsString,
@@ -1543,11 +1565,13 @@ impl Waker {
     }
 }
 
-/// The folder and the lock, as the owner holds them.
+/// The folder and the lock, as the owner holds them. `guard` stays `None`:
+/// Windows owners take no guard.
 #[derive(Debug)]
 pub(crate) struct Held {
     pub(crate) folder: Option<Folder>,
     pub(crate) lock: Option<Lock>,
+    pub(crate) guard: Option<Guard>,
 }
 
 impl Held {
@@ -1556,6 +1580,7 @@ impl Held {
         Held {
             folder: None,
             lock: None,
+            guard: None,
         }
     }
 
@@ -1575,7 +1600,12 @@ pub(crate) struct Claimed {
 }
 
 impl Claimed {
-    pub(crate) fn new(folder: Folder, lock: Lock, app_id: &AppId) -> Claimed {
+    pub(crate) fn new(
+        folder: Folder,
+        lock: Lock,
+        _guard: Option<Guard>,
+        app_id: &AppId,
+    ) -> Claimed {
         let listener = folder.listen(app_id);
         Claimed {
             folder,
@@ -1589,6 +1619,10 @@ impl Claimed {
         false
     }
 
+    pub(crate) fn guarded(&self) -> bool {
+        false
+    }
+
     pub(crate) fn abandon(self) {
         std::mem::forget(self.lock);
     }
@@ -1597,6 +1631,7 @@ impl Claimed {
         let held = Held {
             folder: Some(self.folder),
             lock: Some(self.lock),
+            guard: None,
         };
         match self.listener {
             Ok(l) => (held, Some(l), None),

@@ -115,8 +115,11 @@ pub enum End {
     /// ([`Reason::Declined`]); this process still holds the lock.
     Panicked,
     /// Something deleted the runtime folder under this owner, and another
-    /// process took the lock there before this one could re-create it. That
-    /// process is now the owner: this one must stop writing the state.
+    /// process took the lock there before this one could re-create it: a
+    /// new owner, or a launch that lets go again because this owner holds
+    /// the state folder's [guard](crate::Guard). Either way this one must
+    /// stop writing the state. It gives the guard up as it ends, so a later
+    /// launch can own the state folder.
     LostLock,
 }
 
@@ -347,13 +350,31 @@ pub enum Reason {
         source: io::Error,
     },
     /// The lock file can't be opened or locked (a file system without
-    /// locks, say).
+    /// locks, say), the missing state folder can't be made, or the state
+    /// folder's [guard](crate::Guard) can't be made, opened or locked (in a
+    /// state folder that is read-only, or a guard file that is another
+    /// user's).
     #[non_exhaustive]
     Lock {
-        /// The lock file.
+        /// The lock file, the state folder or the guard file.
         path: PathBuf,
         /// What went wrong.
         source: io::Error,
+    },
+    /// Another process holds the state folder's [guard](crate::Guard), but
+    /// not the lock in this launch's runtime folder, so this launch can't
+    /// reach it: an owner in another container, one given another
+    /// [`Builder::dir`], an owner of another app id given the same state
+    /// folder, or one whose runtime folder was deleted and isn't made again
+    /// yet. This launch let go of its lock before anyone could connect.
+    /// Only [`Builder::start`] takes the guard.
+    ///
+    /// [`Builder::dir`]: crate::Builder::dir
+    /// [`Builder::start`]: crate::Builder::start
+    #[non_exhaustive]
+    StateInUse {
+        /// The guard file.
+        path: PathBuf,
     },
     /// The state folder, or the folder it would be created in, belongs to
     /// another user: root given the user's home by `sudo -E`, say. Nothing
@@ -437,6 +458,11 @@ impl fmt::Display for Reason {
                 write!(f, "runtime folder {}: {source}", path.display())
             }
             Reason::Lock { path, source } => write!(f, "lock {}: {source}", path.display()),
+            Reason::StateInUse { path } => write!(
+                f,
+                "an instance this launch can't reach holds the state folder: {}",
+                path.display()
+            ),
             Reason::ForeignState { path } => write!(
                 f,
                 "the state folder, or the folder it would be created in, belongs to another user: {}",
@@ -523,6 +549,19 @@ mod tests {
         assert!(
             reason.to_string().ends_with("another user: /home/me"),
             "{reason}"
+        );
+        assert!(reason.source().is_none());
+    }
+
+    #[test]
+    fn state_in_use_names_the_guard() {
+        let reason = Reason::StateInUse {
+            path: PathBuf::from("/home/me/app/.instance-handoff.lock"),
+        };
+        assert_eq!(
+            reason.to_string(),
+            "an instance this launch can't reach holds the state folder: \
+             /home/me/app/.instance-handoff.lock"
         );
         assert!(reason.source().is_none());
     }

@@ -2,12 +2,13 @@
 //! to whoever holds it.
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::wire::{self, Hello, Reply, refusal, serving, status};
 use crate::{
-    Activation, AppId, Builder, Claim, ElevatedOwner, Ineligible, Kind, Mode, OwnerInfo, Payload,
-    Reason, Started, sys,
+    Activation, AppId, Builder, Claim, ElevatedOwner, Guard, Ineligible, Kind, Mode, OwnerInfo,
+    Payload, Reason, Started, sys,
 };
 
 /// Between attempts while the owner starts, is busy or quits.
@@ -15,6 +16,11 @@ const RETRY: Duration = Duration::from_millis(50);
 /// A `Separate` launch that finds the lock held looks again for this long,
 /// so a `hand_off` or `probe` testing the lock isn't taken for an owner.
 const SEPARATE_RETRY: Duration = Duration::from_millis(50);
+/// A launch that holds the lock and finds the guard held looks again for
+/// this long. An owner that exits lets go of its lock a moment before its
+/// guard, and a launch that takes the lock in between must not take the
+/// guard for a live owner's.
+const GUARD_RETRY: Duration = Duration::from_millis(50);
 /// The least a committed launch waits for the owner's reply.
 const MIN_POST_COMMIT: Duration = Duration::from_secs(1);
 /// The least time a handoff to a healthy owner needs: shorter timeouts are
@@ -221,9 +227,7 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
     let mut waiting: Option<Waiting> = None;
     loop {
         match folder.lock() {
-            Ok(Some(lock)) => {
-                return Started::Owner(Claim::new(b, place, folder, lock, state, key));
-            }
+            Ok(Some(lock)) => return own(b, place, folder, lock, state, key),
             Ok(None) => {}
             // The folder was deleted under this launch (a cleaner, `rm`):
             // open it afresh and keep going.
@@ -251,9 +255,7 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
             while Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(5));
                 match try_own(&folder) {
-                    Ok(Some(lock)) => {
-                        return Started::Owner(Claim::new(b, place, folder, lock, state, key));
-                    }
+                    Ok(Some(lock)) => return own(b, place, folder, lock, state, key),
                     Ok(None) => {}
                     Err(reason) => return Started::Alone(reason),
                 }
@@ -275,15 +277,74 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
             Exchange::Retry(w) => waiting = Some(w.after(waiting, deadline)),
             Exchange::SameOwner => unreachable!("no commit to compare with"),
             Exchange::Lost(nonce) => {
-                return match after_commit(&folder, b, &key, bytes, nonce, true, &limits) {
-                    AfterCommit::Own(lock) => {
-                        Started::Owner(Claim::new(b, place, folder, lock, state, key))
+                let after = after_commit(
+                    &folder,
+                    b,
+                    &key,
+                    bytes,
+                    nonce,
+                    Some(state.as_deref()),
+                    &limits,
+                );
+                return match after {
+                    AfterCommit::Own(lock, guard) => {
+                        Started::Owner(Claim::new(b, place, folder, lock, guard, state, key))
                     }
                     AfterCommit::Info(info) => Started::HandedOff(info),
                 };
             }
         }
         pause(deadline);
+    }
+}
+
+/// This launch took the `lock`: it owns, once it has the state folder and
+/// holds its guard too. If another process holds the guard, the lock is
+/// dropped here, before any socket is bound, and the launch runs alone.
+fn own<T>(
+    b: &Builder,
+    place: sys::Place,
+    folder: sys::Folder,
+    lock: sys::Lock,
+    state: Option<PathBuf>,
+    key: Vec<u8>,
+) -> Started<T> {
+    match take_state(b, state.as_deref()) {
+        Ok(guard) => Started::Owner(Claim::new(b, place, folder, lock, guard, state, key)),
+        Err(reason) => Started::Alone(reason),
+    }
+}
+
+/// For a launch that holds the lock: creates the canonical `state` folder
+/// when it is missing, whatever the guard (on Unix, so far), then takes its
+/// guard. A folder that can't be made gives [`Reason::Lock`], naming it.
+fn take_state(b: &Builder, state: Option<&Path>) -> Result<Option<sys::Guard>, Reason> {
+    if let Some(state) = state {
+        sys::make_state_dir(state).map_err(|source| Reason::Lock {
+            path: state.to_owned(),
+            source,
+        })?;
+    }
+    take_guard(b, state)
+}
+
+/// Takes the guard of the canonical `state` folder, which exists, for a
+/// launch that holds the lock. `None` when no guard is taken: see
+/// [`Guard`]. A keyed owner takes none. Still held after [`GUARD_RETRY`],
+/// it gives [`Reason::StateInUse`].
+fn take_guard(b: &Builder, state: Option<&Path>) -> Result<Option<sys::Guard>, Reason> {
+    let guarded = b.guard == Guard::Local && b.scope.is_none();
+    let Some(state) = state.filter(|_| guarded) else {
+        return Ok(None);
+    };
+    let until = Instant::now() + GUARD_RETRY;
+    loop {
+        match sys::take_guard(state) {
+            Err(Reason::StateInUse { .. }) if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            taken => return taken,
+        }
     }
 }
 
@@ -331,9 +392,9 @@ pub(crate) fn hand_off<T: Payload>(b: &Builder, payload: Option<&T>) -> Result<O
             Exchange::SameOwner => unreachable!("no commit to compare with"),
             Exchange::Lost(nonce) => {
                 let bytes = request.as_deref().expect("only a request commits");
-                return match after_commit(&folder, b, &key, bytes, nonce, false, &limits) {
+                return match after_commit(&folder, b, &key, bytes, nonce, None, &limits) {
                     AfterCommit::Info(info) => Ok(info),
-                    AfterCommit::Own(_) => unreachable!("a handoff never owns"),
+                    AfterCommit::Own(..) => unreachable!("a handoff never owns"),
                 };
             }
         }
@@ -342,23 +403,26 @@ pub(crate) fn hand_off<T: Payload>(b: &Builder, payload: Option<&T>) -> Result<O
 }
 
 enum AfterCommit {
-    Own(sys::Lock),
+    Own(sys::Lock, Option<sys::Guard>),
     Info(OwnerInfo),
 }
 
 /// The connection closed after this launch committed, with no reply. The
 /// owner may have died with the request or without it; this launch must
-/// not run alone on it. It takes the lock if nobody holds it (`may_own`),
-/// or hands the request to the next owner, one with another nonce.
-/// Otherwise (no owner in time, or one that won't take it) it is handed
-/// off, unconfirmed: the dead owner may have had it.
+/// not run alone on it. It takes the lock, and the canonical state folder
+/// and its guard, if nobody holds them and it may own (`owns` is
+/// `Some(state)`; `None` for `hand_off`), or hands the request to
+/// the next owner, one with another nonce. Otherwise (no owner in time, one
+/// that won't take it, or a state folder it can't make or whose guard
+/// another process holds) it is handed off, unconfirmed: the dead owner may
+/// have had it.
 fn after_commit(
     folder: &sys::Folder,
     b: &Builder,
     key: &[u8],
     bytes: &[u8],
     mut nonce: u64,
-    may_own: bool,
+    owns: Option<Option<&Path>>,
     limits: &Limits,
 ) -> AfterCommit {
     let until = limits.after_commit();
@@ -373,9 +437,15 @@ fn after_commit(
         handed_down: None,
     };
     loop {
-        if may_own {
+        if let Some(state) = owns {
             match folder.lock() {
-                Ok(Some(lock)) => return AfterCommit::Own(lock),
+                // With a guard it can't take, the lock is dropped here.
+                Ok(Some(lock)) => {
+                    return match take_state(b, state) {
+                        Ok(guard) => AfterCommit::Own(lock, guard),
+                        Err(_) => AfterCommit::Info(unconfirmed),
+                    };
+                }
                 Ok(None) => {}
                 Err(_) => return AfterCommit::Info(unconfirmed),
             }
@@ -816,6 +886,38 @@ mod tests {
         owner.release();
         may_not_own(start_as(&b, &Args::default(), raised));
         own(start_as(&b, &Args::default(), None)).release();
+    }
+
+    // The owner this launch committed to died, and another process holds
+    // the guard: the dead owner may have had the request, so the launch
+    // reports it handed off, never alone, and lets go of the lock it took
+    // (0004). With the guard free, it owns.
+    #[cfg(unix)]
+    #[test]
+    fn a_committed_launch_that_finds_the_guard_held_is_handed_off_unconfirmed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Builder::new(AppId::headless("test.guard"), tmp.path().join("state"))
+            .dir(tmp.path().join("run"));
+        let state = b.canonical_state();
+        let place = b.place(state.as_deref()).unwrap();
+        let folder = sys::open_folder(&place, true).unwrap().unwrap();
+        let limits = Limits::new(Instant::now(), Duration::from_secs(1));
+        let key = b.instance_key(state.as_deref());
+        let after = || after_commit(&folder, &b, &key, &[], 1, Some(state.as_deref()), &limits);
+
+        let other = take_state(&b, state.as_deref()).unwrap();
+        assert!(other.is_some());
+        match after() {
+            AfterCommit::Info(info) => assert!(!info.confirmed()),
+            AfterCommit::Own(..) => panic!("owned beside a guard another process holds"),
+        }
+        assert!(!folder.lock_held().unwrap());
+
+        drop(other);
+        match after() {
+            AfterCommit::Own(_, guard) => assert!(guard.is_some()),
+            AfterCommit::Info(info) => panic!("handed off to {info}"),
+        }
     }
 
     #[test]

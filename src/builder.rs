@@ -80,10 +80,52 @@ pub enum Mode {
     ///
     /// A separate launch that finds nobody becomes the owner. Serve it with
     /// [`Claim::decline_all`] if it must not receive the user's launches.
-    /// One that may not own runs alone at once with [`Reason::MayNotOwn`].
+    /// One that may not own runs alone at once with [`Reason::MayNotOwn`],
+    /// and one that takes the lock but finds the state folder's
+    /// [guard](Guard) held runs alone with [`Reason::StateInUse`].
     ///
     /// [`Claim::decline_all`]: crate::Claim::decline_all
     Separate,
+}
+
+/// Whether the owner takes the state folder's guard: see
+/// [`Builder::guard`].
+///
+/// The guard is a lock on `.instance-handoff.lock` in the state folder,
+/// which the owner takes after the lock in its runtime folder and holds as
+/// long. Launches that name one state folder can still end up in two
+/// runtime folders: in two containers, say, given two [`Builder::dir`]
+/// folders, or as two app ids that share the folder. The one that takes
+/// its lock second finds the guard held, lets go of its lock and runs alone
+/// at once with [`Reason::StateInUse`], rather than own the state folder
+/// beside the first.
+///
+/// `start` makes the guard file (mode 0600) in the state folder, which it
+/// has created if it was missing (see [`Builder::new`]). The file is never
+/// written. Like the lock, the guard is held until the process exits, or
+/// until [`Owner::release`] or [`Claim::release`] gives both up, and a
+/// child forked from the owner holds it too until it exits.
+///
+/// No guard is taken, and no guard file made, under [`Guard::Off`], for
+/// [`State::none`], for an owner with a [scope](Builder::scope), and on
+/// Windows. Nor is one held where the file system can't lock files.
+/// [`Claim::guarded`] says whether the owner holds it.
+///
+/// [`Owner::release`]: crate::Owner::release
+/// [`Claim::release`]: crate::Claim::release
+/// [`Claim::guarded`]: crate::Claim::guarded
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Guard {
+    /// Take the guard. One that can't be made or opened gives
+    /// [`Reason::Lock`]: the state folder is read-only, say, or the guard
+    /// file is another user's.
+    #[default]
+    Local,
+    /// Take no guard, and make no guard file. A missing state folder is
+    /// still made. Owners of the folder in two runtime folders then run
+    /// side by side.
+    Off,
 }
 
 /// Which launches with raised rights may become the owner when nobody is:
@@ -139,8 +181,9 @@ pub enum ElevatedOwner {
 pub struct Builder {
     pub(crate) app_id: AppId,
     state: State,
-    scope: Option<OsString>,
+    pub(crate) scope: Option<OsString>,
     dir: Option<PathBuf>,
+    pub(crate) guard: Guard,
     pub(crate) mode: Mode,
     pub(crate) elevated_owner: ElevatedOwner,
     pub(crate) timeout: Duration,
@@ -151,14 +194,19 @@ pub struct Builder {
 impl Builder {
     /// A builder for `app_id`, whose state is in `state` ([`State::dir`]),
     /// or which keeps none ([`State::none`]). The defaults: the default
-    /// runtime folder, [`Mode::Join`], [`ElevatedOwner::NotRaised`], a 5
-    /// second timeout and payload version 0.
+    /// runtime folder, [`Guard::Local`], [`Mode::Join`],
+    /// [`ElevatedOwner::NotRaised`], a 5 second timeout and payload version
+    /// 0.
     ///
     /// Launches of `app_id` that name one state folder, through whatever
     /// links, and one [scope](Builder::scope) meet one owner. Launches that
     /// name two folders get two owners. Each user, and on Windows each
     /// integrity level, has owners of its own: see the crate docs on where
-    /// the lock lives.
+    /// the lock lives. On Unix the owner also holds a lock in the state
+    /// folder, the [guard](Guard), so a launch that finds another runtime
+    /// folder, as in another container, runs alone with
+    /// [`Reason::StateInUse`] rather than become a second owner of that
+    /// state folder.
     ///
     /// Before [`start`](Builder::start) creates anything, it checks whose
     /// the state folder is, or, while it is missing, whose the nearest
@@ -178,12 +226,18 @@ impl Builder {
     ///
     /// [`hand_off`](Builder::hand_off) and [`probe`](Builder::probe) write
     /// nothing there, and don't check.
+    ///
+    /// On Unix, once it holds the lock, `start` creates the state folder if
+    /// it is missing, with the folders above it, the last one private (mode
+    /// 0700), whatever the [guard](Guard). One that can't be made gives
+    /// [`Reason::Lock`]. On Windows `start` makes nothing there.
     pub fn new(app_id: AppId, state: impl Into<State>) -> Builder {
         Builder {
             app_id,
             state: state.into(),
             scope: None,
             dir: None,
+            guard: Guard::Local,
             mode: Mode::Join,
             elevated_owner: ElevatedOwner::NotRaised,
             timeout: Duration::from_secs(5),
@@ -219,14 +273,24 @@ impl Builder {
     /// user's, or open to group or others; on Windows: a link, or one that
     /// others may change or read) is refused with [`Reason::RuntimeDir`].
     ///
-    /// Every launch that should meet must pass the same folder. A folder
-    /// serves one privilege level: on Windows, one made at another
+    /// Every launch that should meet must pass the same folder: one given
+    /// another folder, with the same state folder, runs alone with
+    /// [`Reason::StateInUse`] while this owner holds the [guard](Guard). A
+    /// folder serves one privilege level: on Windows, one made at another
     /// integrity level is refused with [`Reason::RuntimeDir`], so elevated
     /// and normal launches given the same folder don't share it. For tests,
-    /// a fresh temporary folder per test keeps a panicking test's lock from
-    /// blocking the next.
+    /// a fresh temporary folder and state folder per test keep a panicking
+    /// test's lock and guard from blocking the next.
     pub fn dir(mut self, dir: impl Into<PathBuf>) -> Builder {
         self.dir = Some(dir.into());
+        self
+    }
+
+    /// Whether the owner takes the state folder's guard: see [`Guard`].
+    /// Defaults to [`Guard::Local`]. Only `start` takes the guard, so
+    /// `hand_off` and `probe` don't look at it.
+    pub fn guard(mut self, guard: Guard) -> Builder {
+        self.guard = guard;
         self
     }
 

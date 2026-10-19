@@ -48,20 +48,25 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
    - A Windows volume that keeps no owners (FAT, exFAT, no `FILE_PERSISTENT_ACLS`) always passes.
    - `ForeignState { path }` names the folder found to be another user's: the state folder, or, while it is missing, the nearest folder above it.
    - The overflow uid (65534) counts as another user's. In a user namespace that doesn't map root (Flatpak, bwrap), host root's folders show with that uid, so a missing state folder whose nearest existing folder is one of them gives `ForeignState`. Slice 38 tests this under bwrap, and treats the overflow uid as unknown instead if the refusal turns out wrong there.
-3. **A missing state folder.** `start` and `exclusive` create a missing state folder after the ForeignState check and the runtime lock. They use `create_dir_all`; on Unix the last folder gets mode 0700, and on Windows an access list for the user and SYSTEM. ForeignState applies only to `start` and `exclusive`. *Recommended.*
+3. **A missing state folder.** `start` and `exclusive` create a missing state folder after the ForeignState check and the runtime lock. They use `create_dir_all`; on Unix the last folder gets mode 0700, and on Windows an access list for the user and SYSTEM. ForeignState applies only to `start` and `exclusive`. *Recommended.* Slice 25 settled the cases this leaves open. *Our call (slice 25).*
+   - On Unix every `start` that takes the runtime lock with a `State::dir` creates it, under `Guard::Off` and with a scope too, before it takes the guard. Whatever is at the path already, a file say, is left as it is: the guard, where one is taken, refuses it.
+   - A state folder that can't be created gives `Reason::Lock`, naming the folder. A committed launch whose owner died reports an unconfirmed handoff instead, as beside a held guard (6.4).
+   - The Windows half, with its access list, lands with the Windows guard in slice 27, once slice 19 has the access lists. Until then nothing creates the folder on Windows.
 4. `Level` and `Rights` live in `src/level.rs`, re-exported. *Recommended.*
 
 ## 4. The guard (slices 25 to 30)
 
-1. No holder text in 0.1: `StateInUse` names no holder, and the lock file stays unwritten (0010). The guard sits at offset 2^31, which leaves room for text later. *Recommended.*
-2. A read-only state folder, `EACCES`, or a guard file that belongs to another user gives `Reason::Lock`. `ENOLCK` and `EOPNOTSUPP` leave the owner unguarded. *Recommended.*
+1. No holder text in 0.1: `StateInUse` names no holder, and the lock file stays unwritten (0010). The guard sits at offset 2^31, which leaves room for text later. *Recommended.* `StateInUse { path }` names the guard file. *Our call (slice 25).*
+2. A read-only state folder, `EACCES`, or a guard file that belongs to another user gives `Reason::Lock`. `ENOLCK` and `EOPNOTSUPP` leave the owner unguarded. *Recommended.* Slice 25 settled two cases. *Our call (slice 25).*
+   - `ENOTSUP` counts with `EOPNOTSUPP`: they are one number on Linux and FreeBSD, and two on macOS, NetBSD, OpenBSD and illumos.
+   - The guard file is opened read-only and without blocking, so one that exists is locked in a read-only folder, and a FIFO in its place can't hold the launch up. Anything but a regular file gives `Reason::Lock`. `EBADF` from `flock` on it also leaves the owner unguarded: the NFS client emulates `flock` with POSIX locks, and an exclusive one needs a descriptor open for writing (flock(2)). So a state folder on NFS leaves each host its own owner, as R05's network rule wants, before slice 28 and on any file system its list misses.
 3. The Windows guard's handle doesn't share delete, so the app can't rename or delete its own state folder while it runs. *Recommended.*
 4. A state folder labelled above medium gives `Reason::Lock`, since the guard can't be made or locked there. *Our call.*
 5. `start` retries the guard for about 50 ms, and that counts as "at once". *Recommended.*
 6. **LostState.**
    - After `LostState` the owner gives up its runtime lock and socket. It watches for `LostState` only while it holds the guard. *Recommended.*
    - A guard file deleted from an unchanged state folder is re-created if nobody holds the new one; otherwise the owner ends with `LostState`. This matches how the runtime lock already works (0008). *Our call.*
-7. **exclusive().** With `State::none()`, `Guard::Off` or a skipped guard, `exclusive()` takes the runtime lock without listening, as `Mode::Separate` did. `ElevatedOwner` applies to it, so a raised `exclusive()` under `NotRaised` gets `MayNotOwn { Raised }`. *Recommended.* Until slice 30, a `Mode::Separate` launch that may not own does the same: `MayNotOwn` at once, whether or not an owner runs. *Our call (slice 34).*
+7. **exclusive().** With `State::none()`, `Guard::Off` or a skipped guard, `exclusive()` takes the runtime lock without listening, as `Mode::Separate` did. `ElevatedOwner` applies to it, so a raised `exclusive()` under `NotRaised` gets `MayNotOwn { Raised }`. *Recommended.* Until slice 30, a `Mode::Separate` launch that may not own does the same: `MayNotOwn` at once, whether or not an owner runs. *Our call (slice 34).* Until then, too, a `Mode::Separate` launch that takes the runtime lock takes the guard as any `start` does, so beside an owner in another runtime folder it gets `StateInUse`, not `OwnerRunning`. *Our call (slice 25).*
 
 ## 5. Folders and bases (slices 7, 19, 22, 31)
 

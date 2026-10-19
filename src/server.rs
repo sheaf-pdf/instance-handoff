@@ -83,8 +83,9 @@ pub(crate) struct Shared {
     pub(crate) close: AtomicBool,
     pub(crate) ended: Mutex<Option<End>>,
     pub(crate) waker: sys::Waker,
-    /// The folder and the lock. The thread's upkeep replaces them when the
-    /// folder is deleted under it; `release` closes the lock.
+    /// The folder, the lock and the guard. The thread's upkeep replaces the
+    /// folder and the lock when the folder is deleted under it; `release`
+    /// closes the guard and the lock.
     pub(crate) held: Mutex<sys::Held>,
 }
 

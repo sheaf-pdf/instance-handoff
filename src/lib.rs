@@ -43,11 +43,17 @@
 //! # Guarantees
 //!
 //! - At most one process holds the lock for an app id and runtime folder
-//!   at a time, and only it gets [`Started::Owner`]. A process that gets
-//!   [`Started::Alone`] must not write the state the owner owns. If the
-//!   runtime folder is deleted under a running owner and another process
-//!   becomes the owner before this one re-creates its lock, this one is told
-//!   ([`End::LostLock`]) within a minute.
+//!   at a time, and only it gets [`Started::Owner`]. On Unix the owner also
+//!   holds the state folder's [guard](Guard), where it takes one, so a
+//!   launch that took the lock in another runtime folder (another
+//!   container, another [`Builder::dir`], another app id) doesn't own that
+//!   state folder too: it runs alone at once with [`Reason::StateInUse`].
+//!   A process that gets [`Started::Alone`] must not write the state the
+//!   owner owns. If the runtime folder is deleted under a running owner and
+//!   another process takes the lock there before this one re-creates it (a
+//!   new owner, or a launch that finds this owner's guard and lets go
+//!   again), this one is told ([`End::LostLock`]) within a minute, and
+//!   gives its guard up.
 //! - Each launch ends one of three ways, whatever the timing (stopped
 //!   processes, slow handlers, expired timeouts):
 //!   - it hands off ([`Started::HandedOff`]): an owner's handler takes its
@@ -96,7 +102,9 @@
 //!   child serves the `Claim`, and the parent leaves with
 //!   [`std::process::exit`] so that its copy of the `Claim` is never dropped.
 //!   The parent learns the outcome from `start` itself. Never fork after
-//!   `serve`: the crate's thread doesn't survive `fork`. (macOS forbids
+//!   `serve`: the crate's thread doesn't survive `fork`. A helper forked
+//!   from the owner without `exec` holds the lock and the guard until it
+//!   exits too, even after the owner has. (macOS forbids
 //!   `fork` without `exec` once Core Foundation is running: fork before
 //!   anything touches it.)
 //!
@@ -114,16 +122,16 @@
 //!    given to [`Claim::on_end`] marks the same moment.
 //! 3. Write your state while still holding the lock, unless the owner ended
 //!    with [`End::LostLock`].
-//! 4. Exit. The lock goes with the process.
+//! 4. Exit. The lock and the guard go with the process.
 //!
-//! Dropping an [`Owner`] stops serving but **keeps the lock until the
-//! process exits**, so a value dropped by mistake (`let _ = …`, an `if let`
-//! or `matches!` on the result of `start`) can never let a second owner
-//! start beside this one. Dropping a [`Claim`] that was never served keeps
-//! the lock too, turns later launches away at once as
+//! Dropping an [`Owner`] stops serving but **keeps the lock and the guard
+//! until the process exits**, so a value dropped by mistake (`let _ = …`,
+//! an `if let` or `matches!` on the result of `start`) can never let a
+//! second owner start beside this one. Dropping a [`Claim`] that was never
+//! served keeps them too, turns later launches away at once as
 //! [`Claim::decline_all`] does, and logs a warning. [`Owner::release`] gives
-//! the lock up while the process runs on, for tests and services that
-//! restart in place. `stop` stays necessary where destructors don't run:
+//! both up while the process runs on, for tests and services that restart
+//! in place. `stop` stays necessary where destructors don't run:
 //! `process::exit`, GPUI's and AppKit's `terminate:` on macOS.
 //!
 //! # Where the lock lives
@@ -177,6 +185,16 @@
 //! every minute that its lock is still in place, re-creating it when
 //! something deleted it. On Windows nothing can: the owner holds its
 //! folder, its lock and `instance.pipe` open, sharing no delete.
+//!
+//! On Unix the owner also holds a lock in the state folder, on
+//! `.instance-handoff.lock`: the [guard](Guard). Launches that name one
+//! state folder can still find two runtime folders: in two containers,
+//! under two [`Builder::dir`] folders, or as two app ids (an app and a
+//! companion tool that share its folder), say. The guard keeps the second
+//! from owning the state beside the first: it runs alone at once with
+//! [`Reason::StateInUse`]. A `start` that takes the lock makes the state
+//! folder first if it is missing, whether or not it takes the guard.
+//! Windows owners take no guard, and make nothing in the state folder.
 //!
 //! # Privileges
 //!
@@ -268,10 +286,12 @@
 //!   must resolve the state folder to the same path. But paths outside the
 //!   shared mounts may name other files there. A container without systemd
 //!   uses its own `/tmp`, and root in a container usually its own `/run`,
-//!   so each runs its own owner: if it must meet the host's, pass the
-//!   bind-mounted folder to [`Builder::dir`] in both, with a state folder
-//!   both see at one path. Use [`Builder::scope`] with the container's name
-//!   for one owner per container.
+//!   so its launches and the host's can't reach each other's owner.
+//!   Whichever owns a state folder they share first holds its guard, and
+//!   the other's launches run alone with [`Reason::StateInUse`]. To have
+//!   them meet instead, pass the bind-mounted folder to [`Builder::dir`] in
+//!   both, with a state folder both see at one path. Use [`Builder::scope`]
+//!   with the container's name for one owner per container.
 //! - Windows: mapped drives and `SUBST` letters belong to one logon
 //!   session, and every logon session of a user at one integrity level (a
 //!   second RDP session, an OpenSSH login, a scheduled task) reaches the
@@ -325,6 +345,9 @@
 //!   exclusive `LockFileEx` on its first byte on Windows. Both are held per
 //!   open file,
 //!   inherited across `fork`, and released when the last copy closes;
+//! - the guard, on Unix: `flock(LOCK_EX | LOCK_NB)` on
+//!   `.instance-handoff.lock` in the state folder, held as the lock is, and
+//!   never written;
 //! - the address. On Unix, `instance.sock` beside the lock. When that path
 //!   is too long for a socket address, Linux reaches it through
 //!   `/proc/self/fd`; otherwise, and on other Unixes, it uses
@@ -426,7 +449,7 @@ mod wire;
 )]
 mod sys;
 
-pub use builder::{Builder, ElevatedOwner, Mode, State};
+pub use builder::{Builder, ElevatedOwner, Guard, Mode, State};
 pub use id::{AppId, InvalidAppId, Kind};
 pub use level::{Level, Rights};
 pub use outcome::{End, Ineligible, OwnerInfo, Reason, Started};
@@ -449,6 +472,7 @@ mod bounds {
         send_sync::<Claim<Args>>();
         send_sync::<Builder>();
         send_sync::<State>();
+        send_sync::<Guard>();
         send_sync::<Reason>();
         send_sync::<Request<Args>>();
         send_sync::<OwnerInfo>();

@@ -10,6 +10,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use instance_handoff::Guard;
 use instance_handoff::{
     AppId, Args, Builder, Claim, ElevatedOwner, End, Kind, Mode, Owner, Reason, Request, Started,
     State,
@@ -31,7 +33,8 @@ fn dir() -> Dir {
     Dir { tmp, path }
 }
 
-/// The test's state folder, beside its runtime folder. Nothing makes it.
+/// The test's state folder, beside its runtime folder. The test doesn't
+/// make it.
 fn state(dir: &Dir) -> State {
     State::dir(dir.tmp.path().join("state"))
 }
@@ -563,7 +566,8 @@ fn a_deleted_folder_is_re_created() {
     owner.release();
 }
 
-// Windows can't delete or open up a folder the owner holds.
+// Windows can't delete or open up a folder the owner holds. Without the
+// guard, which would turn the second owner away.
 #[cfg(unix)]
 #[test]
 fn an_owner_whose_lock_was_taken_ends_with_lost_lock() {
@@ -573,6 +577,7 @@ fn an_owner_whose_lock_was_taken_ends_with_lost_lock() {
     let ended = tx.clone();
     let first = claim(
         builder(&dir)
+            .guard(Guard::Off)
             .__upkeep(check, Duration::from_secs(3600))
             .start(&Args::default()),
     )
@@ -580,7 +585,9 @@ fn an_owner_whose_lock_was_taken_ends_with_lost_lock() {
     .serve(move |r| tx.send(Ok(r)).is_ok());
     std::fs::remove_dir_all(&dir.path).unwrap();
     // A new owner takes the re-made folder before the first one looks.
-    let (second, rx2) = serve(claim(builder(&dir).start(&Args::default())));
+    let (second, rx2) = serve(claim(
+        builder(&dir).guard(Guard::Off).start(&Args::default()),
+    ));
     match rx.recv_timeout(check * 4) {
         Ok(Err(End::LostLock)) => {}
         other => panic!("{other:?}"),
@@ -593,6 +600,39 @@ fn an_owner_whose_lock_was_taken_ends_with_lost_lock() {
     builder(&dir).hand_off(&args(&["y"])).unwrap();
     assert_eq!(rx2.recv_timeout(SHORT).unwrap().payload(), &args(&["y"]));
     second.release();
+}
+
+// An owner told to stop writing the state gives its guard up too, so a
+// launch in another runtime folder can own the state folder.
+#[cfg(unix)]
+#[test]
+fn an_owner_that_lost_its_lock_gives_the_guard_up() {
+    let dir = dir();
+    let check = Duration::from_millis(400);
+    let (tx, rx) = mpsc::channel();
+    let first = claim(
+        builder(&dir)
+            .__upkeep(check, Duration::from_secs(3600))
+            .start(&Args::default()),
+    );
+    assert!(first.guarded());
+    let first = first
+        .on_end(move |why| tx.send(why).unwrap())
+        .serve(|_: Request<Args>| true);
+    std::fs::remove_dir_all(&dir.path).unwrap();
+    // An owner without a guard takes the re-made folder before the first
+    // one looks.
+    let second = claim(builder(&dir).guard(Guard::Off).start(&Args::default()));
+    assert_eq!(rx.recv_timeout(check * 4).unwrap(), End::LostLock);
+    let other = claim(
+        builder(&dir)
+            .dir(dir.tmp.path().join("other"))
+            .start(&Args::default()),
+    );
+    assert!(other.guarded());
+    other.release();
+    second.release();
+    drop(first);
 }
 
 // The owner holds its folder, its lock and its address open, sharing no
@@ -709,6 +749,79 @@ fn launches_that_name_one_state_folder_through_a_link_meet() {
         .probe()
         .unwrap();
     owner.release();
+}
+
+// Two runtime folders with one state folder, as in two containers: the
+// second launch to take its lock finds the guard held, and runs alone at
+// once without binding a socket.
+#[cfg(unix)]
+#[test]
+fn a_second_runtime_folder_finds_the_state_folder_in_use() {
+    let dir = dir();
+    let first = claim(builder(&dir).start(&Args::default()));
+    assert!(first.guarded());
+    let other = builder(&dir).dir(dir.tmp.path().join("other"));
+    let t = Instant::now();
+    let reason = alone(other.start(&args(&["x"])));
+    let guard = canonical(dir.tmp.path())
+        .join("state")
+        .join(".instance-handoff.lock");
+    assert!(
+        matches!(&reason, Reason::StateInUse { path, .. } if *path == guard),
+        "{reason}"
+    );
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    // It let go of its lock: nobody owns that runtime folder.
+    let reason = other.probe().unwrap_err();
+    assert!(matches!(reason, Reason::NoOwner { .. }), "{reason}");
+    first.release();
+    claim(other.start(&Args::default())).release();
+}
+
+// Guard::Off takes no guard and makes no guard file, so an owner in
+// another runtime folder starts beside it. Like a keyed owner, it still
+// makes the missing state folder, private. State::none has no folder to
+// guard.
+#[cfg(unix)]
+#[test]
+fn guard_off_keyed_and_no_state_take_no_guard() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let dir = dir();
+    let state = dir.tmp.path().join("state");
+    let off = claim(builder(&dir).guard(Guard::Off).start(&Args::default()));
+    assert!(!off.guarded());
+    assert_eq!(mode(&state), 0o700);
+    assert!(!state.join(".instance-handoff.lock").exists());
+    let beside = claim(
+        builder(&dir)
+            .dir(dir.tmp.path().join("other"))
+            .start(&Args::default()),
+    );
+    assert!(beside.guarded());
+    assert!(state.join(".instance-handoff.lock").is_file());
+    beside.release();
+    off.release();
+
+    let keyed_state = dir.tmp.path().join("keyed");
+    let keyed = claim(
+        Builder::new(APP, keyed_state.as_path())
+            .dir(&dir.path)
+            .scope("a")
+            .start(&Args::default()),
+    );
+    assert!(!keyed.guarded());
+    assert_eq!(mode(&keyed_state), 0o700);
+    assert!(!keyed_state.join(".instance-handoff.lock").exists());
+    keyed.release();
+
+    let none = claim(
+        Builder::new(APP, State::none())
+            .dir(&dir.path)
+            .start(&Args::default()),
+    );
+    assert!(!none.guarded());
+    none.release();
 }
 
 #[test]

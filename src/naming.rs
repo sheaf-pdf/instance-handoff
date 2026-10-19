@@ -95,6 +95,10 @@ pub(crate) fn instance_key(state: Option<&Path>, scope: Option<&OsStr>) -> Vec<u
     key
 }
 
+/// The guard: the file in the state folder that the owner locks.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) const GUARD_FILE: &str = ".instance-handoff.lock";
+
 /// Root's base on Linux: the same for every root launch, whether or not
 /// root is logged in.
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -189,6 +193,11 @@ mod tests {
         assert_eq!(level_folder(0x4000), "run-system");
         assert_eq!(level_folder(0x1000), "run-low");
         assert_eq!(level_folder(0x2100), "run-2100");
+    }
+
+    #[test]
+    fn the_guard_file_is_frozen() {
+        assert_eq!(GUARD_FILE, ".instance-handoff.lock");
     }
 
     #[test]

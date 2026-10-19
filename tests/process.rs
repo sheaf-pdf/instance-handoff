@@ -699,6 +699,28 @@ fn a_stopped_owner_never_delivers_a_launch_that_ran_alone() {
     );
 }
 
+// Another process owns the state folder from another runtime folder: a
+// launch is told at once, well inside its timeout, and nothing reaches the
+// owner.
+#[cfg(unix)]
+#[test]
+fn a_guard_held_by_another_process_is_reported_at_once() {
+    let (_tmp, dir) = dir();
+    let owner = Owner::start(&dir);
+    let t = Instant::now();
+    let reason = match Builder::new(APP, state(&dir))
+        .dir(dir.with_file_name("other"))
+        .timeout(Duration::from_secs(10))
+        .start(&Args::new(["x"]))
+    {
+        Started::Alone(reason) => reason,
+        other => panic!("{other:?}"),
+    };
+    assert!(matches!(reason, Reason::StateInUse { .. }), "{reason}");
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(owner.took(Duration::from_millis(500)), None);
+}
+
 #[test]
 fn a_killed_owner_hands_the_lock_to_the_next_launch() {
     let (_tmp, dir) = dir();
@@ -843,7 +865,7 @@ fn a_launch_whose_owner_died_hands_off_to_the_next_owner() {
 }
 
 /// A child forked after `start` that drops or releases its copy of the
-/// Claim leaves the lock and the socket to its parent.
+/// Claim leaves the lock, the guard and the socket to its parent.
 #[cfg(unix)]
 fn a_fork_child_leaves_the_lock_to_its_parent(role: &str) {
     let (_tmp, dir) = dir();
@@ -873,6 +895,16 @@ fn a_fork_child_leaves_the_lock_to_its_parent(role: &str) {
         other => panic!("{other:?}"),
     };
     assert!(matches!(reason, Reason::OwnerRunning { .. }), "{reason}");
+    // And so is the guard: a launch in another runtime folder finds the
+    // state folder in use.
+    let reason = match Builder::new(APP, state(&dir))
+        .dir(dir.with_file_name("other"))
+        .start(&Args::default())
+    {
+        Started::Alone(reason) => reason,
+        other => panic!("{other:?}"),
+    };
+    assert!(matches!(reason, Reason::StateInUse { .. }), "{reason}");
 }
 
 #[cfg(unix)]
