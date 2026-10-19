@@ -302,6 +302,7 @@
 mod builder;
 mod id;
 mod launch;
+mod level;
 mod naming;
 mod outcome;
 mod owner;
@@ -342,6 +343,7 @@ mod sys;
 
 pub use builder::{Builder, Mode};
 pub use id::{AppId, InvalidAppId};
+pub use level::{Level, Rights};
 pub use outcome::{End, OwnerInfo, Reason, Started};
 pub use owner::{Claim, Owner};
 #[cfg(feature = "serde")]
@@ -364,6 +366,7 @@ mod bounds {
         send_sync::<Reason>();
         send_sync::<Request<Args>>();
         send_sync::<OwnerInfo>();
+        send_sync::<Rights>();
         send_sync::<End>();
         send::<Started<Args>>();
     }

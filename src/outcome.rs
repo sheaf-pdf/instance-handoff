@@ -4,7 +4,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::{BoxError, Claim};
+use crate::{BoxError, Claim, Level, Rights};
 
 /// What [`Builder::start`] decided. Exactly one of three things.
 ///
@@ -36,12 +36,17 @@ impl<T> fmt::Debug for Started<T> {
 /// The owner a launch reached: from [`Started::HandedOff`],
 /// [`Builder::hand_off`] and [`Builder::probe`].
 ///
+/// It displays as its pid and level, for messages: `pid 4242, high`. An
+/// unknown pid shows as `pid unknown`, and an unknown level is left out.
+///
 /// [`Builder::hand_off`]: crate::Builder::hand_off
 /// [`Builder::probe`]: crate::Builder::probe
 #[derive(Debug, Clone)]
 pub struct OwnerInfo {
     pub(crate) pid: Option<u32>,
     pub(crate) confirmed: bool,
+    pub(crate) level: Option<Level>,
+    pub(crate) handed_down: Option<Rights>,
 }
 
 impl OwnerInfo {
@@ -52,16 +57,42 @@ impl OwnerInfo {
         self.pid
     }
 
-    /// Whether the owner said its handler took the request. It is `false`
-    /// when this launch committed its request and then got no answer: the
-    /// owner stopped, hung, or died with nothing to take its place, or its
-    /// handler panicked. The request may be taken late, or not at all, and
-    /// this process should still exit. Always `true` from
-    /// [`Builder::probe`].
+    /// Whether the owner said its handler took the request, or, from
+    /// [`Builder::probe`], that it serves. It is `false` when this launch
+    /// committed its request and then got no answer: the owner stopped,
+    /// hung, or died with nothing to take its place, or its handler
+    /// panicked. The request may be taken late, or not at all, and this
+    /// process should still exit. It is also `false` for an owner this
+    /// launch reported without talking to it.
     ///
     /// [`Builder::probe`]: crate::Builder::probe
     pub fn confirmed(&self) -> bool {
         self.confirmed
+    }
+
+    /// The owner's Windows integrity level, if this launch learned it.
+    /// `None` on other platforms, which have no integrity levels.
+    pub fn level(&self) -> Option<Level> {
+        self.level
+    }
+
+    /// The rights this launch gave up to hand its request to an owner that
+    /// lacks them. `None` when it gave up nothing.
+    pub fn handed_down(&self) -> Option<&Rights> {
+        self.handed_down.as_ref()
+    }
+}
+
+impl fmt::Display for OwnerInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.pid {
+            Some(pid) => write!(f, "pid {pid}")?,
+            None => f.write_str("pid unknown")?,
+        }
+        match self.level {
+            Some(level) => write!(f, ", {level}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -208,6 +239,26 @@ pub enum Reason {
         /// What the check found.
         source: io::Error,
     },
+    /// This launch has rights the owner lacks, such as a higher integrity
+    /// level. The request wasn't delivered, since the owner would act on it
+    /// without them.
+    #[non_exhaustive]
+    MoreRights {
+        /// The owner.
+        owner: OwnerInfo,
+        /// What this launch has and the owner lacks.
+        rights: Rights,
+    },
+    /// The owner has rights this launch lacks, such as a higher integrity
+    /// level. The request wasn't delivered, since the owner would act on it
+    /// with rights its launch never had.
+    #[non_exhaustive]
+    OwnerHasMoreRights {
+        /// The owner.
+        owner: OwnerInfo,
+        /// What the owner has and this launch lacks.
+        rights: Rights,
+    },
     /// On Linux with systemd: this process has no login session, so the
     /// user's runtime folder (`/run/user/<uid>`) doesn't exist. Launches
     /// from cron, `@reboot`, `su`, `sudo` or a system service land here. Run
@@ -289,6 +340,14 @@ impl fmt::Display for Reason {
             }
             Reason::Encode { source } => write!(f, "couldn't encode the request: {source}"),
             Reason::Peer { source } => write!(f, "the running instance isn't ours: {source}"),
+            Reason::MoreRights { owner, rights } => write!(
+                f,
+                "the running instance ({owner}) lacks this launch's {rights}"
+            ),
+            Reason::OwnerHasMoreRights { owner, rights } => write!(
+                f,
+                "the running instance ({owner}) has {rights}, which this launch lacks"
+            ),
             Reason::NoSession {} => f.write_str(
                 "no login session, so no runtime folder (`loginctl enable-linger` keeps one)",
             ),
@@ -313,5 +372,60 @@ impl Error for Reason {
             | Reason::Lock { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owner(pid: Option<u32>, level: Option<Level>) -> OwnerInfo {
+        OwnerInfo {
+            pid,
+            confirmed: true,
+            level,
+            handed_down: None,
+        }
+    }
+
+    #[test]
+    fn owners_display_their_pid_and_level() {
+        assert_eq!(
+            owner(Some(4242), Some(Level::HIGH)).to_string(),
+            "pid 4242, high"
+        );
+        assert_eq!(owner(Some(4242), None).to_string(), "pid 4242");
+        assert_eq!(
+            owner(None, Some(Level::MEDIUM)).to_string(),
+            "pid unknown, medium"
+        );
+        assert_eq!(owner(None, None).to_string(), "pid unknown");
+    }
+
+    #[test]
+    fn rights_reasons_name_the_owner_and_the_rights() {
+        let more = Reason::MoreRights {
+            owner: owner(Some(4242), Some(Level::MEDIUM)),
+            rights: Rights::Level {
+                launch: Level::HIGH,
+                owner: Level::MEDIUM,
+            },
+        };
+        assert_eq!(
+            more.to_string(),
+            "the running instance (pid 4242, medium) lacks this launch's high integrity"
+        );
+        let fewer = Reason::OwnerHasMoreRights {
+            owner: owner(None, Some(Level::HIGH)),
+            rights: Rights::Level {
+                launch: Level::MEDIUM,
+                owner: Level::HIGH,
+            },
+        };
+        assert_eq!(
+            fewer.to_string(),
+            "the running instance (pid unknown, high) has high integrity, which this launch lacks"
+        );
+        assert!(more.source().is_none() && fewer.source().is_none());
     }
 }

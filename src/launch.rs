@@ -303,6 +303,8 @@ fn after_commit(
     let unconfirmed = OwnerInfo {
         pid: None,
         confirmed: false,
+        level: None,
+        handed_down: None,
     };
     loop {
         if may_own {
@@ -391,6 +393,8 @@ fn exchange(
     let info = OwnerInfo {
         pid: conn.peer_pid(),
         confirmed: true,
+        level: None,
+        handed_down: None,
     };
     let Some(request) = request else {
         // A probe: the owner serves. Leave without sending anything.
