@@ -307,6 +307,14 @@
 //!   [scope](Builder::scope) of their own, such as the container's name:
 //!   owners with scopes share the guard, so the app must keep their writes
 //!   to the state safe.
+//! - User namespaces: root in one (rootless Podman, `bwrap --uid 0`) is
+//!   the user on the host, but root to this crate. It owns in
+//!   `/run/instance-handoff` in its own `/run`, and the user's folders are
+//!   its own. In any user namespace, Flatpak's too, the folders of users
+//!   it doesn't map, host root's among them, show as the overflow user
+//!   (`nobody`), which counts as another user: a state folder there gives
+//!   [`Reason::ForeignState`], and so does a missing one whose nearest
+//!   folder is there, as in a `/tmp` shared with the host.
 //! - Windows: mapped drives and `SUBST` letters belong to one logon
 //!   session, and every logon session of a user at one integrity level (a
 //!   second RDP session, an OpenSSH login, a scheduled task) reaches the

@@ -242,7 +242,8 @@ impl Builder {
     /// given the user's `%APPDATA%`.
     ///
     /// - On Unix, a folder of the launch's user or of root passes. Root's
-    ///   launches pass only root's.
+    ///   launches pass only root's. In a user namespace, host root's
+    ///   folders show as the overflow user (`nobody`), and don't pass.
     /// - On Windows, a folder of the launch's user, SYSTEM, Administrators
     ///   or TrustedInstaller passes, and so does any folder on a volume
     ///   that keeps no owners, such as FAT.
