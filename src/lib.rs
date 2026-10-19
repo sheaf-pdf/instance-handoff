@@ -1,16 +1,22 @@
-//! Funnel every launch of a program into one process per user.
+//! Funnel every launch of an app into one process per user and state.
 //!
-//! The first launch takes a lock in a private, per-user runtime folder and
-//! becomes the **owner**: the one process that holds the program's state.
-//! Every later launch connects to the owner, hands over a payload (often its
-//! [`Args`]) and exits. The OS releases the lock when the owner exits, crash
+//! The first launch takes a lock in a private, per-user folder and becomes
+//! the **owner**: the one process that keeps the app's state. Every later
+//! launch connects to the owner, hands over a payload (often its [`Args`])
+//! and exits. The OS releases the lock when the owner exits, crash
 //! included, so a lock is never stale.
 //!
+//! The state is the folder the app keeps its files in ([`State`]), and the
+//! lock's folder is named after it: launches that name one state folder
+//! meet one owner, and launches that name two get two.
+//!
 //! ```no_run
-//! use instance_handoff::{AppId, Args, Builder, Request, Started, State};
+//! use instance_handoff::{AppId, Args, Builder, Reason, Request, Started, State};
 //!
 //! const APP: AppId = AppId::windowed("org.example.Player");
 //! # fn library_dir() -> std::path::PathBuf { unimplemented!() }
+//! # fn ask(_: &str) -> bool { false }
+//! # fn play_alone(_: Args) {}
 //!
 //! // Hand over only what the owner needs: here, the files. A flag is not a
 //! // path, and `Request::resolve` would make one of it.
@@ -20,10 +26,24 @@
 //!     .collect();
 //! // Decide first, before any window, event loop or runtime exists. The
 //! // state is the folder the player keeps its library in.
-//! let claim = match Builder::new(APP, State::dir(library_dir())).start(&files) {
+//! let player = Builder::new(APP, State::dir(library_dir()));
+//! let claim = match player.start(&files) {
 //!     Started::Owner(claim) => claim,
 //!     Started::HandedOff(_) => return, // the owner has them; exit
-//!     Started::Alone(reason) => panic!("can't run as the only instance: {reason}"),
+//!     Started::Alone(reason) => {
+//!         // On Windows, from an administrator terminal, with a normal
+//!         // player running: its handler would open the files without
+//!         // these rights.
+//!         if let Reason::MoreRights { owner, rights, .. } = &reason {
+//!             let open = format!("Open in the running player ({owner}), without {rights}?");
+//!             if ask(&open) && player.clone().hand_down(true).hand_off(&files).is_ok() {
+//!                 return;
+//!             }
+//!         }
+//!         // Play them without the library, which only the owner writes.
+//!         eprintln!("{reason}");
+//!         return play_alone(files);
+//!     }
 //! };
 //! let (tx, rx) = std::sync::mpsc::channel();
 //! let owner = claim.serve(move |request| tx.send(request).is_ok());
@@ -42,27 +62,36 @@
 //!
 //! # Guarantees
 //!
-//! - At most one process holds the lock for an app id and runtime folder
-//!   at a time, and only it gets [`Started::Owner`]. The owner also holds
-//!   the state folder's [guard](Guard), where it takes one, so a launch
-//!   that took the lock in another runtime folder (another container,
-//!   another [`Builder::dir`] or another app id) doesn't own that state
-//!   folder too: it runs alone at once with [`Reason::StateInUse`].
-//!   Two owners that both have a [scope](Builder::scope) share the guard,
-//!   and own the state folder side by side. [`Builder::exclusive`] holds
-//!   the guard alone, where it takes one, for a process's own work, so no
-//!   launch that takes the guard owns the state folder beside it. A
-//!   process that gets [`Started::Alone`] must not write the state the
-//!   owner owns. If the state folder is removed or replaced under an owner
-//!   that holds its guard, the owner is told ([`End::LostState`]) within a
-//!   minute, and gives up its guard and its lock, so the next launch owns
-//!   the folder now at the path. If the runtime folder is deleted under a
-//!   running owner, the owner makes it again within a minute, once no
-//!   other process holds the lock there. Where the owner holds the guard
-//!   alone, a launch that takes the lock there first finds the guard held
-//!   and lets go, and the owner waits for any other process that holds it.
-//!   Otherwise, if another process takes the lock there first, the owner
-//!   is told ([`End::LostLock`]), and gives its guard up.
+//! - One owner per state. Launches of one app id by one user that name one
+//!   state folder and one [scope](Builder::scope) meet at one lock in their
+//!   runtime folder, and only the one that holds it gets
+//!   [`Started::Owner`]. The user's launches find the same runtime folder
+//!   whatever their Windows integrity level, session or display. Both
+//!   [kinds](Kind) of an app id meet there, and a launch of the other kind
+//!   than the owner's gets [`Reason::OtherApp`]. The owner also holds the
+//!   state folder's [guard](Guard), so a launch that took a lock in another
+//!   runtime folder (in another container, under another [`Builder::dir`],
+//!   or as another app id that shares the folder) doesn't own it too: it
+//!   runs alone at once with [`Reason::StateInUse`]. Owners with a scope
+//!   share the guard: owners of one state folder under two scopes, or
+//!   under one scope in two runtime folders, own it side by side, but
+//!   never beside an owner without one. Nor does the guard keep anyone out
+//!   where the owner takes none: under [`Guard::Off`], for [`State::none`],
+//!   on a network file system, or where the file system can't lock files.
+//! - A process that gets [`Started::Alone`], for whatever reason
+//!   ([`Reason::MoreRights`] among them), must not write the state: only
+//!   the owner, or a process that holds the state with
+//!   [`Builder::exclusive`], may. If the state folder is removed or
+//!   replaced under an owner that holds its guard, the owner is told
+//!   ([`End::LostState`]) within a minute, and gives up its guard and its
+//!   lock, so the next launch owns the folder now at the path. If the
+//!   runtime folder is deleted under a running owner, the owner makes it
+//!   again within a minute, once no other process holds the lock there.
+//!   Where the owner holds the guard alone, a launch that takes the lock
+//!   there first finds the guard held and lets go, and the owner waits for
+//!   any other process that holds it. Otherwise, if another process takes
+//!   the lock there first, the owner is told ([`End::LostLock`]), and gives
+//!   its guard up.
 //! - Each launch ends one of three ways, whatever the timing (stopped
 //!   processes, slow handlers, expired timeouts):
 //!   - it hands off ([`Started::HandedOff`]): an owner's handler takes its
@@ -77,33 +106,90 @@
 //!   may have taken a request but before it could say so. The launch then
 //!   takes the lock itself or hands the request to the next owner, so work
 //!   the dead owner had started may be done again.
-//! - Only processes of the same user at the same privilege level hand off
-//!   to each other, so a request never runs with more or fewer rights than
-//!   its launch had, unless the app lets a launch hand its request down to
-//!   an owner with fewer ([`Builder::hand_down`]); see
-//!   [Privileges](#privileges). On Unix both ends check the other's user
-//!   id. On Windows every integrity level finds the one owner, and a launch
-//!   at another level than the owner's learns so at once, from the owner's
-//!   lock, and hands it nothing, unless it is above the owner and hands its
-//!   request down. The owner checks the launch's token: it refuses another
-//!   user, and a launch whose token is at another integrity level, naming
-//!   its own level, unless the launch is above it and hands its request
-//!   down. The launch checks that the pipe is its own user's, at the level
-//!   the owner's lock shows.
+//! - A request never runs with more rights than its launch had, and never
+//!   with fewer unless the app lets the launch hand it down
+//!   ([`Builder::hand_down`]). It never goes to another user. Both ends
+//!   check the other: see [Privileges](#privileges).
 //! - [`Builder::start`], [`Builder::hand_off`], [`Builder::probe`] and
 //!   [`Builder::exclusive`] never panic, whatever the
 //!   [timeout](Builder::timeout). Every failure is a [`Reason`], and
 //!   failures that waiting can't fix return at once.
 //!
+//! # The state
+//!
+//! [`State::dir`] names the folder the app keeps its state in: the files
+//! only the owner writes. Pass the folder the app's storage layer writes,
+//! computed by the same function, so that the owner owns what the app
+//! writes. An app with several folders passes the one the others are
+//! derived from. [`State::none`] is for an app that keeps no files of its
+//! own: its launches meet by app id, user and scope alone, and no guard
+//! keeps out an owner in another runtime folder.
+//!
+//! - The folder's links are resolved, so launches that name it through a
+//!   symbolic link, a `SUBST` letter or a mapped drive meet one owner, as
+//!   long as each can see the link. On Windows a mapped drive or a `SUBST`
+//!   letter belongs to one logon session, and a launch run as
+//!   administrator with UAC on has a logon session of its own (see
+//!   [Containers and sandboxes](#containers-and-sandboxes)).
+//! - The folder needn't exist: a [`Builder::start`] that takes the lock,
+//!   and [`Builder::exclusive`], make it when it is missing, private,
+//!   whether or not they take the guard.
+//! - A launch that the app's function gives another folder gets another
+//!   owner. If the function follows the environment, as
+//!   `dirs::config_dir()` follows `HOME` and `XDG_CONFIG_HOME` on Unix, a
+//!   shell or a test that points those elsewhere gets an owner of its own.
+//!   If it follows the account, as the Windows known folders do (they
+//!   ignore `%APPDATA%`), a test must pass its folder through an option of
+//!   the app's own.
+//! - The owner keeps its [guard](Guard), `.instance-handoff.lock`, in the
+//!   folder. For a folder that a sync tool copies between machines, and
+//!   for config that is read-only or shared, use [`Guard::Off`].
+//! - The app must never replace or rename the folder, though it may
+//!   replace the files in it. On Unix an owner that holds the guard ends
+//!   with [`End::LostState`] within a minute when the folder is replaced;
+//!   on Windows, replacing or renaming it fails while the owner holds the
+//!   guard.
+//! - A folder of another user's, as the user's home is to root under
+//!   `sudo -E`, gives [`Reason::ForeignState`]: see [`Builder::new`].
+//!
+//! Recipes:
+//!
+//! - **An administrator terminal.** On Windows, a launch from one, with a
+//!   normal owner running, gets [`Reason::MoreRights`], which names the
+//!   owner and what it lacks. The crate never decides whether a request
+//!   may do without its launch's rights: the app, or its user, does. Ask
+//!   the user whether to open the request in the running instance without
+//!   those rights, and on a yes hand it down, as the example above does:
+//!   `b.clone().hand_down(true).hand_off(&payload)`. Otherwise run alone,
+//!   writing no state. A command that needs no rights, such as `stop` or
+//!   `reload`, can hand down without asking.
+//! - **Batch work.** Work that rewrites the state, such as a migration, an
+//!   import, a cron job or a CI step, holds it with [`Builder::exclusive`]
+//!   (see its example). That serves no launches, and while it is held no
+//!   launch owns the state folder (see [`Exclusive`] for the exceptions).
+//! - **Front ends.** Commands that only make sense against a running app,
+//!   such as `status`, `stop` or `--remote open`, use [`Builder::probe`]
+//!   and [`Builder::hand_off`], which never own: see
+//!   [Daemons](#daemons-services-and-cron).
+//! - **Tests and CI.** Give each test a state folder of its own, a fresh
+//!   temporary one, say: it gets an owner of its own, and a test that
+//!   panics while it owns can't block the next. An app with
+//!   [`State::none`] gives each test a [scope](Builder::scope), or a
+//!   [`Builder::dir`], of its own instead: a test that points `HOME`
+//!   elsewhere still meets the others. Without a display, as on most CI
+//!   runners, a [windowed](Kind::Windowed) app's launches can't own: build
+//!   the tests' [`AppId`] as headless, or on Linux and the BSDs run them
+//!   under a display server such as Xvfb (`xvfb-run cargo test`).
+//!
 //! # Threads, blocking and fork
 //!
 //! - `start`, `hand_off` and `probe` block for at most the
 //!   [timeout](Builder::timeout) plus the greater of the timeout and one
-//!   second, and usually for a few milliseconds. Call
-//!   them first thing in `main`, before an event loop, a display connection
-//!   or an async runtime exists, or inside `spawn_blocking`. Serve the
-//!   [`Claim`] soon after: launches wait for it, and run alone if it takes
-//!   longer than their timeout.
+//!   second, and usually for a few milliseconds. Call them first thing in
+//!   `main`, before an event loop, a display connection or an async
+//!   runtime exists, or inside `spawn_blocking`. Serve the [`Claim`] soon
+//!   after: launches wait for it, and run alone if it takes longer than
+//!   their timeout.
 //! - `start` creates no thread. A [`Claim`] is a held lock and a listening
 //!   socket, nothing more; [`Claim::serve`] and [`Claim::decline_all`] start
 //!   the crate's one thread, named after the app id. [`Builder::exclusive`]
@@ -157,10 +243,10 @@
 //!
 //! # Where the lock lives
 //!
-//! In a local, per-user folder that every launch of the same user finds,
-//! and in it a folder named after the state. Each launch has exactly one
-//! right folder and never falls back to another, because a fallback is how
-//! two launches end up with two owners. The app's folder is:
+//! In a local, per-user folder that every launch of the same user finds:
+//! the app's folder. Each launch has exactly one right folder and never
+//! falls back to another, because a fallback is how two launches end up
+//! with two owners. The app's folder is:
 //!
 //! - Linux in a Flatpak sandbox: `$XDG_RUNTIME_DIR/app/$FLATPAK_ID/<id>`;
 //!   in a snap: `$XDG_RUNTIME_DIR/<id>`.
@@ -174,8 +260,8 @@
 //!   exists while the user has a session (or lingers). Without it,
 //!   launches that may own run alone with [`Reason::NoSession`], and
 //!   [`Builder::hand_off`], [`Builder::probe`] and the other launches look
-//!   only at the state folder's [guard](Guard); see "Daemons, services and
-//!   cron".
+//!   only at the state folder's [guard](Guard); see
+//!   [Daemons](#daemons-services-and-cron).
 //! - Other users on Linux without systemd, the BSDs and illumos:
 //!   `/tmp/<id>-<uid>`, created private. If another user created it first,
 //!   launches run alone with [`Reason::RuntimeDir`]. (CI checks FreeBSD,
@@ -193,118 +279,109 @@
 //! - Anywhere else: nothing; launches run alone with
 //!   [`Reason::Unsupported`].
 //!
-//! The lock is in the instance folder inside the app's folder: `i-` and 16
-//! hex digits of a hash of the state folder, with its links resolved as
-//! [`State::dir`] says, and of the [scope](Builder::scope). So launches
-//! that name one state folder meet one owner, and launches that name two
-//! get two. Should two hash alike, a launch of one that reaches the
-//! other's owner gets [`Reason::OtherApp`]: [`start`](Builder::start) runs
-//! alone with it, and [`hand_off`](Builder::hand_off) and
-//! [`probe`](Builder::probe) return it. On Windows every integrity level
-//! shares the instance folder and the lock in it. The owner publishes its
-//! pipe's name in a folder of its level there: `run`, or `run-high` for a
-//! process run as administrator; see [Privileges](#privileges).
+//! The lock is in the instance folder of the state, in the app's folder:
+//! `i-` and 16 hex digits of a hash of the state folder, with its links
+//! resolved as [`State::dir`] says, and of the [scope](Builder::scope).
+//! The app's kind isn't part of it. Should two states hash alike, a launch
+//! of one that reaches the other's owner gets [`Reason::OtherApp`]:
+//! [`start`](Builder::start) runs alone with it, and
+//! [`hand_off`](Builder::hand_off) and [`probe`](Builder::probe) return
+//! it. On Windows every integrity level shares the app's folder, the
+//! instance folder and the lock in it, and each level has an address
+//! folder there: `run`, or `run-high` for a process run as administrator.
+//! See [Privileges](#privileges) for what they hold.
 //!
 //! [`Builder::dir`] replaces the app's folder. It is never a config folder:
 //! on Windows that roams and may be a network share, where a lock would
 //! span machines. The instance folder is made in it, as in the app's
-//! folder. The owner touches its files every hour, so cleaners that go by
-//! age leave them alone, and checks every minute that its lock is still in
-//! place, re-creating it when something deleted it. On Windows nothing
-//! can: the owner holds its folders, its lock and `instance.pipe` open,
-//! sharing no delete.
+//! folder.
 //!
-//! The owner also holds a lock in the state folder, on
-//! `.instance-handoff.lock`: the [guard](Guard). Launches that name one
-//! state folder can still find two runtime folders: in two containers,
-//! under two [`Builder::dir`] folders, or as two app ids (an app and a
-//! companion tool that share its folder), say. The guard keeps the second
-//! from owning the state beside the first: it runs alone at once with
-//! [`Reason::StateInUse`]. Owners with a [scope](Builder::scope) take the
-//! guard shared, so they own one state folder side by side, but never
-//! beside an owner without one. On a network file system the owner takes
-//! no guard, so each host keeps an owner of its own; on Windows that is a
-//! share, which a mapped drive resolves to, or a drive that Windows says is
-//! remote. Nor does it where the file system can't lock files: see
-//! [`Guard::Local`]. A `start` that takes the lock makes the state folder
-//! first if it is missing, private, whether or not it takes the guard.
+//! On Unix the owner touches its files every hour, so cleaners that go by
+//! age leave them alone, and checks every minute that its lock is still in
+//! place, making the folder and the lock again when something deleted
+//! them. On Windows nothing can: the owner holds its folders, its lock and
+//! `instance.pipe` open, sharing no delete.
+//!
+//! The owner also holds the state folder's [guard](Guard): a lock on
+//! `.instance-handoff.lock` in it, alone, or shared for an owner with a
+//! [scope](Builder::scope). On a network file system the owner takes no
+//! guard, so each host keeps an owner of its own; on Windows that is a
+//! share, which a mapped drive resolves to, or a drive that Windows says
+//! is remote. Nor does it where the file system can't lock files: see
+//! [`Guard::Local`].
+//!
 //! Every minute, an owner that holds the guard checks that the paths of
-//! the state folder and of the guard file still name the ones it holds. It
-//! makes a removed guard file again, and ends with [`End::LostState`] when
-//! the state folder was removed or replaced, or another process holds the
-//! new guard file. On Windows nothing can change either while the owner
-//! holds the guard. [`Builder::exclusive`] takes the guard alone, with no
-//! lock in a runtime folder; where it can't take the guard, it takes the
-//! lock in the runtime folder instead, and serves nothing. Unlike an
-//! owner, it never checks that the state folder is still in place.
+//! the state folder and of the guard file still name the ones it holds. On
+//! Unix it makes a removed guard file again, and ends with
+//! [`End::LostState`] when the state folder was removed or replaced, or
+//! another process holds the new guard file. On Windows nothing can remove
+//! the file, or rename or remove the folder, while the owner holds the
+//! guard. [`Builder::exclusive`] takes the guard alone, with no lock in a
+//! runtime folder. Where it takes no guard, it takes the lock in the
+//! runtime folder instead, and serves nothing. Unlike an owner, it never
+//! checks that the state folder is still in place.
 //!
 //! # Privileges
 //!
 //! A request runs with the rights of the launch that made it, never more,
-//! and never fewer unless the app says so. Handed to a more privileged
-//! owner, it would have that owner act for a process that isn't allowed
-//! to; handed to a less privileged one, it would run without the rights
-//! the user started it with. So a launch hands off only to an owner of its
-//! own user at its own privilege level, unless the app lets it hand its
-//! request down to one at a lower level ([`Builder::hand_down`]):
+//! and never fewer unless the app says so. Handed to an owner with more
+//! rights, it would have that owner act for a process that isn't allowed
+//! to; handed to one with fewer, it would run without the rights the user
+//! started it with. So a launch hands off only to an owner of its own user
+//! at its own privilege level, unless the app lets it hand its request down
+//! to one at a lower level ([`Builder::hand_down`]). A request never goes
+//! to another user, and is never handed up.
 //!
 //! - Unix: the level is the effective user, as the kernel reports it in the
 //!   process's own user namespace. On Linux the crate reads it, the
 //!   process's other ids and the owners of its folders with system calls
 //!   rather than through the C library, so `fakeroot` doesn't change them:
 //!   a launch under `fakeroot` is still its user's, and hands off to that
-//!   user's owner. Root (`sudo`, `su`, `doas`, `pkexec`) is another user,
-//!   with its own folder and owner. On Linux, the BSDs and illumos, root's
-//!   folder is fixed, so root's own launches and launches under `sudo` meet
-//!   one owner, whether or not root is logged in anywhere. A process whose
-//!   real and effective user or group ids differ, as a setuid or setgid
-//!   program's do while it runs with its rights, takes no part at all: it
-//!   has rights its caller lacks, in an environment its caller chose. Its
-//!   launches run alone at once with [`Reason::Excluded`], and
-//!   [`Builder::hand_off`], [`Builder::probe`] and [`Builder::exclusive`]
-//!   fail with it. Only those ids are compared: a set-id program that has
-//!   set its effective ids back to its real ones takes part, though its
-//!   saved ids may let it take its rights back, and so does a program given
-//!   file capabilities.
+//!   user's owner. Root (`sudo`, `su`, `doas`, `pkexec`, `run0`) is another
+//!   user, with its own folder and owner, so `hand_down` changes nothing on
+//!   Unix. On Linux, the BSDs and illumos, root's folder is fixed, so
+//!   root's own launches and launches under `sudo` meet one owner, whether
+//!   or not root is logged in anywhere. Both ends check the other's user
+//!   id, and an owner refuses a launch of another user at once.
 //! - Windows: the level is the user and the integrity level. Every level
-//!   shares one lock per state, in the instance folder, so a launch run as
-//!   administrator (high) and a normal (medium) one meet the same owner,
-//!   but by default only a launch at the owner's level hands off to it. An
-//!   owner marks its level in its lock and names it in its greeting, and
-//!   refuses a request from a launch whose token is at another level,
-//!   naming its own. A launch that finds an owner at another level, from
-//!   its lock, its greeting or its refusal, hands it nothing and runs alone
-//!   at once, with [`Reason::MoreRights`] when the launch has the higher
-//!   level, or [`Reason::OwnerHasMoreRights`] when the owner has;
-//!   [`Builder::probe`] reports such an owner unconfirmed. With
-//!   [`Builder::hand_down`], a launch above the owner hands its request
-//!   down instead: it says so in its request, and the owner, which admits a
+//!   shares one lock per state, so a launch run as administrator (high) and
+//!   a normal (medium) one meet the same owner, but by default only a
+//!   launch at the owner's level hands off to it. An owner marks its level
+//!   in its lock and names it in its greeting. It checks each launch's
+//!   token, and refuses another user, and a launch at another level,
+//!   naming its own level in the refusal. A launch that finds an owner at
+//!   another level, from its lock, its greeting or its refusal, hands it
+//!   nothing and runs alone at once, with [`Reason::MoreRights`] when the
+//!   launch has the higher level, or [`Reason::OwnerHasMoreRights`] when
+//!   the owner has; [`Builder::probe`] reports such an owner unconfirmed.
+//!   With `hand_down`, a launch above the owner hands its request down
+//!   instead: it says so in its request, and the owner, which admits a
 //!   launch above it only then, tells its handler what was given up, from
-//!   the levels of the two tokens ([`Request::handed_down`]). A request is
-//!   never handed up. Each owner publishes its pipe's name in a folder of
-//!   its level, labelled at that level, so lower levels can't read it. A
-//!   launch talks to an owner at its own level, or below it when it hands
-//!   down, through that folder, and checks that the folder and the owner's
-//!   pipe are labelled at the level the lock shows, refusing another with
-//!   [`Reason::Peer`]. A process that a sandbox confines takes no part at
-//!   all: one below medium (low integrity), in an AppContainer, or with a
-//!   restricted token, which has restricting SIDs. The sandbox keeps it
-//!   from what its user may do, so it must neither reach the user's owner
-//!   nor own for launches outside the sandbox. Its launches run alone at
-//!   once with [`Reason::Excluded`], and [`Builder::hand_off`],
-//!   [`Builder::probe`] and [`Builder::exclusive`] fail with it. A Basic
-//!   User token, as `runas /trustlevel:0x20000` gives, is at medium and has
-//!   no restricting SIDs, so it takes part.
+//!   the levels of the two tokens ([`Request::handed_down`]). Each owner
+//!   publishes its pipe's name in its level's address folder, labelled at
+//!   that level, so lower levels can't read it. A launch talks to an owner
+//!   at its own level, or below it when it hands down, through that folder.
+//!   It checks that the folder and the owner's pipe are labelled at the
+//!   level the lock shows, and that the pipe is its own user's, and
+//!   otherwise fails with [`Reason::Peer`].
 //!
-//! The crate never decides whether a request may do without its launch's
-//! rights: the app, or its user, does. On Windows, a launch from an
-//! administrator terminal that finds a normal owner gets
-//! [`Reason::MoreRights`], which names the owner and what it lacks. The
-//! app can ask the user whether to open the request in the running
-//! instance without those rights, and on a yes hand it off again with
-//! `b.clone().hand_down(true).hand_off(&payload)`. Otherwise it runs
-//! alone, and must not write the state. A command that needs no rights,
-//! such as a reload, can hand down without asking.
+//! A process that has rights its caller lacks, or that a sandbox confines,
+//! takes no part at all. Its launches run alone at once with
+//! [`Reason::Excluded`], and [`Builder::hand_off`], [`Builder::probe`] and
+//! [`Builder::exclusive`] fail with it, before they look for an owner:
+//!
+//! - On Unix, a process whose real and effective user or group ids differ,
+//!   as a setuid or setgid program's do while it runs with its rights. Its
+//!   caller chose its environment and arguments. Only those ids are
+//!   compared: a set-id program that has set its effective ids back to its
+//!   real ones takes part, though its saved ids may let it take its rights
+//!   back, and so does a program given file capabilities.
+//! - On Windows, a process below medium integrity (low or untrusted), in
+//!   an AppContainer, or with a restricted token, which has restricting
+//!   SIDs. The sandbox keeps it from what its user may do, so it must
+//!   neither reach the user's owner nor own for launches outside the
+//!   sandbox. A Basic User token, as `runas /trustlevel:0x20000` gives, is
+//!   at medium and has no restricting SIDs, so it takes part.
 //!
 //! A launch whose rights were raised from a login hands off to its level's
 //! owner, but by default never becomes it ([`Builder::elevated_owner`]):
@@ -349,6 +426,20 @@
 //!
 //! # Daemons, services and cron
 //!
+//! A daemon is usually a [headless](Kind::Headless) app, so a launch with
+//! no display may own it. Its front-end commands never own: `status` uses
+//! [`Builder::probe`], `stop` and `reload` use [`Builder::hand_off`] on a
+//! clone with [`hand_down`](Builder::hand_down) set, since they need no
+//! rights, and batch commands hold the state with [`Builder::exclusive`].
+//! The repository's `examples/cli.rs` is such a daemon.
+//!
+//! `hand_off` and `probe` never fail with [`Reason::NoSession`]. With no
+//! runtime folder to look in, as from cron on Linux without a login
+//! session, they can reach no owner, and report [`Reason::NoOwner`], or
+//! [`Reason::StateInUse`] while an owner in another runtime folder, or an
+//! exclusive run, holds the state folder's [guard](Guard) so that `start`
+//! couldn't own.
+//!
 //! A launch on Linux finds the owner only if both see the same folder.
 //! Root's folder is fixed, so a service that runs as root meets root's
 //! launches as it is, unless its unit makes `/run` read-only, as
@@ -358,8 +449,9 @@
 //! default: start it through systemd, which gives services no login user
 //! id, or set [`ElevatedOwner::Allow`], as OpenRC and SysV init scripts
 //! run from `sudo` need.
-//! For a long-running owner of another user that starts
-//! outside a login session:
+//!
+//! For a long-running owner of another user that starts outside a login
+//! session:
 //!
 //! 1. Prefer a systemd user unit plus `loginctl enable-linger`, which keeps
 //!    `/run/user/<uid>` for good, so interactive launches and the service
@@ -403,9 +495,10 @@
 //!   folder is there, as in a `/tmp` shared with the host.
 //! - Windows: mapped drives and `SUBST` letters belong to one logon
 //!   session, and every logon session of a user (a second RDP session, an
-//!   OpenSSH login, a scheduled task) finds the same owner, at any
-//!   integrity level from medium up: a process that a sandbox confines
-//!   takes no part. Hand off canonical paths when that matters.
+//!   OpenSSH login, a scheduled task, or the one a launch run as
+//!   administrator has with UAC on) finds the same owner, at any integrity
+//!   level from medium up: a process that a sandbox confines takes no
+//!   part. Hand off canonical paths when that matters.
 //!
 //! # Windowed apps
 //!
@@ -423,12 +516,9 @@
 //! in session 0, as services and OpenSSH logins do, or on a window station
 //! that isn't visible. Elsewhere, and on macOS or Windows when that can't
 //! be told, every launch counts as able. A [headless](Kind::Headless)
-//! app's launches need no display to own.
-//!
-//! So where tests run without a display, as on most CI runners, a windowed
-//! app's tests can't own. Build the tests' [`AppId`] as headless, with a
-//! state folder of their own. On Linux and the BSDs they can instead run
-//! under a display server such as Xvfb (`xvfb-run cargo test`).
+//! app's launches need no display to own. So where tests run without a
+//! display, a windowed app's tests can't own: see [The state](#the-state)
+//! for what to do.
 //!
 //! # Raising a window
 //!
@@ -477,13 +567,12 @@
 //!   `<base>/<hash>.sock`, where the base is the per-user temporary folder
 //!   on macOS, root's own folder (`/run/instance-handoff` on Linux,
 //!   `/var/run/instance-handoff` on the BSDs and illumos) for root, and
-//!   `/tmp/ih-<uid>` elsewhere, and
-//!   the hash is 16 hex digits of the FNV-1a 64 hash of the folder's device
-//!   and inode (each a little-endian u64). On Windows, a
-//!   named pipe `\\.\pipe\instance-handoff.<id>.<secret>`, where the
-//!   secret is 32 random lowercase hex digits, published as
-//!   `<id> <secret>` and a newline in `instance.pipe` in the address folder
-//!   of the owner's level;
+//!   `/tmp/ih-<uid>` elsewhere, and the hash is 16 hex digits of the
+//!   FNV-1a 64 hash of the folder's device and inode (each a little-endian
+//!   u64). On Windows, a named pipe
+//!   `\\.\pipe\instance-handoff.<id>.<secret>`, where the secret is 32
+//!   random lowercase hex digits, published as `<id> <secret>` and a
+//!   newline in `instance.pipe` in the address folder of the owner's level;
 //! - the exchange. The owner sends HELLO (its app id and kind, the protocol
 //!   versions it speaks, a random nonce, its payload version, whether it
 //!   serves, on Windows its integrity level, its state folder and scope,
@@ -512,12 +601,19 @@
 //!
 //! # Not covered
 //!
-//! Replies beyond "taken" (exit codes, output, `--wait`), sharing state
-//! between processes, taking over from a hung owner, and general IPC. On
-//! macOS, Finder and Dock opens reach a running app as Apple Events through
-//! its toolkit, not as new launches; feed them to the same channel with
-//! [`Request::local`]. On Linux, D-Bus activation reaches the app the same
-//! way, if it registers for it.
+//! - Where the owner runs. A launch hands off to the owner wherever it is,
+//!   in another session or on another display of the same user (a second
+//!   RDP session, a second X server), where the windows it opens may not
+//!   be seen.
+//! - Replies beyond "taken": exit codes, output, and waiting until the
+//!   owner is done with a request, as `--wait` and `$EDITOR` need.
+//! - Sharing state between processes, taking over from a hung owner, and
+//!   general IPC.
+//!
+//! On macOS, Finder and Dock opens reach a running app as Apple Events
+//! through its toolkit, not as new launches; feed them to the same channel
+//! with [`Request::local`]. On Linux, D-Bus activation reaches the app the
+//! same way, if it registers for it.
 
 #![warn(missing_docs, missing_debug_implementations, unsafe_op_in_unsafe_fn)]
 // Where nothing can own, the machinery for owning goes unused.

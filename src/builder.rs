@@ -23,7 +23,11 @@ pub struct State {
 impl State {
     /// The folder the app's storage layer writes, computed by the same
     /// function. An app with several folders passes the one the others are
-    /// derived from. It needn't exist.
+    /// derived from. It needn't exist. The app must never replace or rename
+    /// it, though it may replace the files in it. On Unix an owner that
+    /// holds its [guard](Guard) ends with [`End::LostState`] when it is
+    /// replaced; on Windows, replacing or renaming it fails while the owner
+    /// holds the guard. See the crate docs on the state.
     ///
     /// Its links are resolved when a launch decides, not here. A relative
     /// path is made absolute against the working directory. Then the
@@ -38,6 +42,8 @@ impl State {
     /// can't search, is kept as given, made absolute. One that can't be made
     /// absolute, such as an empty path, is kept as given too, so it stays
     /// relative. Either way the launch goes on, with a warning in the log.
+    ///
+    /// [`End::LostState`]: crate::End::LostState
     pub fn dir(path: impl Into<PathBuf>) -> State {
         State {
             dir: Some(path.into()),
@@ -495,11 +501,11 @@ impl Builder {
     /// neither, and runs alone at once with [`Reason::Excluded`].
     ///
     /// Blocks for at most the [timeout](Builder::timeout) plus the greater
-    /// of the timeout and one second, and usually for a few milliseconds. `payload` is encoded only if it is
-    /// handed off. On the hand-off path this reads `XDG_ACTIVATION_TOKEN`
-    /// and `DESKTOP_STARTUP_ID` (and never unsets them); on Windows it lets
-    /// the owner's process take the foreground. Creates no thread. Never
-    /// panics.
+    /// of the timeout and one second, and usually for a few milliseconds.
+    /// `payload` is encoded only if it is handed off. On the hand-off path
+    /// this reads `XDG_ACTIVATION_TOKEN` and `DESKTOP_STARTUP_ID` (and never
+    /// unsets them); on Windows it lets the owner's process take the
+    /// foreground. Creates no thread. Never panics.
     pub fn start<T: Payload>(&self, payload: &T) -> Started<T> {
         launch::start(self, payload)
     }

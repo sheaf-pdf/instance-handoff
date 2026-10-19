@@ -59,7 +59,7 @@ pub enum Kind {
     /// services and OpenSSH logins do, or on a window station that isn't
     /// visible. On Android, and on macOS or Windows when that can't be
     /// told, every launch counts as able. So without a display, the app's
-    /// tests can't own: see the crate docs on windowed apps.
+    /// tests can't own: the crate docs on the state say what tests can do.
     Windowed,
     /// Any launch, including one with no display. Daemons, services and
     /// CLI back ends are headless, and so is a daemon that opens windows
