@@ -80,8 +80,7 @@ pub enum Mode {
     ///
     /// A separate launch that finds nobody becomes the owner. Serve it with
     /// [`Claim::decline_all`] if it must not receive the user's launches.
-    /// One that may not own ([`Builder::elevated_owner`]) runs alone at
-    /// once with [`Reason::MayNotOwn`].
+    /// One that may not own runs alone at once with [`Reason::MayNotOwn`].
     ///
     /// [`Claim::decline_all`]: crate::Claim::decline_all
     Separate,
@@ -114,8 +113,9 @@ pub enum ElevatedOwner {
     ///
     /// [`Ineligible::AboveNormal`]: crate::Ineligible::AboveNormal
     NotAboveNormal,
-    /// Any launch may own. A launch under `sudo` becomes root's owner when
-    /// root has none, and root's later launches hand off to it.
+    /// A launch's rights never keep it from owning. A launch under `sudo`
+    /// becomes root's owner when root has none, and root's later launches
+    /// hand off to it.
     Allow,
 }
 
@@ -323,9 +323,10 @@ impl Builder {
     }
 
     /// Take the lock, or hand `payload` to the process holding it. A
-    /// launch that may not own ([`Builder::elevated_owner`]) never takes
-    /// the lock: with nobody to hand off to, it runs alone with
-    /// [`Reason::MayNotOwn`].
+    /// launch that may not own never takes the lock: with nobody to hand
+    /// off to, it runs alone with [`Reason::MayNotOwn`]. That is a
+    /// [windowed](crate::Kind::Windowed) app's launch that can't show
+    /// windows, or one with raised rights ([`Builder::elevated_owner`]).
     ///
     /// Blocks for at most the [timeout](Builder::timeout) plus the greater
     /// of the timeout and one second, and usually for a few milliseconds. `payload` is encoded only if it is

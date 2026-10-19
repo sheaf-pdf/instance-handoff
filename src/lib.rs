@@ -274,6 +274,25 @@
 //!   second RDP session, an OpenSSH login, a scheduled task) reaches the
 //!   same owner. Hand off canonical paths when that matters.
 //!
+//! # Windowed apps
+//!
+//! Only a launch that can show windows becomes the owner of a
+//! [windowed](Kind::Windowed) app: an owner without a display couldn't
+//! open the windows its launches ask for. A launch that can't, as from
+//! `ssh`, cron or a system service, hands off to the owner if one is
+//! running, and otherwise runs alone at once, with [`Reason::MayNotOwn`],
+//! or with [`Reason::NoSession`] where it has no runtime folder to look in.
+//! On Linux, the BSDs and illumos a launch can show windows when
+//! `WAYLAND_DISPLAY` or `DISPLAY` is set and not empty, and on macOS when
+//! its login session has graphic access. Elsewhere, and on macOS when the
+//! session can't be read, every launch counts as able. A
+//! [headless](Kind::Headless) app's launches need no display to own.
+//!
+//! So where tests run without a display, as on most CI runners, a windowed
+//! app's tests can't own. Build the tests' [`AppId`] as headless, with a
+//! state folder of their own. On Linux and the BSDs they can instead run
+//! under a display server such as Xvfb (`xvfb-run cargo test`).
+//!
 //! # Raising a window
 //!
 //! A launch the user just started may bring a window forward; the owner, in

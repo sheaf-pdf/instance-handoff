@@ -58,6 +58,10 @@ pub(crate) fn above_normal() -> bool {
     false
 }
 
+pub(crate) fn can_show_windows() -> Option<bool> {
+    None
+}
+
 pub(crate) fn open_folder(_: &Place, _: bool) -> Result<Option<Folder>, Reason> {
     Err(Reason::Unsupported {})
 }

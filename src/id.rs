@@ -37,16 +37,27 @@ pub struct AppId {
 /// Who may become the owner of an app. It doesn't say whether the owner
 /// shows windows.
 ///
+/// A launch that may not own never takes the lock. It hands off to the
+/// owner if one is running, and otherwise runs alone at once with
+/// [`Reason::MayNotOwn`].
+///
 /// The kind doesn't change the runtime folder, so both kinds of an id meet
 /// there and never own at once: beside an owner of one kind, a launch of
-/// the other gets [`Reason::OtherApp`]. For now, any launch may own an app
-/// of either kind.
+/// the other gets [`Reason::OtherApp`].
 ///
+/// [`Reason::MayNotOwn`]: crate::Reason::MayNotOwn
 /// [`Reason::OtherApp`]: crate::Reason::OtherApp
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
     /// Only a launch that can show windows. Most apps with a GUI are
     /// windowed.
+    ///
+    /// On Linux, the BSDs and illumos, a launch can show windows when
+    /// `WAYLAND_DISPLAY` or `DISPLAY` is set and not empty. On macOS it
+    /// can when its login session has graphic access, which a login over
+    /// `ssh` hasn't. On Windows and Android, and on macOS when the session
+    /// can't be read, every launch counts as able. So without a display,
+    /// the app's tests can't own: see the crate docs on windowed apps.
     Windowed,
     /// Any launch, including one with no display. Daemons, services and
     /// CLI back ends are headless, and so is a daemon that opens windows

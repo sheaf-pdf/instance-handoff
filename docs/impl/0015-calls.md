@@ -99,6 +99,11 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
    - Android: unknown.
 
    *Our call.*
+
+   Slice 36 settled what this leaves open. *Our call (slice 36).*
+   - A variable that is set but empty counts as unset. illumos follows the BSDs. `WAYLAND_SOCKET`, which the plan also named, isn't read.
+   - On macOS, a `SessionGetInfo` that fails is unknown.
+   - A windowed app's launch that can't show windows gets `NoWindows` before any reason its rights give, since no `ElevatedOwner` lets it own.
 7. **No test hook in 0.1.** The docs tell a windowed app to run its tests under a display (Xvfb), or to build its test `AppId` as headless with its own test state. The crate's own tests use headless ids. *Our call.*
 
 ## 8. Tests and CI (slices 6, 38)

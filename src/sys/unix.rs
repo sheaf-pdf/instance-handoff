@@ -379,6 +379,81 @@ pub(crate) fn above_normal() -> bool {
     euid() == 0
 }
 
+/// The display variables, gathered apart from the rule so that the rule
+/// can be tested.
+// macOS asks the login session instead, and Android can't tell.
+#[cfg_attr(any(target_os = "macos", target_os = "android"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct DisplayEnv {
+    /// `WAYLAND_DISPLAY`: the Wayland compositor's socket.
+    pub(crate) wayland_display: Option<OsString>,
+    /// `DISPLAY`: the X server.
+    pub(crate) display: Option<OsString>,
+}
+
+/// Whether a launch on Linux, the BSDs or illumos can show windows: a
+/// display variable is set and not empty. A stale `DISPLAY` says yes, and
+/// a compositor that a client would find without `WAYLAND_DISPLAY` says
+/// no.
+#[cfg_attr(any(target_os = "macos", target_os = "android"), allow(dead_code))]
+pub(crate) fn shows_windows_from(env: &DisplayEnv) -> bool {
+    [&env.wayland_display, &env.display]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_empty())
+}
+
+#[cfg_attr(any(target_os = "macos", target_os = "android"), allow(dead_code))]
+fn display_env() -> DisplayEnv {
+    DisplayEnv {
+        wayland_display: std::env::var_os("WAYLAND_DISPLAY"),
+        display: std::env::var_os("DISPLAY"),
+    }
+}
+
+/// Whether this launch can show windows, or `None` where that can't be
+/// told.
+pub(crate) fn can_show_windows() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        session_has_graphics()
+    }
+    #[cfg(target_os = "android")]
+    {
+        None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
+    {
+        Some(shows_windows_from(&display_env()))
+    }
+}
+
+/// Whether this process's login session may use the window server:
+/// `SessionGetInfo`'s graphic-access bit. A login over `ssh` and a daemon
+/// have none. `None` when the session can't be read.
+#[cfg(target_os = "macos")]
+fn session_has_graphics() -> Option<bool> {
+    // From <Security/AuthSession.h>: the caller's own session, and the
+    // bit.
+    const CALLER_SECURITY_SESSION: u32 = u32::MAX;
+    const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SessionGetInfo(session: u32, session_id: *mut u32, attributes: *mut u32) -> i32;
+    }
+    let mut attributes = 0u32;
+    // SAFETY: `attributes` is valid for writes. The session id may be
+    // null, and then isn't written.
+    let status = unsafe {
+        SessionGetInfo(
+            CALLER_SECURITY_SESSION,
+            std::ptr::null_mut(),
+            &mut attributes,
+        )
+    };
+    (status == 0).then_some(attributes & SESSION_HAS_GRAPHIC_ACCESS != 0)
+}
+
 // ---------------------------------------------------------------------------
 // The folder
 // ---------------------------------------------------------------------------
@@ -1877,6 +1952,38 @@ mod tests {
         if env.euid != 0 {
             assert!(!raised() && !above_normal());
         }
+    }
+
+    // On Linux, the BSDs and illumos: a launch can show windows when a
+    // display variable names a display.
+    #[test]
+    fn who_can_show_windows() {
+        let (wayland, x, empty, none) = (Some("wayland-0"), Some(":0"), Some(""), None);
+        // (launch, WAYLAND_DISPLAY, DISPLAY, can show windows)
+        let rows = [
+            ("a Wayland session with Xwayland", wayland, x, true),
+            ("a Wayland session alone", wayland, none, true),
+            ("an X session", none, x, true),
+            ("ssh -X", none, Some("localhost:10.0"), true),
+            ("a console, ssh, cron or a service", none, none, false),
+            ("emptied variables", empty, empty, false),
+            ("an emptied WAYLAND_DISPLAY", empty, x, true),
+            ("an emptied DISPLAY", wayland, empty, true),
+        ];
+        for (launch, wayland_display, display, shows) in rows {
+            let env = DisplayEnv {
+                wayland_display: wayland_display.map(OsString::from),
+                display: display.map(OsString::from),
+            };
+            assert_eq!(shows_windows_from(&env), shows, "{launch}: {env:?}");
+        }
+    }
+
+    // A process can read its own login session.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_login_session_says_whether_it_has_graphics() {
+        assert!(session_has_graphics().is_some());
     }
 
     // Root's base: made only where its parent exists, and refused when it

@@ -131,15 +131,22 @@ impl fmt::Display for End {
 }
 
 /// Why a launch may not become the owner: what [`Reason::MayNotOwn`]
-/// carries. [`Builder::elevated_owner`] sets who may.
+/// carries. The app's [`Kind`] and [`Builder::elevated_owner`] set who may.
 ///
 /// It displays as the cause, for messages: `its rights were raised from a
 /// login`.
 ///
+/// [`Kind`]: crate::Kind
 /// [`Builder::elevated_owner`]: crate::Builder::elevated_owner
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ineligible {
+    /// It can't show windows, and the app is [windowed]: as from `ssh`,
+    /// cron or a system service. No [`ElevatedOwner`] lets it own.
+    ///
+    /// [windowed]: crate::Kind::Windowed
+    /// [`ElevatedOwner`]: crate::ElevatedOwner
+    NoWindows,
     /// Its rights were raised from a login, as under `sudo`, and
     /// [`ElevatedOwner::Allow`] wasn't set.
     ///
@@ -155,6 +162,7 @@ pub enum Ineligible {
 impl fmt::Display for Ineligible {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Ineligible::NoWindows => "it can't show windows",
             Ineligible::Raised => "its rights were raised from a login",
             Ineligible::AboveNormal => "it has more rights than a normal process",
         })
@@ -295,10 +303,13 @@ pub enum Reason {
         /// What the owner has and this launch lacks.
         rights: Rights,
     },
-    /// This launch may not become the owner ([`Builder::elevated_owner`]),
-    /// and nobody it may hand off to is running, or it is
-    /// [`Mode::Separate`], which never hands off. It never took the lock.
+    /// This launch may not become the owner, and nobody it may hand off
+    /// to is running, or it is [`Mode::Separate`], which never hands off.
+    /// It never took the lock. Only a launch that can show windows may own
+    /// a [windowed] app, and [`Builder::elevated_owner`] says which
+    /// launches with raised rights may own.
     ///
+    /// [windowed]: crate::Kind::Windowed
     /// [`Builder::elevated_owner`]: crate::Builder::elevated_owner
     /// [`Mode::Separate`]: crate::Mode::Separate
     #[non_exhaustive]
@@ -526,6 +537,13 @@ mod tests {
         assert_eq!(
             above.to_string(),
             "this launch may not become the running instance: it has more rights than a normal process"
+        );
+        let no_windows = Reason::MayNotOwn {
+            why: Ineligible::NoWindows,
+        };
+        assert_eq!(
+            no_windows.to_string(),
+            "this launch may not become the running instance: it can't show windows"
         );
         assert!(raised.source().is_none());
     }

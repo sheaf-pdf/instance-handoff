@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use crate::wire::{self, Hello, Reply, refusal, state, status};
 use crate::{
-    Activation, AppId, Builder, Claim, ElevatedOwner, Ineligible, Mode, OwnerInfo, Payload, Reason,
-    Started, sys,
+    Activation, AppId, Builder, Claim, ElevatedOwner, Ineligible, Kind, Mode, OwnerInfo, Payload,
+    Reason, Started, sys,
 };
 
 /// Between attempts while the owner starts, is busy or quits.
@@ -143,10 +143,21 @@ fn encode_request<T: Payload>(b: &Builder, payload: &T) -> Result<Vec<u8>, Reaso
     .encode())
 }
 
-/// Why a launch may not own under `policy`, if it may not. `raised`: its
-/// rights were raised from a login. `above_normal`: it has more rights than
-/// a normal process.
-fn ineligible(policy: ElevatedOwner, raised: bool, above_normal: bool) -> Option<Ineligible> {
+/// Why a launch of an app of `kind` may not own under `policy`, if it may
+/// not. `windows`: whether it can show windows, where that is known.
+/// `raised`: its rights were raised from a login. `above_normal`: it has
+/// more rights than a normal process.
+fn ineligible(
+    kind: Kind,
+    windows: Option<bool>,
+    policy: ElevatedOwner,
+    raised: bool,
+    above_normal: bool,
+) -> Option<Ineligible> {
+    // First, since no policy lets it own.
+    if kind == Kind::Windowed && windows == Some(false) {
+        return Some(Ineligible::NoWindows);
+    }
     match policy {
         ElevatedOwner::Allow => None,
         _ if raised => Some(Ineligible::Raised),
@@ -159,7 +170,13 @@ pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
     if !sys::SUPPORTED {
         return Started::Alone(Reason::Unsupported {});
     }
-    let may_not_own = ineligible(b.elevated_owner, sys::raised(), sys::above_normal());
+    let may_not_own = ineligible(
+        b.app_id.kind(),
+        sys::can_show_windows(),
+        b.elevated_owner,
+        sys::raised(),
+        sys::above_normal(),
+    );
     start_as(b, payload, may_not_own)
 }
 
@@ -607,7 +624,6 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Kind;
     use refusal::*;
 
     const KNOWN: [u8; 8] = [
@@ -671,8 +687,10 @@ mod tests {
     fn who_may_own() {
         use ElevatedOwner::*;
         use Ineligible::*;
+        use Kind::*;
         let rows = [
-            // (policy, raised, above normal): why it may not own.
+            // (policy, raised, above normal): why it may not own, where
+            // windows don't stop it.
             ((NotRaised, false, false), None),
             ((NotRaised, false, true), None),
             ((NotRaised, true, false), Some(Raised)),
@@ -686,10 +704,30 @@ mod tests {
             ((Allow, true, false), None),
             ((Allow, true, true), None),
         ];
-        for ((policy, raised, above), why) in rows {
+        // A headless app's launch, whatever its windows, and a windowed
+        // app's that can show them or might: only its rights count.
+        let free = [
+            (Headless, Some(false)),
+            (Headless, None),
+            (Headless, Some(true)),
+            (Windowed, None),
+            (Windowed, Some(true)),
+        ];
+        for (kind, windows) in free {
+            for ((policy, raised, above), why) in rows {
+                assert_eq!(
+                    ineligible(kind, windows, policy, raised, above),
+                    why,
+                    "{kind:?} {windows:?} {policy:?} {raised} {above}"
+                );
+            }
+        }
+        // A windowed app's launch that can't show windows never owns,
+        // whatever its rights and the policy.
+        for ((policy, raised, above), _) in rows {
             assert_eq!(
-                ineligible(policy, raised, above),
-                why,
+                ineligible(Windowed, Some(false), policy, raised, above),
+                Some(NoWindows),
                 "{policy:?} {raised} {above}"
             );
         }

@@ -189,10 +189,21 @@ impl Owner {
     /// Runs `test`, one of the roles above, in a child process, with
     /// `role` in ROLE.
     fn spawn(dir: &Path, test: &str, role: &str) -> Owner {
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        Owner::run(Owner::command(dir, test, role))
+    }
+
+    /// The command `spawn` runs.
+    fn command(dir: &Path, test: &str, role: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--exact", test, "--nocapture", "--test-threads=1", "-q"])
             .env(ROLE, role)
-            .env(DIR, dir)
+            .env(DIR, dir);
+        command
+    }
+
+    fn run(mut command: Command) -> Owner {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -387,8 +398,8 @@ fn a_launch_of_another_payload_version_is_refused_at_once() {
 }
 
 // A windowed launch beside a headless owner of its id. Not the reverse: a
-// windowed owner will need a launch that can show windows, and CI may have
-// no display.
+// windowed owner needs a launch that can show windows, and CI may have no
+// display.
 #[test]
 fn a_launch_of_the_other_kind_is_refused_at_once() {
     let (_tmp, dir) = dir();
@@ -408,6 +419,72 @@ fn a_launch_of_the_other_kind_is_refused_at_once() {
     assert!(matches!(reason, Reason::OtherApp { .. }), "{reason}");
     assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     assert_eq!(owner.took(Duration::from_millis(500)), None);
+}
+
+/// Not a test: a launch of `APP` as a windowed app, which
+/// `windowed_launch` starts with the display it is given. It serves if it
+/// owns, and otherwise prints how it started.
+#[cfg(target_os = "linux")]
+#[test]
+fn windowed_launch_process() {
+    if std::env::var_os(ROLE).is_none() {
+        return;
+    }
+    let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
+    let app = AppId::parse(APP.as_str(), Kind::Windowed).unwrap();
+    match Builder::new(app, state(&dir))
+        .dir(dir)
+        .timeout(Duration::from_secs(20))
+        .start(&Args::new(["windowed"]))
+    {
+        Started::Owner(claim) => serve(claim, false),
+        Started::HandedOff(info) => say(&format!(
+            "handed to {:?}, confirmed {}",
+            info.pid(),
+            info.confirmed()
+        )),
+        Started::Alone(reason) => say(&format!("alone: {reason:?}")),
+    }
+}
+
+/// A `windowed_launch_process` whose only display variable is `DISPLAY`
+/// set to `display`, or which has none.
+#[cfg(target_os = "linux")]
+fn windowed_launch(dir: &Path, display: Option<&str>) -> Owner {
+    let mut command = Owner::command(dir, "windowed_launch_process", "windowed");
+    command.env_remove("WAYLAND_DISPLAY").env_remove("DISPLAY");
+    if let Some(display) = display {
+        command.env("DISPLAY", display);
+    }
+    Owner::run(command)
+}
+
+// Only a launch that can show windows owns a windowed app: on Linux, one
+// with a display variable. One without runs alone at once, creating
+// nothing, or hands off to the owner. No display server is needed, since
+// nothing connects to it.
+#[cfg(target_os = "linux")]
+#[test]
+fn only_a_launch_that_can_show_windows_owns_a_windowed_app() {
+    let (_tmp, dir) = dir();
+    let t = Instant::now();
+    let alone = windowed_launch(&dir, None);
+    assert_eq!(
+        alone.said("alone: ", Duration::from_secs(10)).as_deref(),
+        Some("MayNotOwn { why: NoWindows }")
+    );
+    // Child included, well inside its 20 second timeout.
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert!(!dir.exists());
+
+    let owner = windowed_launch(&dir, Some(":99"));
+    owner.wait_for("ready");
+    let launch = windowed_launch(&dir, None);
+    assert_eq!(
+        launch.said("handed to ", Duration::from_secs(10)),
+        Some(format!("{:?}, confirmed true", Some(owner.pid())))
+    );
+    assert_eq!(owner.took(Duration::from_secs(5)), Some(hex(b"windowed")));
 }
 
 /// Not a test: a launch that `launch_under_fakeroot` starts. It prints the

@@ -242,6 +242,12 @@ pub(crate) fn above_normal() -> bool {
     false
 }
 
+/// Whether this launch can show windows. The session and window station
+/// aren't read here, so it is unknown, and every launch counts as able.
+pub(crate) fn can_show_windows() -> Option<bool> {
+    None
+}
+
 fn trusted(sid: PSID, me: &Identity) -> bool {
     // SAFETY: both are valid SIDs.
     let known = unsafe {
