@@ -58,6 +58,10 @@ pub(crate) fn above_normal() -> bool {
     false
 }
 
+pub(crate) fn level() -> Option<crate::Level> {
+    None
+}
+
 pub(crate) fn can_show_windows() -> Option<bool> {
     None
 }

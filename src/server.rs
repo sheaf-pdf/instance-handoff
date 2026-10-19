@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::wire::{self, Hello, Reply, refusal, serving, status};
-use crate::{Activation, Answer, AppId, End, Payload, Request, sys};
+use crate::{Activation, Answer, AppId, End, Level, Payload, Request, sys};
 
 /// From accepting a connection to reading its REQUEST.
 pub(crate) const REQUEST_WAIT: Duration = Duration::from_secs(2);
@@ -51,6 +51,9 @@ pub(crate) struct Ctx {
     ///
     /// [`naming::instance_key`]: crate::naming::instance_key
     pub(crate) instance_key: Vec<u8>,
+    /// The owner's integrity level, which HELLO's LEVEL sends: `None`
+    /// except on Windows, and there only when its token can't be read.
+    pub(crate) level: Option<Level>,
     pub(crate) payload_version: u32,
     pub(crate) nonce: u64,
     pub(crate) upkeep: Upkeep,
@@ -67,6 +70,7 @@ impl Ctx {
             payload_version: self.payload_version,
             max_request: wire::MAX_REQUEST,
             serving,
+            level: self.level.map(Level::rid),
             state: self.instance_key.clone(),
             features: wire::features::REFUSALS,
         }
@@ -521,6 +525,7 @@ mod tests {
         Ctx {
             app_id,
             instance_key: b"\x02\x01\0\0\0k".to_vec(),
+            level: None,
             payload_version: 3,
             nonce: 7,
             upkeep: Upkeep::default(),
@@ -578,6 +583,20 @@ mod tests {
             assert_eq!(hello.app_kind, wire::app_kind(app_id.kind()));
             assert_eq!(hello.app_kind, byte, "{app_id:?}");
             assert_eq!(hello.state, ctx.instance_key);
+        }
+    }
+
+    // An owner on Windows says its level; one elsewhere has none to say.
+    #[test]
+    fn hello_names_the_owners_level_where_it_has_one() {
+        for level in [None, Some(Level::MEDIUM), Some(Level::HIGH)] {
+            let ctx = Ctx {
+                level,
+                ..ctx(AppId::headless("test"))
+            };
+            let hello = frames(&ctx.hello(serving::TAKING));
+            let hello = Hello::decode(&hello[0].1).unwrap();
+            assert_eq!(hello.level, level.map(Level::rid), "{level:?}");
         }
     }
 

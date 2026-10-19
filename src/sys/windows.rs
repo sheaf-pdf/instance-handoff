@@ -278,6 +278,12 @@ pub(crate) fn above_normal() -> bool {
     false
 }
 
+/// This process's integrity level, or `None` when its token can't be
+/// read.
+pub(crate) fn level() -> Option<crate::Level> {
+    me().ok().map(|me| crate::Level::from_rid(me.integrity))
+}
+
 /// Where this process would show its windows, gathered apart from the rule
 /// so that the rule can be tested. `None` where a fact couldn't be read.
 #[derive(Debug)]

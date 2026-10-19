@@ -380,6 +380,11 @@ pub(crate) fn above_normal() -> bool {
     euid() == 0
 }
 
+/// This process's integrity level: none, since only Windows has them.
+pub(crate) fn level() -> Option<crate::Level> {
+    None
+}
+
 /// The display variables, gathered apart from the rule so that the rule
 /// can be tested.
 // macOS asks the login session instead, and Android can't tell.

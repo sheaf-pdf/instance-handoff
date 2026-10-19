@@ -7,8 +7,8 @@ use std::fmt;
 /// later can't change it.
 ///
 /// It exists on every platform, so code that names it builds everywhere,
-/// but only Windows has integrity levels. Elsewhere the crate never reports
-/// one.
+/// but only Windows has integrity levels. Owners elsewhere never name one,
+/// so the crate reports none there.
 ///
 /// It displays as its name, such as `high`, or, for a level with no
 /// constant here, as its RID in hex, such as `0x3010`.
@@ -32,6 +32,11 @@ impl Level {
     /// The level's relative identifier (RID), as in `S-1-16-<rid>`.
     pub const fn rid(self) -> u32 {
         self.0
+    }
+
+    /// The level with this RID, as a token or a HELLO gives it.
+    pub(crate) const fn from_rid(rid: u32) -> Level {
+        Level(rid)
     }
 }
 

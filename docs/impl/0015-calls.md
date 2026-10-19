@@ -7,7 +7,9 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
 
 ## 1. Wire (slices 5, 9, 13, 16, 17, 18)
 
-1. **Tags.** HELLO: 7 LEVEL, 9 STATE (the state and scope), 11 FEATURES (u32 LE). Today's HELLO tag 6, also called STATE (the serving state), is renamed SERVING. Gaps are left for 0.2. *Recommended.*
+1. **Tags.** HELLO: 7 LEVEL, 9 STATE (the state and scope), 11 FEATURES (u32 LE). Today's HELLO tag 6, also called STATE (the serving state), is renamed SERVING. Gaps are left for 0.2. *Recommended.* Slice 16 settled two cases this leaves open for HELLO's LEVEL. *Our call (slice 16).*
+   - Only Windows owners send it. Unix owners send none, as with REPLY in 1.6.
+   - A LEVEL that isn't 4 bytes makes HELLO malformed, as a wrong-sized SERVING or FEATURES does, and a launch reads it as not this protocol.
 2. **REQUEST.** 0x8A HAND_DOWN: a variant byte, then two RIDs as u32 LE. It is critical, so an older owner refuses it. *Recommended.*
 3. **Refusal codes.** 8 PRIVILEGE, 10 PEER; 9, 11 and 12 reserved. *Recommended.*
 4. **APP.** One kind byte, then the id. *Recommended.*

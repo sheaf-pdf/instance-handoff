@@ -551,7 +551,7 @@ fn exchange(
     let info = OwnerInfo {
         pid: conn.peer_pid(),
         confirmed: true,
-        level: None,
+        level: hello.level.map(crate::Level::from_rid),
         handed_down: None,
     };
     let Some(request) = request else {
@@ -730,6 +730,7 @@ mod tests {
             payload_version: 2,
             max_request: 100,
             serving: serving::TAKING,
+            level: None,
             state: Vec::new(),
             features: wire::features::REFUSALS,
         }

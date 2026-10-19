@@ -48,7 +48,8 @@ mod hello {
     pub const PAYLOAD_VERSION: u8 = 4;
     pub const MAX_REQUEST: u8 = 5;
     pub const SERVING: u8 = 6;
-    // 7, 8 and 10 are kept for records that come later.
+    pub const LEVEL: u8 = 7;
+    // 8 and 10 are kept for records that come later.
     pub const STATE: u8 = 9;
     pub const FEATURES: u8 = 11;
 }
@@ -258,6 +259,9 @@ pub(crate) struct Hello {
     pub(crate) max_request: u32,
     /// A [`serving`] value.
     pub(crate) serving: u8,
+    /// The RID of the owner's integrity level, sent only where it has one:
+    /// by owners on Windows.
+    pub(crate) level: Option<u32>,
     /// The state folder and scope the owner's instance folder is named
     /// from, as [`naming::instance_key`] frames them. A launch compares it
     /// with its own, so two whose hashes collide never hand off.
@@ -275,14 +279,17 @@ impl Hello {
         wire[2..].copy_from_slice(&self.wire_max.to_le_bytes());
         // The app kind byte, then the id.
         let app = [&[self.app_kind], self.app_id.as_bytes()].concat();
-        Writer::new(HELLO)
+        let mut w = Writer::new(HELLO)
             .bytes(hello::WIRE, &wire)
             .bytes(hello::APP, &app)
             .bytes(hello::NONCE, &self.nonce.to_le_bytes())
             .bytes(hello::PAYLOAD_VERSION, &self.payload_version.to_le_bytes())
             .bytes(hello::MAX_REQUEST, &self.max_request.to_le_bytes())
-            .bytes(hello::SERVING, &[self.serving])
-            .bytes(hello::STATE, &self.state)
+            .bytes(hello::SERVING, &[self.serving]);
+        if let Some(level) = self.level {
+            w = w.bytes(hello::LEVEL, &level.to_le_bytes());
+        }
+        w.bytes(hello::STATE, &self.state)
             .bytes(hello::FEATURES, &self.features.to_le_bytes())
             .finish()
     }
@@ -298,6 +305,7 @@ impl Hello {
                 PAYLOAD_VERSION,
                 MAX_REQUEST,
                 SERVING,
+                LEVEL,
                 STATE,
                 FEATURES,
             ],
@@ -320,6 +328,7 @@ impl Hello {
             payload_version: u32::from_le_bytes(r.required(PAYLOAD_VERSION)?),
             max_request: u32::from_le_bytes(r.required(MAX_REQUEST)?),
             serving: r.fixed::<1>(SERVING)?.map_or(serving::TAKING, |[s]| s),
+            level: r.fixed(LEVEL)?.map(u32::from_le_bytes),
             state: r.get(STATE).ok_or(Error::Malformed)?.to_vec(),
             features: r.fixed(FEATURES)?.map_or(0, u32::from_le_bytes),
         })
@@ -497,14 +506,15 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::naming;
+    use crate::{Level, naming};
 
     // The exact bytes of each message are the contract between builds that
     // use different releases of this crate. These tests write them out as
     // numbers, kinds and codes included, so a changed constant fails too.
     #[test]
     fn hello_bytes_are_frozen() {
-        let hello = Hello {
+        // As an owner on Unix sends it, with no level.
+        let unix = Hello {
             wire_min: 1,
             wire_max: 1,
             app_id: "a".into(),
@@ -513,12 +523,12 @@ mod tests {
             payload_version: 7,
             max_request: MAX_REQUEST,
             serving: serving::BUSY,
+            level: None,
             state: naming::instance_key(Some(Path::new("/s")), Some(OsStr::new("k"))),
             features: features::REFUSALS,
         };
-        let bytes = hello.encode();
         #[rustfmt::skip]
-        assert_eq!(bytes, [
+        let unix_bytes = [
             b'I', b'H', b'N', b'D', 1, 80, 0, 0, 0,
             1, 4, 0, 0, 0, 1, 0, 1, 0,
             2, 2, 0, 0, 0, 1, b'a',
@@ -528,17 +538,39 @@ mod tests {
             6, 1, 0, 0, 0, 1,
             9, 13, 0, 0, 0, 1, 2, 0, 0, 0, b'/', b's', 2, 1, 0, 0, 0, b'k',
             11, 4, 0, 0, 0, 1, 0, 0, 0,
-        ]);
-        let (kind, body, used) = split(&bytes, SMALL).unwrap().unwrap();
-        assert_eq!((kind, used), (HELLO, bytes.len()));
-        assert_eq!(Hello::decode(body).unwrap(), hello);
+        ];
+        // As an owner on Windows sends it, with its level after SERVING:
+        // high here.
+        let windows = Hello {
+            level: Some(Level::HIGH.rid()),
+            ..unix.clone()
+        };
+        #[rustfmt::skip]
+        let windows_bytes = [
+            b'I', b'H', b'N', b'D', 1, 89, 0, 0, 0,
+            1, 4, 0, 0, 0, 1, 0, 1, 0,
+            2, 2, 0, 0, 0, 1, b'a',
+            3, 8, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1,
+            4, 4, 0, 0, 0, 7, 0, 0, 0,
+            5, 4, 0, 0, 0, 0, 0, 0x40, 0,
+            6, 1, 0, 0, 0, 1,
+            7, 4, 0, 0, 0, 0, 0x30, 0, 0,
+            9, 13, 0, 0, 0, 1, 2, 0, 0, 0, b'/', b's', 2, 1, 0, 0, 0, b'k',
+            11, 4, 0, 0, 0, 1, 0, 0, 0,
+        ];
+        for (hello, bytes) in [(unix, &unix_bytes[..]), (windows, &windows_bytes[..])] {
+            assert_eq!(hello.encode(), bytes);
+            let (kind, body, used) = split(bytes, SMALL).unwrap().unwrap();
+            assert_eq!((kind, used), (HELLO, bytes.len()));
+            assert_eq!(Hello::decode(body).unwrap(), hello);
+            // An owner from before FEATURES has none.
+            let old = Hello::decode(&body[..body.len() - 9]).unwrap();
+            assert_eq!(old.features, 0);
+        }
         // The other app kind and serving values, which the bytes above
         // don't show.
         assert_eq!(app_kind(Kind::Windowed), 0);
         assert_eq!((serving::TAKING, serving::DECLINING), (0, 2));
-        // An owner from before FEATURES has none.
-        let old = Hello::decode(&body[..body.len() - 9]).unwrap();
-        assert_eq!(old.features, 0);
     }
 
     // A launch reads a HELLO of up to SMALL bytes beside its own STATE, so
@@ -555,6 +587,7 @@ mod tests {
             payload_version: 0,
             max_request: MAX_REQUEST,
             serving: serving::TAKING,
+            level: None,
             state: vec![b'x'; 5000],
             features: features::REFUSALS,
         };
@@ -742,6 +775,13 @@ mod tests {
         let with_app = |app: &[u8]| bare(app).bytes(hello::STATE, &[]).finish();
         // Without STATE: an owner that doesn't say what it holds.
         let bytes = bare(&[0]).finish();
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(Hello::decode(body), Err(Error::Malformed));
+        // A LEVEL that isn't a u32.
+        let bytes = bare(&[0])
+            .bytes(hello::LEVEL, &[0, 0x30])
+            .bytes(hello::STATE, &[])
+            .finish();
         let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
         assert_eq!(Hello::decode(body), Err(Error::Malformed));
         // A HELLO whose APP record has no kind byte.

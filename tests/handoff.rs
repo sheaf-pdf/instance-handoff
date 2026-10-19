@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use instance_handoff::Guard;
 use instance_handoff::{
-    AppId, Args, Builder, Claim, ElevatedOwner, End, Kind, Mode, Owner, Reason, Request, Started,
-    State,
+    AppId, Args, Builder, Claim, ElevatedOwner, End, Kind, Level, Mode, Owner, Reason, Request,
+    Started, State,
 };
 
 const APP: AppId = AppId::headless("test.handoff");
@@ -79,6 +79,54 @@ fn args(list: &[&str]) -> Args {
     Args::new(list.iter().copied())
 }
 
+/// This process's integrity level, as its RID: what an owner in this
+/// process says it runs at. Only Windows has one.
+#[cfg(unix)]
+fn own_level() -> Option<u32> {
+    None
+}
+
+#[cfg(windows)]
+fn own_level() -> Option<u32> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
+        TOKEN_QUERY, TokenIntegrityLevel,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = std::ptr::null_mut();
+    // SAFETY: the current-process pseudo handle; `token` receives a handle
+    // that `OwnedHandle` closes.
+    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    // A TOKEN_MANDATORY_LABEL and the SID it points to, in a buffer
+    // aligned for both.
+    let mut label = [0u64; 8];
+    let mut len = 0;
+    // SAFETY: `label` is valid for writes of the size given.
+    let ok = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenIntegrityLevel,
+            label.as_mut_ptr().cast(),
+            std::mem::size_of_val(&label) as u32,
+            &mut len,
+        )
+    };
+    assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: the call wrote a TOKEN_MANDATORY_LABEL whose SID points into
+    // `label`; the SID's last sub-authority is the level.
+    let rid = unsafe {
+        let sid = (*(label.as_ptr() as *const TOKEN_MANDATORY_LABEL))
+            .Label
+            .Sid;
+        let count = *GetSidSubAuthorityCount(sid);
+        *GetSidSubAuthority(sid, u32::from(count - 1))
+    };
+    Some(rid)
+}
+
 #[test]
 fn a_second_launch_hands_its_args_to_the_first() {
     let dir = dir();
@@ -104,6 +152,9 @@ fn a_second_launch_hands_its_args_to_the_first() {
     };
     assert!(info.confirmed());
     assert_eq!(info.pid(), Some(std::process::id()));
+    // The owner's level is this process's: on the Windows runner, high or
+    // medium as the step runs, and none on Unix.
+    assert_eq!(info.level().map(Level::rid), own_level());
 
     let got = rx.recv_timeout(SHORT).unwrap();
     assert_eq!(got.payload(), &second);
@@ -161,6 +212,7 @@ fn hand_off_and_probe_never_own_and_create_nothing() {
     let (owner, rx) = serve(claim(builder(&dir).start(&Args::default())));
     let info = builder(&dir).probe().unwrap();
     assert!(info.confirmed());
+    assert_eq!(info.level().map(Level::rid), own_level());
     assert!(rx.try_recv().is_err(), "a probe reaches no handler");
     builder(&dir).hand_off(&args(&["y"])).unwrap();
     assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["y"]));
@@ -453,33 +505,38 @@ fn an_owner_that_refuses_the_launchs_user_says_so_at_once() {
     owner.join().unwrap();
 }
 
+/// HELLO from an owner of this app, serving, whose state folder is `state`
+/// in the temporary folder, with no scope. With a `level`, it names its
+/// integrity level, as an owner on Windows does.
+#[cfg(unix)]
+fn hello_from(dir: &Dir, state: &str, level: Option<u32>) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let record =
+        |tag: u8, bytes: &[u8]| [&[tag][..], &(bytes.len() as u32).to_le_bytes(), bytes].concat();
+    let state = canonical(dir.tmp.path()).join(state);
+    let body = [
+        record(1, &[1, 0, 1, 0]),
+        record(2, &[&[1][..], APP.as_str().as_bytes()].concat()),
+        record(3, &[7; 8]),
+        record(4, &[0; 4]),
+        record(5, &(4u32 << 20).to_le_bytes()),
+        record(6, &[0]),
+        level.map_or_else(Vec::new, |rid| record(7, &rid.to_le_bytes())),
+        record(9, &record(1, state.as_os_str().as_bytes())),
+    ]
+    .concat();
+    [&b"IHND\x01"[..], &(body.len() as u32).to_le_bytes(), &body].concat()
+}
+
 // Two state folders whose instance folders share a name, as a hash
 // collision would make them: the owner's HELLO names its state folder, and
 // a launch of the other runs alone at once and sends nothing.
 #[cfg(unix)]
 #[test]
 fn an_owner_of_another_state_in_the_same_folder_is_another_app() {
-    use std::os::unix::ffi::OsStrExt;
     let dir = dir();
     let (_lock, listener) = fake_owner(&dir);
-    let record =
-        |tag: u8, bytes: &[u8]| [&[tag][..], &(bytes.len() as u32).to_le_bytes(), bytes].concat();
-    // HELLO from an owner of this app, serving, whose state folder is
-    // `state` in the temporary folder, and with no scope.
-    let hello = |state: &str| {
-        let state = canonical(dir.tmp.path()).join(state);
-        let body = [
-            record(1, &[1, 0, 1, 0]),
-            record(2, &[&[1][..], APP.as_str().as_bytes()].concat()),
-            record(3, &[7; 8]),
-            record(4, &[0; 4]),
-            record(5, &(4u32 << 20).to_le_bytes()),
-            record(6, &[0]),
-            record(9, &record(1, state.as_os_str().as_bytes())),
-        ]
-        .concat();
-        [&b"IHND\x01"[..], &(body.len() as u32).to_le_bytes(), &body].concat()
-    };
+    let hello = |state: &str| hello_from(&dir, state, None);
     // First the launch's own state, which it accepts, then another.
     let hellos = [
         hello("state"),
@@ -505,6 +562,26 @@ fn an_owner_of_another_state_in_the_same_folder_is_another_app() {
     let reason = alone(builder(&dir).start(&args(&["x"])));
     assert!(matches!(reason, Reason::OtherApp { .. }), "{reason}");
     assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    owner.join().unwrap();
+}
+
+// An owner that names its integrity level, as one on Windows does: the
+// launch reports it. Owners on Unix name none, so the test plays one.
+#[cfg(unix)]
+#[test]
+fn a_launch_reports_the_level_its_owner_names() {
+    let dir = dir();
+    let (_lock, listener) = fake_owner(&dir);
+    let hello = hello_from(&dir, "state", Some(0x3000));
+    let owner = std::thread::spawn(move || {
+        let mut stream = listener.incoming().next().unwrap().unwrap();
+        stream.write_all(&hello).unwrap();
+        let mut got = Vec::new();
+        stream.read_to_end(&mut got).unwrap();
+        assert!(got.is_empty(), "the probe sent {got:?}");
+    });
+    let info = builder(&dir).probe().unwrap();
+    assert_eq!(info.level(), Some(Level::HIGH));
     owner.join().unwrap();
 }
 

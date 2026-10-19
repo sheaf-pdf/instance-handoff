@@ -70,8 +70,11 @@ impl OwnerInfo {
         self.confirmed
     }
 
-    /// The owner's Windows integrity level, if this launch learned it.
-    /// `None` on other platforms, which have no integrity levels.
+    /// The owner's Windows integrity level, as the owner said it in its
+    /// greeting. `None` from owners on other platforms, which have no
+    /// integrity levels and name none, and when this launch can't say which
+    /// owner has its request, as when the owner it committed to died before
+    /// it answered and no other took its place.
     pub fn level(&self) -> Option<Level> {
         self.level
     }

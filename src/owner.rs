@@ -62,6 +62,7 @@ impl<T> Claim<T> {
             ctx: Box::new(Ctx {
                 app_id: b.app_id.clone(),
                 instance_key,
+                level: sys::level(),
                 payload_version: b.payload_version,
                 nonce: nonce(),
                 upkeep: b.upkeep,
