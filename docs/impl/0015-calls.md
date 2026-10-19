@@ -56,9 +56,9 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
 3. Root's long-path socket goes to `<root base>/<hash>.sock`. *Recommended.*
 4. On Windows, `Claim::dir`, `Owner::dir` and `runtime_dir` return the shared key folder. *Recommended.*
 5. An existing key folder with no label counts as medium. *Recommended.*
-6. A `Builder::dir` base stays unlabelled, like `<LocalAppData>\<id>`. Only `i-<hash>` gets the explicit, protected medium label. *Recommended.* A base labelled above medium is refused with `RuntimeDir`. *Our call.*
+6. A `Builder::dir` base stays unlabelled, like `<LocalAppData>\<id>`. Only `i-<hash>` gets the explicit medium label. *Recommended; the label is no longer protected, as 5.8 now says.* A base labelled above medium is refused with `RuntimeDir`. *Our call.*
 7. A Local AppData that resolves into another user's profile gives `RuntimeDir`, naming the path. A redirect outside the profiles folder stays allowed. *Recommended.*
-8. Every explicit label is protected (`S:P`), and the SDDL tests check that each object has exactly one label. *The critic's fix.*
+8. Every label the crate sets is explicit, and none is protected. A protected label (`S:P`) needs a privilege the crate's processes don't have enabled. On Windows CI, both levels failed to make a folder with one (error 1314, run 39221106656), and the crate never enables privileges. The key folder's label doesn't inherit, so each object in it carries only its own explicit label. The SDDL tests check that each object has exactly one label. *Changed after slice 3's run.*
 
 ## 6. Across Windows levels (slices 20 to 23)
 

@@ -97,10 +97,15 @@ const FOLDERS: [(&str, Option<&str>); 2] = [
     ("folder-no-label", None),
     ("folder-high-label-nr", Some("S:(ML;;NWNR;;;HI)")),
 ];
-/// The labels of the level folders in a key folder, as 0015 lays one out:
-/// protected, so that they don't also inherit the key folder's.
-const RUN: &str = "S:P(ML;OICI;NWNR;;;ME)";
-const RUN_HIGH: &str = "S:P(ML;OICI;NWNR;;;HI)";
+/// The label of a key folder and of its instance.lock, as 0015 lays them
+/// out. It doesn't inherit, so nothing made in the key folder gets a label
+/// from it. Like every label in the layout, it isn't protected (`S:P`):
+/// the `protected-label` row reports why.
+const KEY_LABEL: &str = "S:(ML;;NWNR;;;ME)";
+/// The labels of the level folders in a key folder. They inherit, so what
+/// an owner makes in its folder is labelled at its level.
+const RUN: &str = "S:(ML;OICI;NWNR;;;ME)";
+const RUN_HIGH: &str = "S:(ML;OICI;NWNR;;;HI)";
 
 // ---------------------------------------------------------------------------
 // The tests
@@ -251,6 +256,15 @@ fn what_each_level_may_do_with_the_others_files() {
     lock(&guard, GUARD, 1, true).unwrap();
     lock(&guard, u64::from(HIGH), 1, true).unwrap();
     facts.push(("guard: made by high".into(), security(&dir.join("guard"))));
+    // A key folder with its label protected (S:P). Its row shows why no
+    // label in the layout is protected.
+    let protected = dir.join("protected-label");
+    let sddl = layout_sddl("OICI", "S:P(ML;;NWNR;;;ME)");
+    let made = create(&protected, Some(&sddl), true);
+    facts.push((
+        "protected-label: made by high".into(),
+        made_as(&protected, &made, full_security),
+    ));
     // 0015's layout, owned by high: the key folder and instance.lock, with
     // high's own folder in it.
     let key = dir.join("key-by-high");
@@ -803,18 +817,39 @@ fn security(path: &Path) -> String {
     }
 }
 
-/// `path`'s owner, access list and label, as SDDL, and how many label
-/// ACEs it has. A protected label should be its only one.
+/// `path`'s owner, access list and label, as SDDL, then its label ACEs.
+/// Each object in 0015's layout should have exactly one, its own; the
+/// protected-label row shows what a protected one would be.
 fn full_security(path: &Path) -> String {
     let info = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
     match sddl(path, info) {
-        Ok(sddl) => {
-            let labels = sddl.matches("(ML;").count();
-            let s = if labels == 1 { "" } else { "s" };
-            format!("{sddl} ({labels} label ACE{s})")
-        }
+        Ok(sddl) => format!("{sddl} ({})", labels(&sddl)),
         Err(e) => e,
     }
+}
+
+/// How many label ACEs `sddl` has, and for each its level and whether it
+/// is explicit or inherited: "2 label ACEs: ME, explicit; HI, inherited".
+fn labels(sddl: &str) -> String {
+    let aces: Vec<String> = sddl
+        .split('(')
+        .filter_map(|ace| ace.strip_prefix("ML;"))
+        .map(|ace| {
+            // The rest of the ACE: flags, rights, two object GUIDs and the
+            // SID. An inherited ACE has ID among its two-letter flags.
+            let mut fields = ace.split([';', ')']);
+            let flags = fields.next().unwrap_or_default();
+            let level = fields.nth(3).unwrap_or("?");
+            let inherited = flags.as_bytes().chunks(2).any(|f| f == b"ID");
+            let how = if inherited { "inherited" } else { "explicit" };
+            format!("{level}, {how}")
+        })
+        .collect();
+    if aces.is_empty() {
+        return "0 label ACEs".into();
+    }
+    let s = if aces.len() == 1 { "" } else { "s" };
+    format!("{} label ACE{s}: {}", aces.len(), aces.join("; "))
 }
 
 /// The parts of `path`'s security that `info` names, as SDDL, or why they
@@ -1018,11 +1053,12 @@ fn held(file: &File, start: u64, end: u64, tries: &mut u32) -> io::Result<Vec<u6
 // ---------------------------------------------------------------------------
 
 /// The security 0015 gives the key folder (`inherit` "OICI") and
-/// instance.lock (""): an access list for this user and SYSTEM and a
-/// medium label, both explicit and protected.
-fn layout_sddl(inherit: &str) -> String {
+/// instance.lock (""): an explicit, protected access list for this user
+/// and SYSTEM, then `label`. The protected-label row passes a protected
+/// label to show why the layout's aren't.
+fn layout_sddl(inherit: &str, label: &str) -> String {
     let user = user();
-    format!("D:P(A;{inherit};FA;;;{user})(A;{inherit};FA;;;SY)S:P(ML;{inherit};NWNR;;;ME)")
+    format!("D:P(A;{inherit};FA;;;{user})(A;{inherit};FA;;;SY){label}")
 }
 
 /// Makes the key folder `key` with instance.lock in it, and holds the
@@ -1030,13 +1066,13 @@ fn layout_sddl(inherit: &str) -> String {
 /// as `who`, and returns the lock, held until it is dropped.
 fn make_key(key: &Path, who: &str, level: u32, facts: &mut Vec<(String, String)>) -> Option<File> {
     let name = key.file_name().unwrap().to_string_lossy();
-    let made = create(key, Some(&layout_sddl("OICI")), true);
+    let made = create(key, Some(&layout_sddl("OICI", KEY_LABEL)), true);
     facts.push((
         format!("{name}: made by {who}"),
         made_as(key, &made, full_security),
     ));
     let path = key.join("instance.lock");
-    let made = create(&path, Some(&layout_sddl("")), false);
+    let made = create(&path, Some(&layout_sddl("", KEY_LABEL)), false);
     facts.push((
         format!(r"{name}\instance.lock: made by {who}"),
         made_as(&path, &made, full_security),
