@@ -434,7 +434,8 @@ mod tests {
     use super::*;
 
     // The exact bytes of each message are the contract between builds that
-    // use different releases of this crate.
+    // use different releases of this crate. These tests write them out as
+    // numbers, kinds and codes included, so a changed constant fails too.
     #[test]
     fn hello_bytes_are_frozen() {
         let hello = Hello {
@@ -449,7 +450,7 @@ mod tests {
         let bytes = hello.encode();
         #[rustfmt::skip]
         assert_eq!(bytes, [
-            b'I', b'H', b'N', b'D', HELLO, 52, 0, 0, 0,
+            b'I', b'H', b'N', b'D', 1, 52, 0, 0, 0,
             1, 4, 0, 0, 0, 1, 0, 1, 0,
             2, 1, 0, 0, 0, b'a',
             3, 8, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1,
@@ -460,6 +461,116 @@ mod tests {
         let (kind, body, used) = split(&bytes, SMALL).unwrap().unwrap();
         assert_eq!((kind, used), (HELLO, bytes.len()));
         assert_eq!(Hello::decode(body).unwrap(), hello);
+        // The other states, which the bytes above don't show.
+        assert_eq!((state::TAKING, state::DECLINING), (0, 2));
+    }
+
+    #[test]
+    fn request_bytes_are_frozen() {
+        let full = Request {
+            wire: 1,
+            payload_version: 3,
+            cwd: Some(b"/w".to_vec()),
+            xdg_activation_token: Some("tok".into()),
+            startup_id: Some("id".into()),
+            payload: vec![0, 159, 146, 150],
+        };
+        #[rustfmt::skip]
+        let full_bytes = [
+            b'I', b'H', b'N', b'D', 2, 47, 0, 0, 0,
+            1, 2, 0, 0, 0, 1, 0,
+            2, 4, 0, 0, 0, 3, 0, 0, 0,
+            3, 2, 0, 0, 0, b'/', b'w',
+            4, 3, 0, 0, 0, b't', b'o', b'k',
+            5, 2, 0, 0, 0, b'i', b'd',
+            6, 4, 0, 0, 0, 0, 159, 146, 150,
+        ];
+        // Without the optional records. The payload goes even when empty.
+        let bare = Request {
+            wire: 1,
+            payload_version: 3,
+            ..Request::default()
+        };
+        #[rustfmt::skip]
+        let bare_bytes = [
+            b'I', b'H', b'N', b'D', 2, 21, 0, 0, 0,
+            1, 2, 0, 0, 0, 1, 0,
+            2, 4, 0, 0, 0, 3, 0, 0, 0,
+            6, 0, 0, 0, 0,
+        ];
+        for (req, bytes) in [(full, &full_bytes[..]), (bare, &bare_bytes[..])] {
+            assert_eq!(req.encode(), bytes);
+            let (kind, body, used) = split(bytes, MAX_REQUEST as usize).unwrap().unwrap();
+            assert_eq!((kind, used), (REQUEST, bytes.len()));
+            assert_eq!(Request::decode(body).unwrap(), req);
+        }
+    }
+
+    #[test]
+    fn ready_and_commit_bytes_are_frozen() {
+        for (kind, bytes) in [
+            (READY, [b'I', b'H', b'N', b'D', 3, 0, 0, 0, 0]),
+            (COMMIT, [b'I', b'H', b'N', b'D', 4, 0, 0, 0, 0]),
+        ] {
+            assert_eq!(empty(kind), bytes);
+            let (k, body, used) = split(&bytes, SMALL).unwrap().unwrap();
+            assert_eq!((k, used), (kind, bytes.len()));
+            assert_eq!(check_empty(body), Ok(()));
+        }
+    }
+
+    #[test]
+    fn reply_bytes_are_frozen() {
+        let check = |reply: Reply, bytes: &[u8]| {
+            assert_eq!(reply.encode(), bytes, "{reply:?}");
+            let (kind, body, used) = split(bytes, SMALL).unwrap().unwrap();
+            assert_eq!((kind, used), (REPLY, bytes.len()));
+            assert_eq!(Reply::decode(body).unwrap(), reply);
+        };
+        for (reply, delivered, code) in [
+            (Reply::new(true, status::TAKEN), 1, 0),
+            (Reply::new(false, status::BUSY), 0, 1),
+            (Reply::new(false, status::DECLINED), 0, 2),
+            (Reply::new(false, status::GAVE_UP), 0, 4),
+        ] {
+            #[rustfmt::skip]
+            let bytes = [
+                b'I', b'H', b'N', b'D', 5, 12, 0, 0, 0,
+                1, 1, 0, 0, 0, delivered,
+                2, 1, 0, 0, 0, code,
+            ];
+            check(reply, &bytes);
+        }
+        for (why, code) in [
+            (refusal::WIRE, 1),
+            (refusal::APP, 2),
+            (refusal::PAYLOAD_VERSION, 3),
+            (refusal::UNDECODABLE, 4),
+            (refusal::TOO_LARGE, 5),
+            (refusal::MALFORMED, 6),
+            (refusal::UNSUPPORTED, 7),
+        ] {
+            #[rustfmt::skip]
+            let bytes = [
+                b'I', b'H', b'N', b'D', 5, 18, 0, 0, 0,
+                1, 1, 0, 0, 0, 0,
+                2, 1, 0, 0, 0, 3,
+                3, 1, 0, 0, 0, code,
+            ];
+            check(Reply::refused(why), &bytes);
+        }
+        // A payload-version refusal carries the owner's version.
+        let mut reply = Reply::refused(refusal::PAYLOAD_VERSION);
+        reply.payload_version = Some(4);
+        #[rustfmt::skip]
+        let bytes = [
+            b'I', b'H', b'N', b'D', 5, 27, 0, 0, 0,
+            1, 1, 0, 0, 0, 0,
+            2, 1, 0, 0, 0, 3,
+            3, 1, 0, 0, 0, 3,
+            4, 4, 0, 0, 0, 4, 0, 0, 0,
+        ];
+        check(reply, &bytes);
     }
 
     #[test]
@@ -480,13 +591,6 @@ mod tests {
         let mut reply = Reply::refused(refusal::PAYLOAD_VERSION);
         reply.payload_version = Some(4);
         let bytes = reply.encode();
-        assert_eq!(
-            bytes,
-            [
-                b'I', b'H', b'N', b'D', REPLY, 27, 0, 0, 0, 1, 1, 0, 0, 0, 0, 2, 1, 0, 0, 0, 3, 3,
-                1, 0, 0, 0, 3, 4, 4, 0, 0, 0, 4, 0, 0, 0,
-            ]
-        );
         let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
         assert_eq!(Reply::decode(body).unwrap(), reply);
     }
