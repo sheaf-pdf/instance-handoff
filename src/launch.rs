@@ -587,7 +587,7 @@ mod tests {
     /// What this launch makes of REPLY REFUSED with `code`, after `hello`
     /// or in place of it.
     fn refused_with(code: Option<u8>, hello: Option<&Hello>) -> Reason {
-        let b = Builder::new(AppId::new("test")).payload_version(3);
+        let b = Builder::new(AppId::headless("test")).payload_version(3);
         let reply = Reply {
             refusal: code,
             ..Reply::new(false, status::REFUSED)

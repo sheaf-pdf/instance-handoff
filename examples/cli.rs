@@ -12,7 +12,7 @@ use std::sync::mpsc;
 
 use instance_handoff::{AppId, Args, Builder, End, Reason, Request, Started};
 
-const APP: AppId = AppId::new("com.example.notes");
+const APP: AppId = AppId::headless("com.example.notes");
 
 fn main() -> ExitCode {
     let mut args = Args::from_env();

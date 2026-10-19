@@ -500,7 +500,7 @@ mod tests {
             None,
             shared,
             Ctx {
-                app_id: AppId::new("test"),
+                app_id: AppId::headless("test"),
                 payload_version: 3,
                 nonce: 7,
                 upkeep: Upkeep::default(),
@@ -717,7 +717,7 @@ mod tests {
             None,
             shared,
             Ctx {
-                app_id: AppId::new("test"),
+                app_id: AppId::headless("test"),
                 payload_version: 3,
                 nonce: 7,
                 upkeep: Upkeep::default(),

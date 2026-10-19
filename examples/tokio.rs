@@ -17,7 +17,7 @@ use instance_handoff::{AppId, Args, Builder, End, Request, Started};
 #[cfg(any(unix, windows))]
 use tokio::sync::{Notify, mpsc};
 
-const APP: AppId = AppId::new("com.example.syncd");
+const APP: AppId = AppId::headless("com.example.syncd");
 
 #[cfg(not(any(unix, windows)))]
 fn main() {}

@@ -83,6 +83,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
+use crate::id::valid_id;
 use crate::naming::level_folder;
 use crate::server::{Core, Session};
 use crate::wire::refusal;
@@ -636,8 +637,8 @@ impl Folder {
         let bad = || io::Error::new(io::ErrorKind::InvalidData, "a malformed instance.pipe");
         let line = text.strip_suffix('\n').ok_or_else(bad)?;
         let (id, secret) = line.split_once(' ').ok_or_else(bad)?;
-        let id = AppId::parse(id).map_err(|_| bad())?;
-        if secret.len() != 32
+        if !valid_id(id.as_bytes())
+            || secret.len() != 32
             || !secret
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -645,7 +646,7 @@ impl Folder {
             return Err(bad());
         }
         Ok(Some(Address {
-            pipe: pipe_name(&id, secret),
+            pipe: pipe_name(id, secret),
         }))
     }
 
@@ -653,7 +654,7 @@ impl Folder {
     /// program holding the file) is retried by the owner's upkeep.
     pub(crate) fn listen(&self, app_id: &AppId) -> io::Result<PipeListener> {
         let secret = random_hex()?;
-        let name = pipe_name(app_id, &secret);
+        let name = pipe_name(app_id.as_str(), &secret);
         let sd = SecurityDescriptor::for_pipe()?;
         let first = create_instance(&name, &sd, true)?;
         let published = match self.publish(app_id, &secret) {
@@ -727,7 +728,7 @@ fn wait_ms(deadline: Option<Instant>) -> u32 {
     }
 }
 
-fn pipe_name(id: &AppId, secret: &str) -> OsString {
+fn pipe_name(id: &str, secret: &str) -> OsString {
     format!(r"\\.\pipe\instance-handoff.{id}.{secret}").into()
 }
 
@@ -932,7 +933,7 @@ impl PipeListener {
     /// with a new one, published again.
     fn renew(&mut self, folder: &Folder, app_id: &AppId) -> io::Result<()> {
         let secret = random_hex()?;
-        let name = pipe_name(app_id, &secret);
+        let name = pipe_name(app_id.as_str(), &secret);
         self.first = Some(create_instance(&name, &self.sd, true)?);
         self.name = name;
         self.secret = secret;
@@ -1671,7 +1672,7 @@ mod tests {
 
     #[test]
     fn the_default_folder_passes_the_check() {
-        let place = default_place(&AppId::new("test.windows")).unwrap();
+        let place = default_place(&AppId::headless("test.windows")).unwrap();
         let base = open_dir(&place.base).unwrap();
         check_dir(&base, false, false).unwrap();
         assert_eq!(place.subs[1], *level_folder(me().unwrap().integrity));
@@ -1735,7 +1736,7 @@ mod tests {
         let folder = open_folder(&Place::dir(tmp.path().join("run")), true)
             .unwrap()
             .unwrap();
-        let id = AppId::new("test.windows");
+        let id = AppId::headless("test.windows");
         let mut listener = folder.listen(&id).unwrap();
         assert!(listener.published);
         let _first = listener.instance(false).unwrap();

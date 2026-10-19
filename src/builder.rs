@@ -29,7 +29,7 @@ pub enum Mode {
 /// use std::time::Duration;
 /// use instance_handoff::{AppId, Builder, Mode};
 ///
-/// const APP: AppId = AppId::new("org.example.Viewer");
+/// const APP: AppId = AppId::windowed("org.example.Viewer");
 /// let builder = Builder::new(APP).mode(Mode::Separate).timeout(Duration::from_secs(1));
 /// # let _ = builder;
 /// ```

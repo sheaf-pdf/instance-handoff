@@ -7,7 +7,7 @@ The first launch takes a lock in a private, per-user runtime folder and becomes 
 ```rust
 use instance_handoff::{AppId, Args, Builder, Request, Started};
 
-const APP: AppId = AppId::new("org.example.Viewer");
+const APP: AppId = AppId::windowed("org.example.Viewer");
 
 fn main() {
     let args = Args::from_env();

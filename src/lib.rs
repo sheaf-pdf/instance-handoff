@@ -9,7 +9,7 @@
 //! ```no_run
 //! use instance_handoff::{AppId, Args, Builder, Request, Started};
 //!
-//! const APP: AppId = AppId::new("org.example.Player");
+//! const APP: AppId = AppId::windowed("org.example.Player");
 //!
 //! // Hand over only what the owner needs: here, the files. A flag is not a
 //! // path, and `Request::resolve` would make one of it.
@@ -363,7 +363,7 @@ mod wire;
 mod sys;
 
 pub use builder::{Builder, Mode};
-pub use id::{AppId, InvalidAppId};
+pub use id::{AppId, InvalidAppId, Kind};
 pub use level::{Level, Rights};
 pub use outcome::{End, OwnerInfo, Reason, Started};
 pub use owner::{Claim, Owner};

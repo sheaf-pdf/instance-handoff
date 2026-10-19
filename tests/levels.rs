@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use instance_handoff::{AppId, Args, Builder, Claim, Reason, Started};
+use instance_handoff::{AppId, Args, Builder, Claim, Kind, Reason, Started};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_NO_SUCH_LOGON_SESSION, GENERIC_READ,
     GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
@@ -69,7 +69,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::WSF_VISIBLE;
 
-const APP: AppId = AppId::new("test.levels");
+const APP: AppId = AppId::headless("test.levels");
 /// Which `child_*` test a child runs as.
 const ROLE: &str = "INSTANCE_HANDOFF_LEVELS_ROLE";
 /// The app id a child launches as.
@@ -451,7 +451,7 @@ fn is_role(name: &str) -> bool {
 }
 
 fn child_builder() -> Builder {
-    let id: AppId = std::env::var(ID).unwrap().parse().unwrap();
+    let id = AppId::parse(std::env::var(ID).unwrap(), Kind::Headless).unwrap();
     match std::env::var_os(DIR) {
         Some(dir) => Builder::new(id).dir(PathBuf::from(dir)),
         None => Builder::new(id),
@@ -476,9 +476,11 @@ fn parse_facts(lines: &[String]) -> impl Iterator<Item = (String, String)> {
 
 /// A fresh app id, so tests in the real local AppData don't meet.
 fn app(name: &str) -> AppId {
-    format!("test.levels.{}.{name}", std::process::id())
-        .parse()
-        .unwrap()
+    AppId::parse(
+        format!("test.levels.{}.{name}", std::process::id()),
+        Kind::Headless,
+    )
+    .unwrap()
 }
 
 fn claim(started: Started<Args>) -> Claim<Args> {

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use instance_handoff::{AppId, Args, Builder, Claim, End, Mode, Owner, Reason, Request, Started};
 
-const APP: AppId = AppId::new("test.handoff");
+const APP: AppId = AppId::headless("test.handoff");
 const SHORT: Duration = Duration::from_millis(300);
 
 struct Dir {
@@ -225,7 +225,7 @@ fn mismatches_are_reported_at_once() {
         "{reason}"
     );
     let reason = alone(
-        Builder::new(AppId::new("test.other"))
+        Builder::new(AppId::headless("test.other"))
             .dir(&dir.path)
             .start(&Args::default()),
     );

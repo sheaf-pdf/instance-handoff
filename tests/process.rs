@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use instance_handoff::{AppId, Args, Builder, Claim, Mode, Reason, Started};
 
-const APP: AppId = AppId::new("test.process");
+const APP: AppId = AppId::headless("test.process");
 const ROLE: &str = "INSTANCE_HANDOFF_TEST_ROLE";
 const DIR: &str = "INSTANCE_HANDOFF_TEST_DIR";
 

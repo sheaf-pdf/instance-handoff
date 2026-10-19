@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
-use std::str::FromStr;
 
 /// Names an app: its runtime folder, its socket, its thread. An owner
 /// refuses a launch that names another app ([`Reason::OtherApp`]).
@@ -14,20 +13,46 @@ use std::str::FromStr;
 /// good choice. Keep it the same across releases of your app, or two builds will
 /// each become an owner.
 ///
-/// [`AppId::new`] is a `const fn`, so a bad literal in a `const` is a
-/// compile error:
+/// An app id also has a [`Kind`], which says who may become the owner.
+/// Two app ids with the same id and different kinds compare unequal, so
+/// give every binary of an app the same `const`. For now, launches don't
+/// compare kinds with the owner.
 ///
-/// ```compile_fail
-/// const APP: instance_handoff::AppId = instance_handoff::AppId::new("../evil");
+/// [`AppId::windowed`] and [`AppId::headless`] are `const fn`s, so a bad
+/// literal in a `const` is a compile error:
+///
+/// ```compile_fail,E0080
+/// const APP: instance_handoff::AppId = instance_handoff::AppId::windowed("../evil");
 /// ```
 ///
 /// [`Reason::OtherApp`]: crate::Reason::OtherApp
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AppId(Cow<'static, str>);
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AppId {
+    id: Cow<'static, str>,
+    kind: Kind,
+}
+
+/// Who may become the owner of an app. It doesn't say whether the owner
+/// shows windows.
+///
+/// For now the kind is only recorded: any launch may own an app of either
+/// kind, and a launch hands off to an owner of its id whatever the owner's
+/// kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Kind {
+    /// Only a launch that can show windows. Most apps with a GUI are
+    /// windowed.
+    Windowed,
+    /// Any launch, including one with no display. Daemons, services and
+    /// CLI back ends are headless, and so is a daemon that opens windows
+    /// for its clients, as Emacs's does.
+    Headless,
+}
 
 const MAX_ID: usize = 48;
 
-const fn valid_id(b: &[u8]) -> bool {
+/// Whether `b` is a valid app id.
+pub(crate) const fn valid_id(b: &[u8]) -> bool {
     if b.is_empty() || b.len() > MAX_ID {
         return false;
     }
@@ -73,45 +98,67 @@ const fn reserved_on_windows(b: &[u8]) -> bool {
 }
 
 impl AppId {
-    /// An app id from a literal. Declare it as a `const` so a bad one is a
-    /// compile error.
+    /// A [windowed](Kind::Windowed) app id from a literal. Declare it as a
+    /// `const` so a bad one is a compile error.
     ///
     /// # Panics
     ///
     /// If `id` isn't valid (see [`AppId`]). Use [`AppId::parse`] for ids
     /// known only at run time.
-    pub const fn new(id: &'static str) -> AppId {
+    pub const fn windowed(id: &'static str) -> AppId {
+        AppId::literal(id, Kind::Windowed)
+    }
+
+    /// A [headless](Kind::Headless) app id from a literal. Declare it as a
+    /// `const` so a bad one is a compile error.
+    ///
+    /// # Panics
+    ///
+    /// If `id` isn't valid (see [`AppId`]). Use [`AppId::parse`] for ids
+    /// known only at run time.
+    pub const fn headless(id: &'static str) -> AppId {
+        AppId::literal(id, Kind::Headless)
+    }
+
+    const fn literal(id: &'static str, kind: Kind) -> AppId {
         if !valid_id(id.as_bytes()) {
             panic!(
                 "invalid app id: use 1-48 ASCII letters, digits, '.', '-' or '_', starting and \
                  ending with a letter or digit, and not a Windows device name such as \"con\""
             );
         }
-        AppId(Cow::Borrowed(id))
+        AppId {
+            id: Cow::Borrowed(id),
+            kind,
+        }
     }
 
-    /// An app id from a run-time string.
-    pub fn parse(id: impl Into<String>) -> Result<AppId, InvalidAppId> {
+    /// An app id of `kind` from a run-time string.
+    pub fn parse(id: impl Into<String>, kind: Kind) -> Result<AppId, InvalidAppId> {
         let id = id.into();
         if valid_id(id.as_bytes()) {
-            Ok(AppId(Cow::Owned(id)))
+            Ok(AppId {
+                id: Cow::Owned(id),
+                kind,
+            })
         } else {
             Err(InvalidAppId { id })
         }
     }
 
-    /// The id, as given.
+    /// The id, as given, without the kind. Folder names, the thread's name
+    /// and the address use it.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.id
+    }
+
+    /// Who may become the owner.
+    pub fn kind(&self) -> Kind {
+        self.kind
     }
 }
 
-impl fmt::Debug for AppId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self.as_str(), f)
-    }
-}
-
+/// The id alone, without the kind.
 impl fmt::Display for AppId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -121,13 +168,6 @@ impl fmt::Display for AppId {
 impl AsRef<str> for AppId {
     fn as_ref(&self) -> &str {
         self.as_str()
-    }
-}
-
-impl FromStr for AppId {
-    type Err = InvalidAppId;
-    fn from_str(s: &str) -> Result<AppId, InvalidAppId> {
-        AppId::parse(s)
     }
 }
 
@@ -160,41 +200,66 @@ impl Error for InvalidAppId {}
 
 #[cfg(test)]
 mod tests {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
     use super::*;
 
     #[test]
     fn ids_are_safe_file_names() {
-        for good in [
-            "sheaf",
-            "org.example.Viewer",
-            "a",
-            "my_app-2",
-            &"x".repeat(48),
-        ] {
-            assert!(AppId::parse(good).is_ok(), "{good}");
+        for kind in [Kind::Windowed, Kind::Headless] {
+            for good in [
+                "sheaf",
+                "org.example.Viewer",
+                "a",
+                "my_app-2",
+                &"x".repeat(48),
+            ] {
+                assert!(AppId::parse(good, kind).is_ok(), "{good}");
+            }
+            for bad in [
+                "",
+                "../evil",
+                "a/b",
+                ".hidden",
+                "app.",
+                "-x",
+                "x-",
+                "with space",
+                "naïve",
+                &"x".repeat(49),
+                "con",
+                "NUL",
+                "aux.example",
+                "com1",
+                "LPT9.x",
+            ] {
+                assert!(AppId::parse(bad, kind).is_err(), "{bad}");
+            }
+            // Device names only as the whole stem.
+            assert!(AppId::parse("console", kind).is_ok());
+            assert!(AppId::parse("com", kind).is_ok());
         }
-        for bad in [
-            "",
-            "../evil",
-            "a/b",
-            ".hidden",
-            "app.",
-            "-x",
-            "x-",
-            "with space",
-            "naïve",
-            &"x".repeat(49),
-            "con",
-            "NUL",
-            "aux.example",
-            "com1",
-            "LPT9.x",
-        ] {
-            assert!(AppId::parse(bad).is_err(), "{bad}");
+    }
+
+    #[test]
+    fn the_kind_is_part_of_the_app_id() {
+        const WINDOWED: AppId = AppId::windowed("sheaf");
+        const HEADLESS: AppId = AppId::headless("sheaf");
+        fn hash(id: &AppId) -> u64 {
+            let mut h = DefaultHasher::new();
+            id.hash(&mut h);
+            h.finish()
         }
-        // Device names only as the whole stem.
-        assert!(AppId::parse("console").is_ok());
-        assert!(AppId::parse("com").is_ok());
-        assert_eq!(AppId::new("sheaf").to_string(), "sheaf");
+        assert_eq!(WINDOWED.kind(), Kind::Windowed);
+        assert_eq!(HEADLESS.kind(), Kind::Headless);
+        assert_ne!(WINDOWED, HEADLESS);
+        assert_ne!(hash(&WINDOWED), hash(&HEADLESS));
+        // A literal and a parsed id of one kind are the same app id.
+        let parsed = AppId::parse("sheaf", Kind::Windowed).unwrap();
+        assert_eq!(parsed, WINDOWED);
+        assert_eq!(hash(&parsed), hash(&WINDOWED));
+        // Folder names, the thread and the address see the bare id.
+        assert_eq!(WINDOWED.to_string(), "sheaf");
+        assert_eq!(HEADLESS.as_str(), "sheaf");
     }
 }

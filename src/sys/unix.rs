@@ -1542,7 +1542,7 @@ fn read<T: Payload>(c: &mut Connection<T>, core: &mut Core<T>, now: Instant) {
 mod tests {
     use super::*;
 
-    const ID: AppId = AppId::new("app.test");
+    const ID: AppId = AppId::headless("app.test");
 
     fn env() -> LinuxEnv {
         LinuxEnv {
