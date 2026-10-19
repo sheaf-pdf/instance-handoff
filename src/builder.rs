@@ -215,6 +215,7 @@ pub struct Builder {
     dir: Option<PathBuf>,
     pub(crate) guard: Guard,
     pub(crate) elevated_owner: ElevatedOwner,
+    pub(crate) hand_down: bool,
     pub(crate) timeout: Duration,
     pub(crate) payload_version: u32,
     pub(crate) upkeep: Upkeep,
@@ -223,8 +224,9 @@ pub struct Builder {
 impl Builder {
     /// A builder for `app_id`, whose state is in `state` ([`State::dir`]),
     /// or which keeps none ([`State::none`]). The defaults: the default
-    /// runtime folder, [`Guard::Local`], [`ElevatedOwner::NotRaised`], a 5
-    /// second timeout and payload version 0.
+    /// runtime folder, [`Guard::Local`], [`ElevatedOwner::NotRaised`],
+    /// [`hand_down`](Builder::hand_down) off, a 5 second timeout and payload
+    /// version 0.
     ///
     /// Launches of `app_id` that name one state folder, through whatever
     /// links, and one [scope](Builder::scope) meet one owner. Launches that
@@ -273,6 +275,7 @@ impl Builder {
             dir: None,
             guard: Guard::Local,
             elevated_owner: ElevatedOwner::NotRaised,
+            hand_down: false,
             timeout: Duration::from_secs(5),
             payload_version: 0,
             upkeep: Upkeep::default(),
@@ -347,6 +350,36 @@ impl Builder {
     /// never own, so they don't look at it.
     pub fn elevated_owner(mut self, policy: ElevatedOwner) -> Builder {
         self.elevated_owner = policy;
+        self
+    }
+
+    /// Whether a launch with rights the owner lacks gives them up and hands
+    /// its request down, rather than fail with [`Reason::MoreRights`]
+    /// (`start` then runs alone). Defaults to `false`. The only such right
+    /// compared is a higher Windows integrity level, as a launch has from
+    /// an administrator terminal, Windows `sudo`, Run as administrator, an
+    /// elevated SSH or WinRM logon, or UIAccess.
+    ///
+    /// No property of a token tells deliberate elevation from incidental,
+    /// so the crate never decides this itself. Set it per call, on a clone,
+    /// for the commands that need no rights (`b.clone().hand_down(true)`),
+    /// and leave it off for the rest. The owner admits a launch above its
+    /// level only when it hands down, and tells its handler what was given
+    /// up, as [`Request::handed_down`]; the launch sees the same in
+    /// [`OwnerInfo::handed_down`]. Both come from the levels Windows
+    /// reports, never from what the launch says.
+    ///
+    /// A request is never handed up, and never goes to another user. On
+    /// Unix, `sudo`, `su`, `doas`, `pkexec` and `run0` launch as root, whose
+    /// launches meet root's owner, so this changes nothing there. Applies
+    /// to `start` and `hand_off`: `probe` and
+    /// [`exclusive`](Builder::exclusive) hand nothing over, and ignore it.
+    /// The crate's own launches don't hand down yet: they connect only to
+    /// an owner at their own level (see the crate docs on privileges).
+    ///
+    /// [`Request::handed_down`]: crate::Request::handed_down
+    pub fn hand_down(mut self, allow: bool) -> Builder {
+        self.hand_down = allow;
         self
     }
 

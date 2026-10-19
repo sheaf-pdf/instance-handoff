@@ -83,8 +83,14 @@ impl OwnerInfo {
         self.level
     }
 
-    /// The rights this launch gave up to hand its request to an owner that
-    /// lacks them. `None` when it gave up nothing.
+    /// The rights this launch gave up to hand its request down to an owner
+    /// that lacks them ([`Builder::hand_down`]). The owner's handler is
+    /// told them too, as [`Request::handed_down`]. `None` when it gave up
+    /// nothing, and, as for [`OwnerInfo::level`], when this launch can't
+    /// say which owner has its request.
+    ///
+    /// [`Builder::hand_down`]: crate::Builder::hand_down
+    /// [`Request::handed_down`]: crate::Request::handed_down
     pub fn handed_down(&self) -> Option<&Rights> {
         self.handed_down.as_ref()
     }
@@ -388,13 +394,17 @@ pub enum Reason {
     },
     /// This launch has rights the owner lacks, such as a higher integrity
     /// level. The request wasn't delivered, since the owner would act on it
-    /// without them. It returns at once, whatever the
+    /// without them. [`Builder::hand_down`] lets a launch give them up and
+    /// hand its request down. It returns at once, whatever the
     /// [timeout](crate::Builder::timeout).
     ///
     /// On Windows a launch usually learns this from the marker in the
     /// owner's lock, before it connects, and then never talks to the owner:
     /// unlike the owner's greeting, the marker can't show its app, kind or
-    /// state folder.
+    /// state folder. The crate's launches don't hand down to an owner they
+    /// find this way yet.
+    ///
+    /// [`Builder::hand_down`]: crate::Builder::hand_down
     #[non_exhaustive]
     MoreRights {
         /// The owner.

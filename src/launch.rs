@@ -1,6 +1,7 @@
 //! The launch's side of the exchange: take the lock, or hand the request
 //! to whoever holds it.
 
+use std::borrow::Cow;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -78,8 +79,10 @@ fn meet(own: Option<Level>, owner: OwnerLevel, probe: bool) -> Meet {
         // Windows reads the launch's own level to look for the marker, so
         // here it is known. Were it not, `Talk(None)` matches no address
         // folder or pipe's label, so nothing is sent to an owner at another
-        // level.
-        OwnerLevel::Other(owner) => match own.and_then(|own| rights(own, owner, probe)) {
+        // level. Nor does the marker let a launch hand down yet: `Talk(own)`
+        // would look for the owner's address in this launch's own level's
+        // folder, where an owner at another level publishes none.
+        OwnerLevel::Other(owner) => match own.and_then(|own| rights(own, owner, probe, false)) {
             Some(answer) => Meet::Report(answer),
             None => Meet::Talk(own),
         },
@@ -93,9 +96,16 @@ fn meet(own: Option<Level>, owner: OwnerLevel, probe: bool) -> Meet {
 /// no pid, and is unconfirmed (call 6.3), however the launch learnt the
 /// level: from the owner's marker ([`meet`]), its HELLO ([`exchange`]) or
 /// its PRIVILEGE refusal ([`refused`]). `None` when the levels are the
-/// same.
-fn rights(own: Level, owner: Level, probe: bool) -> Option<Result<OwnerInfo, Reason>> {
-    if owner == own {
+/// same, or when the owner is below and the launch may `hand_down` its
+/// request ([`Builder::hand_down`]): then it goes on, and gives up the
+/// rights the owner lacks.
+fn rights(
+    own: Level,
+    owner: Level,
+    probe: bool,
+    hand_down: bool,
+) -> Option<Result<OwnerInfo, Reason>> {
+    if owner == own || (owner < own && hand_down && !probe) {
         return None;
     }
     let info = OwnerInfo {
@@ -246,6 +256,9 @@ fn encode_request<T: Payload>(b: &Builder, payload: &T) -> Result<Vec<u8>, Reaso
         xdg_activation_token: activation.xdg_activation_token().map(str::to_owned),
         startup_id: activation.startup_id().map(str::to_owned),
         payload,
+        // Added once HELLO shows the owner below this launch: see
+        // `exchange`.
+        hand_down: None,
     }
     .encode())
 }
@@ -740,18 +753,21 @@ fn exchange(
             theirs: hello.payload_version,
         });
     }
-    // A request goes neither up nor down, so at another level this launch
-    // decides at once, whether or not the owner serves, and sends nothing.
-    // Where either level is unknown, as on Unix, it goes on.
-    let theirs = hello.level.map(Level::from_rid);
-    match own
-        .zip(theirs)
-        .and_then(|(own, theirs)| rights(own, theirs, request.is_none()))
-    {
+    // A request never goes up, and goes down only with `hand_down`. So at
+    // another level this launch decides at once, whether or not the owner
+    // serves, and sends nothing, unless it hands its request down. Where
+    // either level is unknown, as on Unix, it goes on.
+    let levels = own.zip(hello.level.map(Level::from_rid));
+    let probe = request.is_none();
+    match levels.and_then(|(own, theirs)| rights(own, theirs, probe, b.hand_down)) {
         Some(Ok(info)) => return Exchange::Taken(info),
         Some(Err(reason)) => return Exchange::Fail(reason),
         None => {}
     }
+    // Still here at another level, this launch hands its request down.
+    let handed_down = levels
+        .filter(|(own, theirs)| own != theirs)
+        .map(|(launch, owner)| Rights::Level { launch, owner });
     if committed_to == Some(hello.nonce) {
         return Exchange::SameOwner;
     }
@@ -767,12 +783,19 @@ fn exchange(
         pid: conn.peer_pid(),
         confirmed: true,
         level: hello.level.map(crate::Level::from_rid),
-        handed_down: None,
+        handed_down,
     };
     let Some(request) = request else {
         // A probe: the owner serves. Leave without sending anything.
         return Exchange::Taken(info);
     };
+    // The owner admits a launch above it only with HAND_DOWN, its consent
+    // to hand the request down.
+    let request = match &info.handed_down {
+        Some(given) => Cow::Owned(wire::hand_down(request, given)),
+        None => Cow::Borrowed(request),
+    };
+    let request = &*request;
     let limit = hello.max_request as usize;
     if request.len() - wire::HEADER > limit {
         return Exchange::Fail(Reason::TooLarge {
@@ -871,10 +894,11 @@ fn refused(
         (Some(refusal::APP), _) => Reason::OtherApp {},
         // The owner names its level with the refusal. Without one, or
         // with this launch's own, the rights can't be named: a cause this
-        // build doesn't know.
+        // build doesn't know. A launch refused what it handed down kept its
+        // rights, so `hand_down` is `false` here.
         (Some(refusal::PRIVILEGE), _) => own
             .zip(r.level.map(Level::from_rid))
-            .and_then(|(own, theirs)| rights(own, theirs, false)?.err())
+            .and_then(|(own, theirs)| rights(own, theirs, false, false)?.err())
             .unwrap_or(Reason::Declined {}),
         (Some(refusal::PAYLOAD_VERSION), Some(hello)) => Reason::PayloadVersion {
             ours: b.payload_version,
@@ -1022,17 +1046,22 @@ mod tests {
 
     // At another level, a launch decides from HELLO with `rights`, as it
     // does from the marker, and sends nothing. With the higher level it
-    // has rights the owner lacks; with the lower, the owner has rights it
-    // lacks. A probe finds the owner, unconfirmed: it won't serve this
-    // launch. Where a level is unknown, as on Unix, the launch goes on.
+    // has rights the owner lacks, unless it may hand its request down, and
+    // then it goes on. With the lower, the owner has rights it lacks,
+    // whether or not it may. A probe finds the owner, unconfirmed: it
+    // won't serve this launch. Where a level is unknown, as on Unix, the
+    // launch goes on.
     #[test]
     fn a_launch_at_another_level_decides_from_hello() {
-        for row in LEVELS {
+        for (row, hand_down) in LEVELS
+            .into_iter()
+            .flat_map(|row| [(row, false), (row, true)])
+        {
             let (own, theirs, apart) = row;
             // As `exchange` reads HELLO's LEVEL.
             let decide = |probe| {
                 own.zip(theirs)
-                    .and_then(|(own, theirs)| rights(own, theirs, probe))
+                    .and_then(|(own, theirs)| rights(own, theirs, probe, hand_down))
             };
             let handoff = decide(false);
             let probe = decide(true);
@@ -1040,16 +1069,20 @@ mod tests {
                 assert!(handoff.is_none() && probe.is_none(), "{row:?}");
                 continue;
             }
+            let goes_on = apart == Apart::More && hand_down;
             match handoff {
-                Some(Err(reason)) => assert!(fares(&reason, row), "{row:?}: {reason:?}"),
-                other => panic!("{row:?}: {other:?}"),
+                None if goes_on => {}
+                Some(Err(reason)) if !goes_on => {
+                    assert!(fares(&reason, row), "{row:?} {hand_down}: {reason:?}");
+                }
+                other => panic!("{row:?} {hand_down}: {other:?}"),
             }
             match probe {
                 Some(Ok(found)) => assert_eq!(
                     (found.pid, found.confirmed, found.level),
                     (None, false, theirs)
                 ),
-                other => panic!("{row:?}: {other:?}"),
+                other => panic!("{row:?} {hand_down}: {other:?}"),
             }
         }
     }
@@ -1057,11 +1090,14 @@ mod tests {
     // PRIVILEGE comes with the owner's level, which the launch compares
     // with its own, after HELLO or in place of it. Without a level to
     // compare, or with its own, it can't name the rights, and reads the
-    // cause as one it doesn't know.
+    // cause as one it doesn't know. A launch that may hand down reads it
+    // the same way: the owner refused what it handed down, as one that
+    // reads the launch's token at another level than the launch does.
     #[test]
     fn a_privilege_refusal_names_the_rights_from_the_owners_level() {
         let hello = hello();
         let b = Builder::new(AppId::headless("test"), crate::State::none());
+        let down = b.clone().hand_down(true);
         for row in LEVELS {
             let (own, theirs, apart) = row;
             let reply = Reply {
@@ -1070,11 +1106,14 @@ mod tests {
                 ..Reply::new(false, status::REFUSED)
             };
             for hello in [Some(&hello), None] {
-                let reason = refused(&reply, hello, &b, &[], own);
-                if apart == Apart::Neither {
-                    assert!(matches!(reason, Reason::Declined {}), "{row:?}: {reason}");
-                } else {
-                    assert!(fares(&reason, row), "{row:?}: {reason:?}");
+                for b in [&b, &down] {
+                    let reason = refused(&reply, hello, b, &[], own);
+                    let case = (row, b.hand_down);
+                    if apart == Apart::Neither {
+                        assert!(matches!(reason, Reason::Declined {}), "{case:?}: {reason}");
+                    } else {
+                        assert!(fares(&reason, row), "{case:?}: {reason:?}");
+                    }
                 }
             }
         }
@@ -1142,6 +1181,192 @@ mod tests {
         );
         assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
         owner.join().unwrap();
+    }
+
+    // An owner below the launch, as its HELLO names it, takes a request the
+    // launch hands down, and nothing else from it. The owner here is a
+    // session at medium that reads each launch's level, as an owner on
+    // Windows reads it from the launch's token. Owners and launches on Unix
+    // have no levels, so the test sets both.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_above_the_owner_hands_down_only_when_asked() {
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+
+        use crate::server::{Core, Ctx, Peer, Session, Shared, Upkeep};
+        use crate::{Answer, Args, Request};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Builder::new(AppId::headless("test.down"), crate::State::none())
+            .dir(tmp.path().join("run"))
+            .timeout(Duration::from_secs(3));
+        let folder = sys::open_folder(&b.place(None).unwrap(), true)
+            .unwrap()
+            .unwrap();
+        let _lock = folder.lock().unwrap().unwrap();
+        let socket = b.runtime_dir().unwrap().join("instance.sock");
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let ctx = Ctx {
+            app_id: b.app_id.clone(),
+            instance_key: b.instance_key(None),
+            level: Some(Level::MEDIUM),
+            payload_version: b.payload_version,
+            nonce: 1,
+            upkeep: Upkeep::default(),
+        };
+        // Each launch's level, as the owner reads it.
+        let levels = [
+            Level::HIGH,
+            Level::HIGH,
+            Level::LOW,
+            Level::HIGH,
+            Level::MEDIUM,
+            Level::LOW,
+        ];
+        // For two owners played by hand, which answer COMMIT with what
+        // isn't a REPLY the launch can read: a READY, and a REPLY with no
+        // records.
+        let hello = Hello {
+            app_id: "test.down".into(),
+            payload_version: b.payload_version,
+            max_request: wire::MAX_REQUEST,
+            level: Some(Level::MEDIUM.rid()),
+            state: b.instance_key(None),
+            ..hello()
+        }
+        .encode();
+        let (tx, taken) = std::sync::mpsc::channel::<Request<Args>>();
+        let owner = std::thread::spawn(move || {
+            let shared = Shared::new(sys::Held::detached());
+            let handler = Box::new(move |r| {
+                tx.send(r).unwrap();
+                Answer::Take
+            });
+            let mut core = Core::new(Some(handler), None, shared, ctx);
+            // What each launch sent.
+            let mut sent = Vec::new();
+            for (level, stream) in levels.into_iter().zip(listener.incoming()) {
+                let mut stream = stream.unwrap();
+                let now = Instant::now();
+                let mut s = Session::new(&core, Peer::default(), now);
+                s.attested(level);
+                let mut got = Vec::new();
+                let mut buf = [0; 4096];
+                while !s.is_done() {
+                    let out = s.outgoing().to_vec();
+                    stream.write_all(&out).unwrap();
+                    s.wrote(out.len());
+                    if s.should_shut_write() {
+                        let _ = stream.shutdown(Shutdown::Write);
+                    }
+                    match stream.read(&mut buf).unwrap() {
+                        0 => s.eof(&core.ctx.app_id),
+                        n => {
+                            got.extend_from_slice(&buf[..n]);
+                            if let Some(request) = s.read(&buf[..n], &core, now) {
+                                let answer = core.deliver(request).unwrap();
+                                s.answer(answer, now);
+                            }
+                        }
+                    }
+                }
+                sent.push(got);
+            }
+            // One whole message from the launch.
+            let frame = |stream: &mut std::os::unix::net::UnixStream| {
+                let mut got = Vec::new();
+                let mut buf = [0; 4096];
+                while wire::split(&got, wire::MAX_REQUEST as usize)
+                    .unwrap()
+                    .is_none()
+                {
+                    let n = stream.read(&mut buf).unwrap();
+                    assert_ne!(n, 0, "the launch left early");
+                    got.extend_from_slice(&buf[..n]);
+                }
+                got
+            };
+            for answer in [wire::empty(wire::READY), wire::empty(wire::REPLY)] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.write_all(&hello).unwrap();
+                let request = frame(&mut stream);
+                stream.write_all(&wire::empty(wire::READY)).unwrap();
+                assert_eq!(frame(&mut stream), wire::empty(wire::COMMIT));
+                stream.write_all(&answer).unwrap();
+                sent.push(request);
+            }
+            sent
+        });
+        let payload = Args::new(["x"]);
+        let down = b.clone().hand_down(true);
+        let given = Rights::Level {
+            launch: Level::HIGH,
+            owner: Level::MEDIUM,
+        };
+        let wait = Duration::from_secs(1);
+
+        // High, handing down: the owner takes the request, and both ends
+        // are told what was given up.
+        let info = hand_off_at(&down, Some(&payload), Some(Level::HIGH)).unwrap();
+        assert_eq!(
+            (info.confirmed(), info.level(), info.handed_down()),
+            (true, Some(Level::MEDIUM), Some(&given))
+        );
+        let request = taken.recv_timeout(wait).unwrap();
+        assert_eq!(request.payload(), &payload);
+        assert_eq!(request.handed_down(), Some(&given));
+        // High, keeping its rights: MoreRights, with nothing sent.
+        match hand_off_at(&b, Some(&payload), Some(Level::HIGH)) {
+            Err(Reason::MoreRights { rights, .. }) => assert_eq!(rights, given),
+            other => panic!("{other:?}"),
+        }
+        // Never up, whatever the launch allows.
+        match hand_off_at(&down, Some(&payload), Some(Level::LOW)) {
+            Err(Reason::OwnerHasMoreRights { .. }) => {}
+            other => panic!("{other:?}"),
+        }
+        // A probe hands nothing over, so nothing down.
+        let found = hand_off_at::<()>(&down, None, Some(Level::HIGH)).unwrap();
+        assert_eq!((found.confirmed(), found.handed_down()), (false, None));
+        // At the owner's level there is nothing to give up.
+        let info = hand_off_at(&down, Some(&payload), Some(Level::MEDIUM)).unwrap();
+        assert!(info.confirmed() && info.handed_down().is_none());
+        assert!(taken.recv_timeout(wait).unwrap().handed_down().is_none());
+        // High as the launch reads its token, low as the owner does: the
+        // owner refuses what it hands down with PRIVILEGE and its level,
+        // and the launch has more rights, as if it had kept them.
+        match hand_off_at(&down, Some(&payload), Some(Level::HIGH)) {
+            Err(Reason::MoreRights { rights, .. }) => assert_eq!(rights, given),
+            other => panic!("{other:?}"),
+        }
+        // Committed, but with no REPLY it can read: unconfirmed, and still
+        // handed down.
+        for _ in 0..2 {
+            let info = hand_off_at(&down, Some(&payload), Some(Level::HIGH)).unwrap();
+            assert_eq!(
+                (info.confirmed(), info.level(), info.handed_down()),
+                (false, Some(Level::MEDIUM), Some(&given))
+            );
+        }
+
+        // Each launch that handed down said so, and only those. The three
+        // that didn't hand off sent nothing.
+        let sent = owner.join().unwrap();
+        let hand_down = |sent: &[u8]| {
+            let (kind, body, _) = wire::split(sent, wire::MAX_REQUEST as usize)
+                .unwrap()
+                .unwrap();
+            assert_eq!(kind, wire::REQUEST);
+            wire::Request::decode(body).unwrap().hand_down
+        };
+        assert_eq!(hand_down(&sent[0]), Some(given.clone()));
+        assert!(sent[1..4].iter().all(Vec::is_empty), "{sent:?}");
+        assert_eq!(hand_down(&sent[4]), None);
+        for sent in &sent[5..] {
+            assert_eq!(hand_down(sent), Some(given.clone()));
+        }
+        assert!(taken.try_recv().is_err());
     }
 
     // Both ways, and a kind from a later release: the two kinds of an id

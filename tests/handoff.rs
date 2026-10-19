@@ -318,6 +318,32 @@ fn allow_owns_and_hands_off_as_before() {
     claim(builder(&dir).start(&Args::default())).release();
 }
 
+// Every launch here is at the owner's level, so hand_down changes
+// nothing: the request is delivered, and neither end is told of rights
+// handed down.
+#[test]
+fn at_one_level_nothing_is_handed_down() {
+    let dir = dir();
+    let (owner, rx) = serve(claim(builder(&dir).start(&Args::default())));
+    for launch in [builder(&dir), builder(&dir).hand_down(true)] {
+        let info = match launch.start(&args(&["two"])) {
+            Started::HandedOff(info) => info,
+            other => panic!("{other:?}"),
+        };
+        for info in [info, launch.hand_off(&args(&["three"])).unwrap()] {
+            assert!(info.confirmed() && info.handed_down().is_none());
+        }
+        for sent in [args(&["two"]), args(&["three"])] {
+            let got = rx.recv_timeout(SHORT).unwrap();
+            assert_eq!(got.payload(), &sent);
+            assert!(got.handed_down().is_none());
+        }
+        assert!(launch.probe().unwrap().handed_down().is_none());
+    }
+    assert!(Request::local(Args::default()).handed_down().is_none());
+    owner.release();
+}
+
 #[test]
 fn hand_off_and_probe_never_own_and_create_nothing() {
     let dir = dir();

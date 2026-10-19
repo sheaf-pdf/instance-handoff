@@ -89,7 +89,9 @@
 //!   before it sends anything;
 //! - the owner checks the launch's token by impersonation. It refuses
 //!   another user with PEER, and a launch at another level with PRIVILEGE
-//!   and its own level.
+//!   and its own level, unless the launch is above it and hands its
+//!   request down with HAND_DOWN. What was handed down is read from the
+//!   two tokens, never from the record.
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::{File, OpenOptions};

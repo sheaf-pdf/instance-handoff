@@ -9,7 +9,7 @@
 
 use std::ffi::{OsStr, OsString};
 
-use crate::{BoxError, Kind};
+use crate::{BoxError, Kind, Level, Rights};
 
 pub(crate) const MAGIC: [u8; 4] = *b"IHND";
 pub(crate) const HEADER: usize = 9;
@@ -84,6 +84,17 @@ mod request {
     pub const XDG_TOKEN: u8 = 4;
     pub const STARTUP_ID: u8 = 5;
     pub const PAYLOAD: u8 = 6;
+    // 7, 8 and 9, and 0x8B, are kept for records that come later.
+    /// Critical: the launch hands its request down to an owner that lacks
+    /// its rights. An owner that doesn't know it refuses the request.
+    pub const HAND_DOWN: u8 = 0x8A;
+}
+
+/// Which [`Rights`] a HAND_DOWN record names, in its first byte.
+mod rights {
+    /// Integrity levels: then the launch's RID and the owner's, each a u32
+    /// LE.
+    pub const LEVEL: u8 = 0;
 }
 
 /// REPLY record tags.
@@ -349,6 +360,10 @@ pub(crate) struct Request {
     pub(crate) xdg_activation_token: Option<String>,
     pub(crate) startup_id: Option<String>,
     pub(crate) payload: Vec<u8>,
+    /// The rights the launch gives up, in HAND_DOWN: its consent to hand
+    /// the request down. An owner reads the rights themselves from the
+    /// launch's token, never from this.
+    pub(crate) hand_down: Option<Rights>,
 }
 
 impl Request {
@@ -370,14 +385,26 @@ impl Request {
                 w = w.bytes(tag, v.as_bytes());
             }
         }
-        w.bytes(request::PAYLOAD, &self.payload).finish()
+        w = w.bytes(request::PAYLOAD, &self.payload);
+        if let Some(rights) = &self.hand_down {
+            w = w.bytes(request::HAND_DOWN, &hand_down_record(rights));
+        }
+        w.finish()
     }
 
     pub(crate) fn decode(body: &[u8]) -> Result<Request, Error> {
         use request::*;
         let r = Records::parse(
             body,
-            &[WIRE, PAYLOAD_VERSION, CWD, XDG_TOKEN, STARTUP_ID, PAYLOAD],
+            &[
+                WIRE,
+                PAYLOAD_VERSION,
+                CWD,
+                XDG_TOKEN,
+                STARTUP_ID,
+                PAYLOAD,
+                HAND_DOWN,
+            ],
         )?;
         // Activation values are hints: a bad one is dropped, not refused.
         let token = |tag| {
@@ -393,7 +420,49 @@ impl Request {
             xdg_activation_token: token(XDG_TOKEN),
             startup_id: token(STARTUP_ID),
             payload: r.get(PAYLOAD).ok_or(Error::Malformed)?.to_vec(),
+            hand_down: r.get(HAND_DOWN).map(hand_down_rights).transpose()?,
         })
+    }
+}
+
+/// `bytes`, a REQUEST as [`Request::encode`] makes it without HAND_DOWN,
+/// with the HAND_DOWN record for `given` added last, as `encode` adds it.
+/// A launch decides to hand its request down only once HELLO names the
+/// owner's level.
+pub(crate) fn hand_down(bytes: &[u8], given: &Rights) -> Vec<u8> {
+    Writer {
+        buf: bytes.to_vec(),
+    }
+    .bytes(request::HAND_DOWN, &hand_down_record(given))
+    .finish()
+}
+
+/// A HAND_DOWN record's bytes: which rights, then what they are.
+fn hand_down_record(given: &Rights) -> Vec<u8> {
+    match given {
+        Rights::Level { launch, owner } => [
+            &[rights::LEVEL][..],
+            &launch.rid().to_le_bytes(),
+            &owner.rid().to_le_bytes(),
+        ]
+        .concat(),
+    }
+}
+
+/// The rights a HAND_DOWN record names. Rights from a later release are
+/// unsupported, as an unknown critical record is: the owner couldn't say
+/// what was given up.
+fn hand_down_rights(record: &[u8]) -> Result<Rights, Error> {
+    match record.split_first() {
+        Some((&rights::LEVEL, rids)) => {
+            let [a, b, c, d, e, f, g, h] = rids.try_into().map_err(|_| Error::Malformed)?;
+            Ok(Rights::Level {
+                launch: Level::from_rid(u32::from_le_bytes([a, b, c, d])),
+                owner: Level::from_rid(u32::from_le_bytes([e, f, g, h])),
+            })
+        }
+        Some(_) => Err(Error::Unsupported),
+        None => Err(Error::Malformed),
     }
 }
 
@@ -627,6 +696,7 @@ mod tests {
             xdg_activation_token: Some("tok".into()),
             startup_id: Some("id".into()),
             payload: vec![0, 159, 146, 150],
+            hand_down: None,
         };
         #[rustfmt::skip]
         let full_bytes = [
@@ -651,12 +721,83 @@ mod tests {
             2, 4, 0, 0, 0, 3, 0, 0, 0,
             6, 0, 0, 0, 0,
         ];
-        for (req, bytes) in [(full, &full_bytes[..]), (bare, &bare_bytes[..])] {
+        // Handed down from high to medium: the critical HAND_DOWN record,
+        // last. Its first byte names integrity levels, then the RIDs.
+        let rights = Rights::Level {
+            launch: Level::HIGH,
+            owner: Level::MEDIUM,
+        };
+        let down = Request {
+            hand_down: Some(rights.clone()),
+            ..bare.clone()
+        };
+        #[rustfmt::skip]
+        let down_bytes = [
+            b'I', b'H', b'N', b'D', 2, 35, 0, 0, 0,
+            1, 2, 0, 0, 0, 1, 0,
+            2, 4, 0, 0, 0, 3, 0, 0, 0,
+            6, 0, 0, 0, 0,
+            0x8a, 9, 0, 0, 0, 0, 0, 0x30, 0, 0, 0, 0x20, 0, 0,
+        ];
+        // A launch adds it to the request it encoded before HELLO.
+        assert_eq!(hand_down(&bare.encode(), &rights), down_bytes);
+        assert_eq!(hand_down(&full.encode(), &rights), {
+            let mut full = full.clone();
+            full.hand_down = Some(rights.clone());
+            full.encode()
+        });
+        for (req, bytes) in [
+            (full, &full_bytes[..]),
+            (bare, &bare_bytes[..]),
+            (down, &down_bytes[..]),
+        ] {
             assert_eq!(req.encode(), bytes);
             let (kind, body, used) = split(bytes, MAX_REQUEST as usize).unwrap().unwrap();
             assert_eq!((kind, used), (REQUEST, bytes.len()));
             assert_eq!(Request::decode(body).unwrap(), req);
         }
+    }
+
+    // HAND_DOWN is critical, and so is what it names: rights this build
+    // doesn't know are unsupported, as an unknown critical record is,
+    // since the owner couldn't say what was given up. So is a critical
+    // record from a later release, such as WAIT (0x8B).
+    #[test]
+    fn a_request_with_rights_or_records_this_build_doesnt_know_is_unsupported() {
+        let req = |tag: u8, bytes: &[u8]| {
+            let msg = Writer::new(REQUEST)
+                .bytes(request::WIRE, &[1, 0])
+                .bytes(request::PAYLOAD_VERSION, &[0; 4])
+                .bytes(request::PAYLOAD, &[])
+                .bytes(tag, bytes)
+                .finish();
+            Request::decode(&msg[HEADER..]).map(|r| r.hand_down)
+        };
+        let rids = [0, 0x30, 0, 0, 0, 0x20, 0, 0];
+        assert_eq!(
+            req(0x8a, &[&[0][..], &rids].concat()),
+            Ok(Some(Rights::Level {
+                launch: Level::HIGH,
+                owner: Level::MEDIUM
+            }))
+        );
+        assert_eq!(
+            req(0x8a, &[&[1][..], &rids].concat()),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(req(0x8b, &[]), Err(Error::Unsupported));
+        // A record too short or too long for its rights, or empty.
+        assert_eq!(
+            req(0x8a, &[&[0][..], &rids[1..]].concat()),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            req(0x8a, &[&[0][..], &rids, &[0]].concat()),
+            Err(Error::Malformed)
+        );
+        assert_eq!(req(0x8a, &[]), Err(Error::Malformed));
+        // A record from a later release that isn't critical is skipped.
+        assert_eq!(req(0x0b, b"later"), Ok(None));
     }
 
     #[test]
@@ -750,6 +891,7 @@ mod tests {
             xdg_activation_token: Some("tok".into()),
             startup_id: None,
             payload: vec![0, 159, 146, 150],
+            hand_down: None,
         };
         let bytes = req.encode();
         let (kind, body, _) = split(&bytes, MAX_REQUEST as usize).unwrap().unwrap();

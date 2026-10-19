@@ -79,13 +79,16 @@
 //!   the dead owner had started may be done again.
 //! - Only processes of the same user at the same privilege level hand off
 //!   to each other, so a request never runs with more or fewer rights than
-//!   its launch had; see [Privileges](#privileges). On Unix both ends check
-//!   the other's user id. On Windows every integrity level finds the one
-//!   owner, and a launch at another level than the owner's learns so at
-//!   once, from the owner's lock, and hands it nothing. The owner checks
-//!   the launch's token: it refuses another user, and a launch whose token
-//!   is at another integrity level, naming its own level. The launch checks
-//!   that the pipe is its own user's, at the level the owner's lock shows.
+//!   its launch had, unless the app lets a launch hand its request down to
+//!   an owner with fewer ([`Builder::hand_down`]); see
+//!   [Privileges](#privileges). On Unix both ends check the other's user
+//!   id. On Windows every integrity level finds the one owner, and a launch
+//!   at another level than the owner's learns so at once, from the owner's
+//!   lock, and hands it nothing. The owner checks the launch's token: it
+//!   refuses another user, and a launch whose token is at another
+//!   integrity level, naming its own level, unless the launch is above it
+//!   and hands its request down. The launch checks that the pipe is its
+//!   own user's, at the level the owner's lock shows.
 //! - [`Builder::start`], [`Builder::hand_off`], [`Builder::probe`] and
 //!   [`Builder::exclusive`] never panic, whatever the
 //!   [timeout](Builder::timeout). Every failure is a [`Reason`], and
@@ -234,12 +237,13 @@
 //!
 //! # Privileges
 //!
-//! A request runs with the rights of the launch that made it, never more
-//! and never fewer. Handed to a more privileged owner, it would have that
-//! owner act for a process that isn't allowed to; handed to a less
-//! privileged one, it would run without the rights the user started it
-//! with. So a launch hands off only to an owner of its own user at its own
-//! privilege level:
+//! A request runs with the rights of the launch that made it, never more,
+//! and never fewer unless the app says so. Handed to a more privileged
+//! owner, it would have that owner act for a process that isn't allowed
+//! to; handed to a less privileged one, it would run without the rights
+//! the user started it with. So a launch hands off only to an owner of its
+//! own user at its own privilege level, unless the app lets it hand its
+//! request down to one at a lower level ([`Builder::hand_down`]):
 //!
 //! - Unix: the level is the effective user, as the kernel reports it in the
 //!   process's own user namespace. On Linux the crate reads it, and the
@@ -254,20 +258,27 @@
 //! - Windows: the level is the user and the integrity level. Every level
 //!   shares one lock per state, in the instance folder, so a launch run as
 //!   administrator (high) and a normal (medium) one meet the same owner,
-//!   but only a launch at the owner's level hands off to it. An owner marks
-//!   its level in its lock and names it in its greeting, and refuses a
-//!   request from a launch whose token is at another level, naming its
-//!   own. A launch that finds an owner at another level, from its lock,
-//!   its greeting or its refusal, hands it nothing and runs alone at once,
-//!   with [`Reason::MoreRights`] when the launch has the higher level, or
-//!   [`Reason::OwnerHasMoreRights`] when the owner has; [`Builder::probe`]
-//!   reports such an owner unconfirmed. Each owner publishes its pipe's
-//!   name in a folder of its level, labelled at that level, so lower levels
-//!   can't read it. A launch also checks that the owner's pipe is labelled
-//!   at the level the lock shows, and refuses another with
-//!   [`Reason::Peer`]. Below medium (low integrity, AppContainer), launches
-//!   can't make or open their folder and run alone with
-//!   [`Reason::RuntimeDir`].
+//!   but by default only a launch at the owner's level hands off to it. An
+//!   owner marks its level in its lock and names it in its greeting, and
+//!   refuses a request from a launch whose token is at another level,
+//!   naming its own. A launch that finds an owner at another level, from
+//!   its lock, its greeting or its refusal, hands it nothing and runs alone
+//!   at once, with [`Reason::MoreRights`] when the launch has the higher
+//!   level, or [`Reason::OwnerHasMoreRights`] when the owner has;
+//!   [`Builder::probe`] reports such an owner unconfirmed. With
+//!   [`Builder::hand_down`], a launch above an owner that names its level
+//!   in its greeting hands its request down instead: it says so in its
+//!   request, and the owner, which admits a launch above it only then,
+//!   tells its handler what was given up, from the levels of the two tokens
+//!   ([`Request::handed_down`]). A request is never handed up. The crate's
+//!   own launches don't hand down yet: they connect only to an owner at
+//!   their own level, and answer one at another from its lock. Each owner
+//!   publishes its pipe's name in a folder of its level, labelled at that
+//!   level, so lower levels can't read it. A launch also checks that the
+//!   owner's pipe is labelled at the level the lock shows, and refuses
+//!   another with [`Reason::Peer`]. Below medium (low integrity,
+//!   AppContainer), launches can't make or open their folder and run alone
+//!   with [`Reason::RuntimeDir`].
 //!
 //! A launch whose rights were raised from a login hands off to its level's
 //! owner, but by default never becomes it ([`Builder::elevated_owner`]):
@@ -445,10 +456,13 @@
 //!   sends REPLY with the cause at once, in place of READY, or in place of
 //!   HELLO when an owner on Unix refuses the launch's user. An owner on
 //!   Windows refuses a launch at another integrity level with its own level
-//!   in the REPLY, before it decodes the payload. Feature bit 0 in HELLO
-//!   says an owner never just closes, and every owner of this release sets
-//!   it. A launch reads a cause it doesn't know as a decline, and a close
-//!   before HELLO as a sign to try again. Every message is
+//!   in the REPLY, before it decodes the payload, unless the launch is
+//!   above it and its REQUEST carries the critical HAND_DOWN record, its
+//!   consent to hand the request down. The record names the rights given
+//!   up, but the owner reads them from the launch's token. Feature bit 0
+//!   in HELLO says an owner never just closes, and every owner of this
+//!   release sets it. A launch reads a cause it doesn't know as a decline,
+//!   and a close before HELLO as a sign to try again. Every message is
 //!   `"IHND" | kind u8 | length u32 LE | records`, and a record is
 //!   `tag u8 | length u32 LE | bytes`. Peers skip records they don't know,
 //!   so later releases add to the exchange without breaking it, unless the

@@ -25,7 +25,9 @@ use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use instance_handoff::{AppId, Args, Builder, Claim, Kind, Payload, Reason, Started, State};
+use instance_handoff::{
+    AppId, Args, Builder, Claim, Kind, Level, Payload, Reason, Rights, Started, State,
+};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_NO_SUCH_LOGON_SESSION, GENERIC_READ,
     GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
@@ -369,16 +371,7 @@ fn a_medium_owner_refuses_a_high_client_at_once() {
     let dir = PathBuf::from(child.expect("owner "));
     let base = app_folder(&dir, &id).to_path_buf();
 
-    let address = std::fs::read_to_string(dir.join("run").join("instance.pipe")).unwrap();
-    let (named, secret) = address.trim_end().split_once(' ').unwrap();
-    assert_eq!(named, id.as_str());
-    let name = format!(r"\\.\pipe\instance-handoff.{named}.{secret}");
-    let mut pipe = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .security_qos_flags(SECURITY_IDENTIFICATION)
-        .open(name)
-        .unwrap();
+    let mut pipe = raw_client(&dir, &id);
     let (kind, hello) = read_message(&mut pipe);
     assert_eq!(kind, 1, "HELLO");
     assert!(
@@ -413,6 +406,63 @@ fn a_medium_owner_refuses_a_high_client_at_once() {
     drop(pipe);
     let rest = child.finish();
     assert!(!rest.iter().any(|l| l.starts_with("took ")), "{rest:?}");
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// A high client that hands its request down to a medium owner, with the
+/// HAND_DOWN record, is delivered, and the owner's handler is told what it
+/// gave up, from the two tokens' levels: never from the record, whose RIDs
+/// here are false. The crate's own launches at high read a medium owner's
+/// level from its marker and don't connect yet, so a client built here
+/// hands down as they will, through the owner's address folder.
+#[test]
+fn a_medium_owner_takes_a_high_client_that_hands_down() {
+    if !elevated() {
+        return;
+    }
+    let id = app("hand-down");
+    let mut child = medium("child_owner", &[(ID, OsStr::new(id.as_str()))]);
+    let dir = PathBuf::from(child.expect("owner "));
+    let base = app_folder(&dir, &id).to_path_buf();
+
+    let mut pipe = raw_client(&dir, &id);
+    let (kind, _) = read_message(&mut pipe);
+    assert_eq!(kind, 1, "HELLO");
+    let payload = Args::new(["from-high"]).encode().unwrap();
+    // Integrity levels (0), with false RIDs: from system to low.
+    let hand_down = [&[0][..], &0x4000u32.to_le_bytes(), &0x1000u32.to_le_bytes()].concat();
+    let request = message(
+        2,
+        &[
+            (1, &1u16.to_le_bytes()),
+            (2, &0u32.to_le_bytes()),
+            (6, &payload),
+            (0x8a, &hand_down),
+        ],
+    );
+    pipe.write_all(&request).unwrap();
+    let (kind, ready) = read_message(&mut pipe);
+    assert_eq!((kind, ready), (3, vec![]), "READY");
+    pipe.write_all(&message(4, &[])).unwrap();
+    let (kind, reply) = read_message(&mut pipe);
+    assert_eq!(kind, 5, "REPLY");
+    // Delivered; taken.
+    assert_eq!(reply, [(1, vec![1]), (2, vec![0])]);
+    let given = Rights::Level {
+        launch: Level::HIGH,
+        owner: Level::MEDIUM,
+    };
+    assert_eq!(
+        child.expect("took "),
+        format!(
+            "{:?}, handed down {:?}",
+            Args::new(["from-high"]),
+            Some(&given)
+        )
+    );
+
+    drop(pipe);
+    child.finish();
     let _ = std::fs::remove_dir_all(base);
 }
 
@@ -532,7 +582,11 @@ fn child_owner() {
     };
     println!("owner {}", claim.dir().display());
     let _owner = claim.serve(|request| {
-        println!("took {:?}", request.payload());
+        println!(
+            "took {:?}, handed down {:?}",
+            request.payload(),
+            request.handed_down()
+        );
         true
     });
     let _ = io::stdin().read_line(&mut String::new());
@@ -765,6 +819,23 @@ fn message(kind: u8, records: &[(u8, &[u8])]) -> Vec<u8> {
         &body,
     ]
     .concat()
+}
+
+/// A connection to the medium owner whose runtime folder is `dir`, made as
+/// the crate's launches make it, for identification only, from the pipe's
+/// name in the owner's address folder, `run`. It skips their checks of the
+/// folder's and the pipe's labels, so a high client reaches a medium owner.
+fn raw_client(dir: &Path, id: &AppId) -> File {
+    let address = std::fs::read_to_string(dir.join("run").join("instance.pipe")).unwrap();
+    let (named, secret) = address.trim_end().split_once(' ').unwrap();
+    assert_eq!(named, id.as_str());
+    let name = format!(r"\\.\pipe\instance-handoff.{named}.{secret}");
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .security_qos_flags(SECURITY_IDENTIFICATION)
+        .open(name)
+        .unwrap()
 }
 
 /// The next handoff message from `pipe`: its kind and its records.

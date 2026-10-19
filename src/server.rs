@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::wire::{self, Hello, Reply, refusal, serving, status};
-use crate::{Activation, Answer, AppId, End, Level, Payload, Request, sys};
+use crate::{Activation, Answer, AppId, End, Level, Payload, Request, Rights, sys};
 
 /// From accepting a connection to reading its REQUEST.
 pub(crate) const REQUEST_WAIT: Duration = Duration::from_secs(2);
@@ -440,19 +440,28 @@ impl<T: Payload> Session<T> {
             reply.payload_version = Some(core.ctx.payload_version);
             return self.reply(reply, now);
         }
-        // A request goes neither up nor down. The launch's level comes from
-        // its token, never from what it sends: one that isn't the owner's,
-        // or that wasn't read while the owner's was, is refused and told
-        // the owner's. On Unix neither end has one.
-        if self.peer.level != core.ctx.level {
-            log::warn!(
-                "instance-handoff {}: refused a launch at another integrity level",
-                core.ctx.app_id
-            );
-            let mut reply = Reply::refused(refusal::PRIVILEGE);
-            reply.level = core.ctx.level.map(Level::rid);
-            return self.reply(reply, now);
-        }
+        // A request never goes up, and goes down only when the launch
+        // consents with HAND_DOWN. The launch's level comes from its token,
+        // never from what it sends, and so do the rights it hands down:
+        // HAND_DOWN is only its consent, whatever rights it names. Any
+        // other launch at another level, or one whose level wasn't read
+        // while the owner's was, is refused and told the owner's. On Unix
+        // neither end has one, and HAND_DOWN changes nothing.
+        let handed_down = match (self.peer.level, core.ctx.level) {
+            (launch, owner) if launch == owner => None,
+            (Some(launch), Some(owner)) if launch > owner && req.hand_down.is_some() => {
+                Some(Rights::Level { launch, owner })
+            }
+            _ => {
+                log::warn!(
+                    "instance-handoff {}: refused a launch at another integrity level",
+                    core.ctx.app_id
+                );
+                let mut reply = Reply::refused(refusal::PRIVILEGE);
+                reply.level = core.ctx.level.map(Level::rid);
+                return self.reply(reply, now);
+            }
+        };
         // The app's decoder runs on the crate's thread: a panic in it must
         // not take the thread down.
         let payload = match catch_unwind(AssertUnwindSafe(|| T::decode(&req.payload))) {
@@ -483,7 +492,13 @@ impl<T: Payload> Session<T> {
             .and_then(|b| wire::os_from_bytes(b).ok())
             .map(PathBuf::from);
         let activation = Activation::from_parts(req.xdg_activation_token, req.startup_id);
-        self.pending = Some(Request::remote(payload, cwd, activation, self.peer.pid));
+        self.pending = Some(Request::remote(
+            payload,
+            cwd,
+            activation,
+            self.peer.pid,
+            handed_down,
+        ));
         self.out.extend_from_slice(&wire::empty(wire::READY));
         self.phase = Phase::Commit;
         self.deadline = now + COMMIT_WAIT;
@@ -689,7 +704,14 @@ mod tests {
     fn bad_requests_are_refused_with_a_reason() {
         let core = core(Some(Box::new(|_| Answer::Take)));
         let now = Instant::now();
-        let cases: [(Vec<u8>, u8); 4] = [
+        // A request with a critical record from a later release: WAIT.
+        let wait = wire::Writer::new(wire::REQUEST)
+            .bytes(1, &1u16.to_le_bytes())
+            .bytes(2, &3u32.to_le_bytes())
+            .bytes(6, &Args::default().encode().unwrap())
+            .bytes(0x8b, &[])
+            .finish();
+        let cases: [(Vec<u8>, u8); 5] = [
             (
                 request(4, Args::default().encode().unwrap()),
                 refusal::PAYLOAD_VERSION,
@@ -697,6 +719,7 @@ mod tests {
             (request(3, vec![9]), refusal::UNDECODABLE),
             (b"{\"v\":1}\n".to_vec(), refusal::MALFORMED),
             (wire::empty(wire::COMMIT), refusal::MALFORMED),
+            (wait, refusal::UNSUPPORTED),
         ];
         for (bytes, why) in cases {
             let mut s = Session::new(&core, Peer::default(), now);
@@ -748,9 +771,10 @@ mod tests {
         assert!(s.is_done());
     }
 
-    // A launch is admitted only at the owner's own level, as its token
-    // shows it. Any other, or none where the owner has one, is refused with
-    // PRIVILEGE and the owner's level. On Unix neither has one.
+    // A launch that doesn't hand down is admitted only at the owner's own
+    // level, as its token shows it. Any other, or none where the owner has
+    // one, is refused with PRIVILEGE and the owner's level. On Unix neither
+    // has one.
     #[test]
     fn a_launch_at_another_level_is_refused_with_the_owners() {
         let (low, medium, high) = (Some(Level::LOW), Some(Level::MEDIUM), Some(Level::HIGH));
@@ -792,6 +816,79 @@ mod tests {
                 ),
                 "{owner:?} {launch:?}"
             );
+        }
+    }
+
+    // A launch above the owner, as its token shows it, is admitted only
+    // when it hands its request down with HAND_DOWN, and the handler is
+    // told what it gave up: the two levels the tokens show, never the
+    // record's. A request never goes up, so a launch below the owner, or
+    // whose level wasn't read, is refused with PRIVILEGE, record or not.
+    // At the owner's level, and on Unix where neither has one, the record
+    // changes nothing.
+    #[test]
+    fn a_launch_above_the_owner_is_admitted_only_handing_down() {
+        /// What becomes of a launch.
+        #[derive(Debug, PartialEq)]
+        enum Is {
+            Refused,
+            /// With what it handed down.
+            Admitted(Option<Rights>),
+        }
+        let (low, medium, high) = (Some(Level::LOW), Some(Level::MEDIUM), Some(Level::HIGH));
+        let system = Some(Level::SYSTEM);
+        let rights = |launch, owner| Rights::Level { launch, owner };
+        let down = rights(Level::HIGH, Level::MEDIUM);
+        let from_system = rights(Level::SYSTEM, Level::HIGH);
+        // RIDs that aren't the tokens' levels.
+        let lie = rights(Level::SYSTEM, Level::LOW);
+        let gave = |rights: &Rights| Is::Admitted(Some(rights.clone()));
+        let rows = [
+            // (the owner's level, the launch's, the record): what becomes
+            // of the launch.
+            ((medium, high, Some(&down)), gave(&down)),
+            ((medium, high, Some(&lie)), gave(&down)),
+            ((high, system, Some(&down)), gave(&from_system)),
+            ((medium, high, None), Is::Refused),
+            ((medium, low, Some(&down)), Is::Refused),
+            ((high, medium, Some(&down)), Is::Refused),
+            ((medium, None, Some(&down)), Is::Refused),
+            ((None, high, Some(&down)), Is::Refused),
+            ((medium, medium, Some(&lie)), Is::Admitted(None)),
+            ((None, None, Some(&down)), Is::Admitted(None)),
+        ];
+        let now = Instant::now();
+        for ((owner, launch, record), is) in rows {
+            let mut c = core(Some(Box::new(|_| Answer::Take)));
+            c.ctx.level = owner;
+            let mut s = Session::new(&c, Peer::default(), now);
+            if let Some(level) = launch {
+                s.attested(level);
+            }
+            take_out(&mut s);
+            let bytes = wire::Request {
+                wire: 1,
+                payload_version: 3,
+                payload: Args::default().encode().unwrap(),
+                hand_down: record.cloned(),
+                ..Default::default()
+            }
+            .encode();
+            assert!(s.read(&bytes, &c, now).is_none());
+            let out = take_out(&mut s);
+            let got = if out[0].0 == wire::READY {
+                let request = s.read(&wire::empty(wire::COMMIT), &c, now).unwrap();
+                Is::Admitted(request.handed_down().cloned())
+            } else {
+                let r = reply(&out);
+                assert_eq!(
+                    (r.refusal, r.level),
+                    (Some(refusal::PRIVILEGE), owner.map(Level::rid)),
+                    "{owner:?} {launch:?} {record:?}"
+                );
+                Is::Refused
+            };
+            assert_eq!(got, is, "{owner:?} {launch:?} {record:?}");
         }
     }
 
