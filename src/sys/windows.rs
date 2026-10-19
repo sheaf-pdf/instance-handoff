@@ -8,6 +8,22 @@
 //! lose the ones the user elevated for. Each level's folder is labelled at
 //! that level, so lower levels can neither read it nor squat its lock.
 //!
+//! Each folder from the base down gets an access list of its own, for this
+//! user and SYSTEM, whatever its parent hands down; the missing parents of
+//! a `Builder::dir` base are made as Windows makes any folder. In Local
+//! AppData, the app's folder has no label, so it counts as medium. The
+//! instance folder in it, which every level shares, is labelled medium by
+//! whichever level makes it, and the label isn't handed down. Each level's
+//! folder in it is labelled at that level, and hands the label down to what
+//! is made in it. So each of these folders carries at most one label, its
+//! own. A `Builder::dir` base and its instance folder are labelled at the
+//! process's level, as a level's folder is. No label is protected (`S:P`):
+//! that needs a privilege the crate never enables. A launch refuses an
+//! instance folder in Local AppData labelled other than medium (none counts
+//! as medium), and a level's folder labelled at another level.
+//! `instance.lock` gets an access list of its own too, and takes its label
+//! from its folder.
+//!
 //! The pipe's controls, each against a threat:
 //! - its name is 128 random bits, published only after the pipe exists, in
 //!   a folder only this user can read: another user on a terminal server
@@ -55,15 +71,16 @@ use windows_sys::Win32::Security::{
     WinCreatorOwnerRightsSid, WinCreatorOwnerSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY,
-    FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
-    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, GetFileInformationByHandle,
-    GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, LOCKFILE_EXCLUSIVE_LOCK,
-    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, PIPE_ACCESS_DUPLEX, READ_CONTROL, ReadFile,
-    SECURITY_IDENTIFICATION, SYNCHRONIZE, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER, WriteFile,
+    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DELETE, FILE_ADD_FILE,
+    FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
+    FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+    GetVolumeInformationByHandleW, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    OPEN_ALWAYS, PIPE_ACCESS_DUPLEX, READ_CONTROL, ReadFile, SECURITY_IDENTIFICATION, SYNCHRONIZE,
+    VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER, WriteFile,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
@@ -321,6 +338,24 @@ impl Place {
         p.extend(&self.level);
         p
     }
+
+    /// Each folder this crate makes in the base, with its role. Above a
+    /// level folder, the last is the instance folder, and any before it
+    /// (the app's folder) are shared. Without a level folder, each belongs
+    /// to this process's level.
+    fn folders(&self) -> impl Iterator<Item = (&OsString, Role)> {
+        let key = self.subs.len().saturating_sub(1);
+        let shared = self.level.is_some();
+        let subs = self.subs.iter().enumerate().map(move |(i, sub)| {
+            let role = match (shared, i == key) {
+                (false, _) => Role::Level,
+                (true, true) => Role::Key,
+                (true, false) => Role::Shared,
+            };
+            (sub, role)
+        });
+        subs.chain(self.level.iter().map(|sub| (sub, Role::Level)))
+    }
 }
 
 pub(crate) fn default_place(id: &AppId) -> Result<Place, Reason> {
@@ -498,12 +533,28 @@ fn open_dir(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// What a folder this crate makes is for, which sets its label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The app's folder in Local AppData, which every level shares:
+    /// unlabelled, so it counts as medium.
+    Shared,
+    /// The instance folder in Local AppData, which every level shares:
+    /// labelled medium, whatever level makes it, and the label isn't handed
+    /// down. One with no label counts as medium too.
+    Key,
+    /// A folder of this process's integrity level: labelled at that level,
+    /// and the label is handed down to everything made in it.
+    Level,
+}
+
 /// A real folder, owned by this user (or SYSTEM, Administrators,
 /// TrustedInstaller), that nobody else may change. A folder this crate
-/// makes (`private`) must also be one nobody else may read, and one that
-/// belongs to an integrity level (`level`) must be labelled at this
-/// process's level (no label counts as medium).
-fn check_dir(dir: &File, private: bool, level: bool) -> io::Result<()> {
+/// makes (one with a `role`) must also be one nobody else may read. An
+/// instance folder in Local AppData must be labelled medium or not at all,
+/// and a level's folder at this process's level (no label counts as
+/// medium).
+fn check_dir(dir: &File, role: Option<Role>) -> io::Result<()> {
     let handle = dir.as_raw_handle();
     // SAFETY: plain data, filled in by the call.
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -542,8 +593,15 @@ fn check_dir(dir: &File, private: bool, level: bool) -> io::Result<()> {
         return Err(denied("owned by another user"));
     }
     // SAFETY: a valid (or null) SACL from the call above.
-    if level && unsafe { label(sacl) }.unwrap_or(MEDIUM) != me.integrity {
-        return Err(denied("made for another integrity level"));
+    let labelled = unsafe { label(sacl) };
+    match role {
+        Some(Role::Key) if labelled.is_some_and(|l| l != MEDIUM) => {
+            return Err(denied("labelled at an integrity level other than medium"));
+        }
+        Some(Role::Level) if labelled.unwrap_or(MEDIUM) != me.integrity => {
+            return Err(denied("made for another integrity level"));
+        }
+        _ => {}
     }
     if dacl.is_null() {
         return Err(denied("no access list: anyone may change it"));
@@ -570,7 +628,7 @@ fn check_dir(dir: &File, private: bool, level: bool) -> io::Result<()> {
         if ace.mask & CHANGES != 0 {
             return Err(denied("other users can change it"));
         }
-        if private && ace.mask & READS != 0 {
+        if role.is_some() && ace.mask & READS != 0 {
             return Err(denied("other users can read it"));
         }
     }
@@ -592,21 +650,28 @@ struct AllowedAce {
 }
 
 /// Creates a folder that only this user (and SYSTEM) can open, whatever
-/// its parent would hand down. A `level` folder is also labelled at this
-/// process's integrity level, and so is everything made in it, so that
-/// lower levels can't open any of it. An existing folder is left as it is.
-fn create_private_dir(path: &Path, level: bool) -> io::Result<()> {
+/// its parent would hand down, labelled as its `role` wants. A level's
+/// folder is labelled at this process's integrity level, and so is
+/// everything made in it, so that lower levels can't open any of it. An
+/// instance folder is labelled medium, which a process may set at medium
+/// or above, and nothing made in it takes that label. An existing folder
+/// is left as it is.
+fn create_private_dir(path: &Path, role: Role) -> io::Result<()> {
     let me = me()?;
     let mut sddl = format!("D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)", me.sid_string);
-    if level {
-        sddl += &format!("S:(ML;OICI;NWNR;;;S-1-16-{})", me.integrity);
+    match role {
+        Role::Shared => {}
+        Role::Key => sddl += "S:(ML;;NWNR;;;ME)",
+        Role::Level => sddl += &format!("S:(ML;OICI;NWNR;;;S-1-16-{})", me.integrity),
     }
-    let sd = SecurityDescriptor::from_sddl(&sddl)?;
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: (sd.0).0,
-        bInheritHandle: 0,
-    };
+    create_dir_with_sd(path, &sddl)
+}
+
+/// Creates the folder `path` with the security `sddl` describes. An
+/// existing folder is left as it is.
+fn create_dir_with_sd(path: &Path, sddl: &str) -> io::Result<()> {
+    let sd = SecurityDescriptor::from_sddl(sddl)?;
+    let sa = sd.attributes();
     let wide_path = wide(path.as_os_str());
     // SAFETY: a NUL-terminated path and valid security attributes.
     if unsafe { CreateDirectoryW(wide_path.as_ptr(), &sa) } == 0 {
@@ -618,31 +683,57 @@ fn create_private_dir(path: &Path, level: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// Opens the file `path` to read and write, creating it with the security
+/// `sddl` describes when it is missing; an existing file keeps its own. A
+/// link at `path` is opened as itself, not followed. While it is open,
+/// others may open it to read and write, but not to delete or rename it.
+fn create_file_with_sd(path: &Path, sddl: &str) -> io::Result<File> {
+    let sd = SecurityDescriptor::from_sddl(sddl)?;
+    let sa = sd.attributes();
+    let wide_path = wide(path.as_os_str());
+    // SAFETY: a NUL-terminated path, valid security attributes and no
+    // template file.
+    let h = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &sa,
+            OPEN_ALWAYS,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a new handle that nothing else owns.
+    Ok(unsafe { File::from_raw_handle(h) })
+}
+
 pub(crate) fn open_folder(place: &Place, create: bool) -> Result<Option<Folder>, Reason> {
     let mut path = place.base.clone();
     let missing = |e: &io::Error| e.kind() == io::ErrorKind::NotFound && !create;
-    let made = place.kind == Base::Create;
-    if made && create {
+    // Local AppData isn't the crate's, so it need only be safe. A
+    // `Builder::dir` base is, and belongs to this process's level.
+    let made = (place.kind == Base::Create).then_some(Role::Level);
+    if let (Some(role), true) = (made, create) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Reason::runtime_dir(&path, e))?;
         }
-        create_private_dir(&path, true).map_err(|e| Reason::runtime_dir(&path, e))?;
+        create_private_dir(&path, role).map_err(|e| Reason::runtime_dir(&path, e))?;
     }
-    let mut dir = match open_dir(&path).and_then(|d| check_dir(&d, made, made).map(|()| d)) {
+    let mut dir = match open_dir(&path).and_then(|d| check_dir(&d, made).map(|()| d)) {
         Ok(dir) => dir,
         Err(e) if missing(&e) => return Ok(None),
         Err(e) => return Err(Reason::runtime_dir(&path, e)),
     };
-    // Each folder below the base, and whether it belongs to this process's
-    // level.
-    let shared = place.level.is_some();
-    let subs = place.subs.iter().map(|sub| (sub, !shared));
-    for (sub, level) in subs.chain(place.level.iter().map(|sub| (sub, true))) {
+    for (sub, role) in place.folders() {
         path.push(sub);
         if create {
-            create_private_dir(&path, level).map_err(|e| Reason::runtime_dir(&path, e))?;
+            create_private_dir(&path, role).map_err(|e| Reason::runtime_dir(&path, e))?;
         }
-        dir = match open_dir(&path).and_then(|d| check_dir(&d, true, level).map(|()| d)) {
+        dir = match open_dir(&path).and_then(|d| check_dir(&d, Some(role)).map(|()| d)) {
             Ok(dir) => dir,
             Err(e) if missing(&e) => return Ok(None),
             Err(e) => return Err(Reason::runtime_dir(&path, e)),
@@ -699,14 +790,21 @@ impl Folder {
         self.path.join(LOCK_FILE)
     }
 
+    /// Opens `instance.lock`, creating it when `create` is set. A new one
+    /// gets an access list of its own, for this user and SYSTEM, and no
+    /// label of its own: it takes its folder's.
     fn open_lock(&self, create: bool) -> io::Result<File> {
+        let path = self.lock_path();
+        if create {
+            let sddl = format!("D:P(A;;FA;;;{})(A;;FA;;;SY)", me()?.sid_string);
+            return create_file_with_sd(&path, &sddl);
+        }
         OpenOptions::new()
             .read(true)
             .write(true)
-            .create(create)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(self.lock_path())
+            .open(path)
     }
 
     pub(crate) fn lock(&self) -> io::Result<Option<Lock>> {
@@ -982,11 +1080,11 @@ fn check_client(pipe: HANDLE) -> io::Result<()> {
     Ok(())
 }
 
-/// The pipe's security: owned by this user, open to this user alone, and
-/// labelled at this process's integrity level.
+/// The security a new pipe, folder or file gets, made from SDDL.
 struct SecurityDescriptor(Local);
 
-// SAFETY: an immutable block, only read by CreateNamedPipeW.
+// SAFETY: an immutable block, only read by the calls that create objects
+// with it.
 unsafe impl Send for SecurityDescriptor {}
 unsafe impl Sync for SecurityDescriptor {}
 
@@ -997,6 +1095,8 @@ impl std::fmt::Debug for SecurityDescriptor {
 }
 
 impl SecurityDescriptor {
+    /// The pipe's: owned by this user, open to this user alone, and
+    /// labelled at this process's integrity level.
     fn for_pipe() -> io::Result<SecurityDescriptor> {
         let me = me()?;
         SecurityDescriptor::from_sddl(&format!(
@@ -1024,14 +1124,21 @@ impl SecurityDescriptor {
         }
         Ok(SecurityDescriptor(Local(sd)))
     }
+
+    /// Attributes that give a new object this security, and a handle that
+    /// child processes don't inherit. They point into `self`, so they are
+    /// valid only while it lives.
+    fn attributes(&self) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: (self.0).0,
+            bInheritHandle: 0,
+        }
+    }
 }
 
 fn create_instance(name: &OsStr, sd: &SecurityDescriptor, first: bool) -> io::Result<OwnedHandle> {
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: (sd.0).0,
-        bInheritHandle: 0,
-    };
+    let sa = sd.attributes();
     let mut open = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
     if first {
         open |= FILE_FLAG_FIRST_PIPE_INSTANCE;
@@ -1818,60 +1925,225 @@ fn check_address<T: Payload>(core: &Core<T>, listener: Option<&mut PipeListener>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+    use windows_sys::Win32::Security::OBJECT_SECURITY_INFORMATION;
+
+    const APP: &str = "test.windows";
+    const KEY: &str = "i-0123456789abcdef";
+    const DACL: OBJECT_SECURITY_INFORMATION = DACL_SECURITY_INFORMATION;
+    const LABEL: OBJECT_SECURITY_INFORMATION = LABEL_SECURITY_INFORMATION;
+
+    /// A place laid out as in Local AppData, in a private folder made in
+    /// `tmp`: the app's folder, an instance folder, then this process's
+    /// level folder.
+    fn local(tmp: &Path) -> Place {
+        let base = tmp.join("local");
+        create_private_dir(&base, Role::Shared).unwrap();
+        Place {
+            base,
+            kind: Base::Known,
+            subs: vec![APP.into(), KEY.into()],
+            level: Some(level_folder(me().unwrap().integrity).into()),
+        }
+    }
+
+    /// An access list for this user and SYSTEM alone, its entries handed
+    /// down as `inherit` says (`OICI`, or nothing).
+    fn private(inherit: &str) -> String {
+        let user = &me().unwrap().sid_string;
+        format!("D:P(A;{inherit};FA;;;{user})(A;{inherit};FA;;;SY)")
+    }
+
+    /// The parts of `path`'s security that `info` names, as SDDL, and the
+    /// level its label names, if `info` names the label and there is one.
+    fn security(path: &Path, info: OBJECT_SECURITY_INFORMATION) -> (String, Option<u32>) {
+        let file = OpenOptions::new()
+            .access_mode(READ_CONTROL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .unwrap();
+        let mut sacl: *mut ACL = null_mut();
+        let mut sd: *mut c_void = null_mut();
+        // SAFETY: a handle opened with READ_CONTROL; `sacl` points into
+        // `sd`, freed by `Local`.
+        let err = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                info,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut sacl,
+                &mut sd,
+            )
+        };
+        assert_eq!(err, 0, "GetSecurityInfo: {}", win32(err));
+        let sd = Local(sd);
+        // SAFETY: a valid (or null) SACL from the call above.
+        (to_sddl(&sd, info), unsafe { label(sacl) })
+    }
+
+    /// The parts of the security descriptor `sd` holds that `info` names,
+    /// as SDDL.
+    fn to_sddl(sd: &Local, info: OBJECT_SECURITY_INFORMATION) -> String {
+        let mut s: *mut u16 = null_mut();
+        // SAFETY: both callers pass a security descriptor, from
+        // GetSecurityInfo or from SDDL; `s` receives a LocalAlloc'd string,
+        // freed by `Local`.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd.0,
+                SDDL_REVISION_1,
+                info,
+                &mut s,
+                null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+        let _free = Local(s.cast());
+        // SAFETY: a NUL-terminated string from the call above.
+        let len = (0..).take_while(|&i| unsafe { *s.add(i) } != 0).count();
+        let units = unsafe { std::slice::from_raw_parts(s, len) };
+        String::from_utf16_lossy(units)
+    }
+
+    /// The parts of `sddl` that `info` names, as Windows writes them back.
+    /// It spells some SIDs by name, such as the built-in Administrator's
+    /// (`LA`), which CI runs as.
+    fn spelled(sddl: &str, info: OBJECT_SECURITY_INFORMATION) -> String {
+        to_sddl(&SecurityDescriptor::from_sddl(sddl).unwrap().0, info)
+    }
+
+    /// Asserts that `open_folder` refuses `place` because of the folder
+    /// `at`.
+    fn refused(place: &Place, at: &Path) {
+        match open_folder(place, true) {
+            Err(Reason::RuntimeDir { path, .. }) => assert_eq!(path, at),
+            other => panic!("{other:?}"),
+        }
+    }
 
     // The level folder comes last, below the instance folder that every
     // level shares.
     #[test]
     fn the_default_folder_passes_the_check() {
-        let mut place = default_place(&AppId::headless("test.windows")).unwrap();
+        let mut place = default_place(&AppId::headless(APP)).unwrap();
         let base = open_dir(&place.base).unwrap();
-        check_dir(&base, false, false).unwrap();
+        check_dir(&base, None).unwrap();
         let level = level_folder(me().unwrap().integrity);
-        place.push("i-0123456789abcdef");
-        assert_eq!(
-            place.path(),
-            place
-                .base
-                .join("test.windows")
-                .join("i-0123456789abcdef")
-                .join(level)
-        );
+        place.push(KEY);
+        assert_eq!(place.path(), place.base.join(APP).join(KEY).join(level));
     }
 
+    // Each folder has an access list of its own and at most one label, its
+    // own: the instance folder's isn't handed down to the level folder.
+    // Windows reports a label given as a folder is made with AI
+    // (auto-inherited) on the list that holds it, as the CI measurements in
+    // docs/design show.
     #[test]
     fn folders_this_crate_makes_are_private_and_labelled() {
+        let me = me().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let mut place = Place::dir(tmp.path().join("run"));
-        place.push("i-0123456789abcdef");
+        let place = local(tmp.path());
         let folder = open_folder(&place, true).unwrap().unwrap();
-        check_dir(&open_dir(folder.path()).unwrap(), true, true).unwrap();
-        check_dir(&open_dir(&tmp.path().join("run")).unwrap(), true, true).unwrap();
+        let app = place.base.join(APP);
+        let key = app.join(KEY);
+        assert_eq!(folder.path(), key.join(level_folder(me.integrity)));
+
+        let both = DACL | LABEL;
+        assert_eq!(security(&app, DACL).0, spelled(&private("OICI"), DACL));
+        let (label, level) = security(&app, LABEL);
+        assert_eq!(level, None, "{label}");
+        let want = format!("{}S:AI(ML;;NWNR;;;ME)", private("OICI"));
+        assert_eq!(security(&key, both).0, spelled(&want, both));
+        let want = format!(
+            "{}S:AI(ML;OICI;NWNR;;;S-1-16-{})",
+            private("OICI"),
+            me.integrity
+        );
+        assert_eq!(security(folder.path(), both).0, spelled(&want, both));
+
+        // Under Builder::dir, the base and the instance folder belong to
+        // this process's level.
+        let mut place = Place::dir(tmp.path().join("dir"));
+        place.push(KEY);
+        let folder = open_folder(&place, true).unwrap().unwrap();
+        for dir in [folder.path(), &tmp.path().join("dir")] {
+            check_dir(&open_dir(dir).unwrap(), Some(Role::Level)).unwrap();
+        }
     }
 
+    // instance.lock has an access list of its own. Its one label is its
+    // folder's, handed down.
+    #[test]
+    fn the_lock_file_has_its_own_access_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = open_folder(&local(tmp.path()), true).unwrap().unwrap();
+        let _lock = folder.lock().unwrap().unwrap();
+        let path = folder.lock_path();
+        assert_eq!(security(&path, DACL).0, spelled(&private(""), DACL));
+        let (label, level) = security(&path, LABEL);
+        assert_eq!(label.matches("(ML;").count(), 1, "{label}");
+        assert_eq!(level, Some(me().unwrap().integrity), "{label}");
+    }
+
+    // Each label here is one this process may set: below its own level, or
+    // at it.
     #[test]
     fn a_folder_made_for_another_integrity_level_is_refused() {
-        // Labelled one level below this process's, which it may do.
         let me = me().unwrap();
-        let sd = SecurityDescriptor::from_sddl(&format!(
-            "D:P(A;OICI;FA;;;{})S:(ML;OICI;NW;;;S-1-16-{})",
-            me.sid_string,
+        let below = format!(
+            "{}S:(ML;OICI;NWNR;;;S-1-16-{})",
+            private("OICI"),
             me.integrity - 0x1000
-        ))
-        .unwrap();
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: (sd.0).0,
-            bInheritHandle: 0,
-        };
+        );
+
+        // An instance folder labelled low.
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("run");
-        let wide_path = wide(path.as_os_str());
-        // SAFETY: a NUL-terminated path and valid security attributes.
-        assert_ne!(unsafe { CreateDirectoryW(wide_path.as_ptr(), &sa) }, 0);
-        assert!(matches!(
-            open_folder(&Place::dir(path), true),
-            Err(Reason::RuntimeDir { .. })
-        ));
+        let place = local(tmp.path());
+        let app = place.base.join(APP);
+        create_private_dir(&app, Role::Shared).unwrap();
+        let low = format!("{}S:(ML;;NWNR;;;LW)", private("OICI"));
+        create_dir_with_sd(&app.join(KEY), &low).unwrap();
+        refused(&place, &app.join(KEY));
+
+        // One labelled above medium, where this process may label it so.
+        if me.integrity > MEDIUM {
+            let tmp = tempfile::tempdir().unwrap();
+            let place = local(tmp.path());
+            let app = place.base.join(APP);
+            create_private_dir(&app, Role::Shared).unwrap();
+            create_private_dir(&app.join(KEY), Role::Level).unwrap();
+            refused(&place, &app.join(KEY));
+        }
+
+        // A level folder labelled one level below this process's.
+        let tmp = tempfile::tempdir().unwrap();
+        let place = local(tmp.path());
+        let app = place.base.join(APP);
+        create_private_dir(&app, Role::Shared).unwrap();
+        create_private_dir(&app.join(KEY), Role::Key).unwrap();
+        create_dir_with_sd(&place.path(), &below).unwrap();
+        refused(&place, &place.path());
+
+        // So is a Builder::dir base, which belongs to a level too.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("dir");
+        create_dir_with_sd(&base, &below).unwrap();
+        refused(&Place::dir(base.clone()), &base);
+    }
+
+    // Instance folders used to be made without a label, and every level
+    // may still use one.
+    #[test]
+    fn an_instance_folder_with_no_label_counts_as_medium() {
+        let tmp = tempfile::tempdir().unwrap();
+        let place = local(tmp.path());
+        let app = place.base.join(APP);
+        create_private_dir(&app, Role::Shared).unwrap();
+        create_private_dir(&app.join(KEY), Role::Shared).unwrap();
+        assert!(open_folder(&place, true).unwrap().is_some());
     }
 
     #[test]
