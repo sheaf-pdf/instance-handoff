@@ -80,7 +80,7 @@ fn a_second_launch_hands_its_args_to_the_first() {
     let dir = dir();
     let (owner, rx) = serve(claim(builder(&dir).start(&args(&["one.pdf"]))));
     assert!(owner.listen_error().is_none());
-    assert_eq!(owner.dir(), dir.path);
+    assert_eq!(Some(owner.dir().to_path_buf()), builder(&dir).runtime_dir());
 
     // Not valid Unicode: bytes on Unix, a lone surrogate on Windows.
     #[cfg(unix)]
@@ -343,8 +343,8 @@ fn socket(dir: &Path) -> std::fs::File {
 fn silent_and_trickling_clients_block_nobody() {
     let dir = dir();
     let (owner, rx) = serve(claim(builder(&dir).start(&Args::default())));
-    let _silent: Vec<_> = (0..3).map(|_| socket(&dir.path)).collect();
-    let mut trickle = socket(&dir.path);
+    let _silent: Vec<_> = (0..3).map(|_| socket(owner.dir())).collect();
+    let mut trickle = socket(owner.dir());
     trickle.write_all(b"IH").unwrap();
     let t = Instant::now();
     builder(&dir).hand_off(&args(&["through"])).unwrap();
@@ -364,7 +364,7 @@ fn silent_and_trickling_clients_block_nobody() {
 fn an_old_json_launch_is_refused_and_nothing_is_delivered() {
     let dir = dir();
     let (owner, rx) = serve(claim(builder(&dir).start(&Args::default())));
-    let mut old = socket(&dir.path);
+    let mut old = socket(owner.dir());
     #[cfg(unix)]
     old.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     old.write_all(b"{\"v\":1,\"paths\":[\"/x.pdf\"]}\n")
@@ -390,7 +390,11 @@ fn an_owner_that_refuses_the_launchs_user_says_so_at_once() {
     use std::os::unix::fs::DirBuilderExt;
     let dir = dir();
     let run = builder(&dir).runtime_dir().unwrap();
-    std::fs::DirBuilder::new().mode(0o700).create(&run).unwrap();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&run)
+        .unwrap();
     let lock = std::fs::File::create(run.join("instance.lock")).unwrap();
     // SAFETY: flock on an open file.
     let locked = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -468,7 +472,8 @@ fn a_deleted_folder_is_re_created() {
     ));
     std::fs::remove_dir_all(&dir.path).unwrap();
     std::thread::sleep(check * 4);
-    assert!(dir.path.join("instance.lock").exists());
+    let run = builder(&dir).runtime_dir().unwrap();
+    assert!(run.join("instance.lock").exists());
     builder(&dir).hand_off(&args(&["after"])).unwrap();
     assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["after"]));
     assert_eq!(owner.ended(), None);
@@ -518,13 +523,14 @@ fn a_live_owners_folder_and_address_stay_put() {
     let (owner, rx) = serve(claim(
         builder(&dir).__upkeep(hour, hour).start(&Args::default()),
     ));
-    let address = dir.path.join("instance.pipe");
+    let run = owner.dir();
+    let address = run.join("instance.pipe");
     assert!(std::fs::remove_file(&address).is_err());
-    let other = dir.path.join("other");
+    let other = run.join("other");
     std::fs::write(&other, "x\n").unwrap();
     assert!(std::fs::rename(&other, &address).is_err());
-    assert!(std::fs::remove_dir_all(&dir.path).is_err());
-    assert!(std::fs::rename(&dir.path, dir.path.with_extension("moved")).is_err());
+    assert!(std::fs::remove_dir_all(run).is_err());
+    assert!(std::fs::rename(run, run.with_extension("moved")).is_err());
     assert!(address.exists());
     builder(&dir).hand_off(&args(&["after"])).unwrap();
     assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["after"]));
@@ -634,7 +640,11 @@ fn a_relative_folder_is_made_absolute() {
         .runtime_dir()
         .unwrap();
     assert!(dir.is_absolute(), "{}", dir.display());
-    assert_eq!(dir, std::env::current_dir().unwrap().join("run"));
+    assert!(
+        dir.starts_with(std::env::current_dir().unwrap().join("run")),
+        "{}",
+        dir.display()
+    );
 }
 
 #[test]

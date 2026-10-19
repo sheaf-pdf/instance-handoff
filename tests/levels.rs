@@ -125,7 +125,7 @@ fn a_medium_launch_never_hands_off_to_a_high_owner() {
         "{}",
         claim.dir().display()
     );
-    let base = claim.dir().parent().unwrap().to_path_buf();
+    let base = app_folder(claim.dir(), &id).to_path_buf();
     let (tx, rx) = mpsc::channel();
     let owner = claim.serve(move |r| tx.send(r).is_ok());
 
@@ -153,6 +153,7 @@ fn a_high_launch_never_hands_off_to_a_medium_owner() {
     let mut child = medium("child_owner", &[(ID, OsStr::new(id.as_str()))]);
     let dir = child.expect("owner ");
     assert!(dir.ends_with(r"\run"), "{dir}");
+    let base = app_folder(Path::new(&dir), &id).to_path_buf();
 
     match Builder::new(id.clone(), State::none()).start(&Args::new(["from-high"])) {
         Started::Owner(claim) => {
@@ -172,7 +173,7 @@ fn a_high_launch_never_hands_off_to_a_medium_owner() {
 
     let rest = child.finish();
     assert!(!rest.iter().any(|l| l.starts_with("took ")), "{rest:?}");
-    let _ = std::fs::remove_dir_all(Path::new(&dir).parent().unwrap());
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]
@@ -488,6 +489,14 @@ fn app(name: &str) -> AppId {
         Kind::Headless,
     )
     .unwrap()
+}
+
+/// The folder named after `id` that `dir` is in: the one the crate made
+/// in the real local AppData, which a test removes when it is done.
+fn app_folder<'a>(dir: &'a Path, id: &AppId) -> &'a Path {
+    dir.ancestors()
+        .find(|p| p.file_name() == Some(OsStr::new(id.as_str())))
+        .unwrap_or_else(|| panic!("{} isn't in a folder named {id}", dir.display()))
 }
 
 fn claim(started: Started<Args>) -> Claim<Args> {
