@@ -1,39 +1,87 @@
 # instance-handoff
 
-One instance of an app per user on each machine. The first launch takes a lock and becomes the *owner*. A later launch connects to the owner's socket, hands over the files it was given, and exits.
+Make your program single-instance, whatever it's built with: GPUI, winit, egui, a tokio service or a plain CLI.
+
+The first launch takes a lock in a private, per-user runtime folder and becomes the *owner*. Every later launch connects to the owner, hands over its request (its arguments and working directory, or any payload you define), gets an answer, and exits. Only one process ever holds the lock, so the owner can keep your app's state to itself. The OS releases the lock when the owner exits, crash included, so there's never a stale lock to clean up. Only the same user can connect, and when a launch can't hand over, it tells you why.
+
+```rust
+use instance_handoff::{AppId, Args, Builder, Request, Started};
+
+const APP: AppId = AppId::new("org.example.Viewer");
+
+fn main() {
+    let args = Args::from_env();
+    // Decide first, before any window, event loop or runtime exists.
+    let claim = match Builder::new(APP).start(&args) {
+        Started::Owner(claim) => claim,
+        Started::HandedOff(_) => return, // the owner has it; exit
+        Started::Alone(reason) => panic!("{reason}"), // or run without state
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let owner = claim.serve(move |request| tx.send(request).is_ok());
+    for request in std::iter::once(Request::local(args)).chain(rx) {
+        // request.payload(), request.cwd(), request.resolve(path), …
+    }
+    drop(owner);
+}
+```
 
 ## Status
 
-Not published, and not yet generic. `src/lib.rs` is an unchanged copy of `crates/sheaf-instance` from [sheaf](https://github.com/sheaf-pdf/sheaf) at commit `468aaf1`, so it still says "sheaf" in places, and `Cargo.toml` has `publish = false` until that's fixed. The plan before a first release:
+Not published yet. The API was reworked from sheaf's `sheaf-instance` after a pre-release review, and `Cargo.toml` keeps `publish = false` until:
 
-- **App name.** "sheaf" is written into the runtime folder (`default_dir`), the fallback socket's name, the listener thread's name and the reasons `Started::Standalone` gives. Take an app id instead.
-- **Payload.** `Request` carries absolute paths and the Wayland activation token, nothing else. Make it generic, with a ready-made type for argv plus the working directory.
-- **Versions.** `PROTOCOL` versions both the wire format and sheaf's request. Split them, so a new release of the crate doesn't refuse handoffs between two builds of the same app.
-- **Delivery.** Requests go to a `futures` `UnboundedSender`. Take a callback that accepts a request or says it's busy, which suits std channels, tokio, winit's `EventLoopProxy` and GPUI alike.
-- **Reasons.** `Started::Standalone(String)` becomes an enum.
-- **Shutdown.** `Owner::stop` removes the socket, but the listener thread runs until the process exits. Stop it when the `Owner` drops.
-- **Tests.** They run on Unix only, and there's no peer check on Windows.
-- **Smaller things.** A request that doesn't parse gets no reply, so the launch waits out its timeout. The fallback socket for a long folder path goes in the shared temp folder under a name others can predict. The crate docs point at sheaf's `todos/m9.md`.
-- **To decide:** AF_UNIX on Windows through `uds_windows` (one code path; Windows 10 1803 or later; no peer check), or named pipes (the usual choice there, and they can check the client's user).
+- the Windows transport (named pipes) has run in CI: it is written and compile-checked from Linux, but no test has run on Windows;
+- sheaf has moved to the new API;
+- the maintainers have settled the decisions the review left open.
 
 ## How it works
 
-- **The lock decides the owner.** The owner holds `instance.lock` in a per-user runtime folder, taken with `File::try_lock`. The OS releases it when the owner exits, crash included, so a lock is never stale and there's no guessing about leftover sockets. The lock file holds the owner's process id.
-- **The socket only carries requests.** `instance.sock` sits beside the lock, or under a hashed name in the temp folder when the path is too long for a socket address. It's AF_UNIX on every platform; on Windows through `uds_windows`.
-- **One line each way.** A launch writes its request as a JSON line, and the owner answers *ok*, *retry* (it's quitting, or not ready) or *refused* (another protocol version). The owner replies as soon as the request is queued, so a busy window never keeps a launch waiting. Requests are capped at 1 MiB.
-- **Only the same user.** On Unix the runtime folder must be a folder, not a symlink, owned by the user and writable by no one else, group included, and both ends check the peer's user id (`SO_PEERCRED`, or `getpeereid` off Linux).
-- **Where the folder is.** `$XDG_RUNTIME_DIR/sheaf` on Linux and the BSDs (`/tmp/sheaf-<uid>` without one), `$TMPDIR/sheaf` on macOS, `%LOCALAPPDATA%\sheaf\run` on Windows. Never the config folder, which on Windows roams and may be on a network share, where sockets don't work and a lock would span machines.
-- **Two ways to launch.** `Mode::Join` becomes the owner or hands its files over, trying again until a deadline when the owner doesn't answer. `Mode::Separate` becomes the owner if nobody is and otherwise runs alone, for scripts, tests and `--new-instance` flags.
-- **Raising the window.** A launch was just started by the user, so it may bring a window forward, and the owner otherwise may not. On Windows the launch calls `AllowSetForegroundWindow` before handing off. On Wayland it passes `XDG_ACTIVATION_TOKEN` along for the owner to use.
+- **The lock decides the owner.** `flock` on `instance.lock` (Unix) or `LockFileEx` (Windows), in a per-user runtime folder. Dropping the `Owner` by mistake never frees it: only `release()` or the process's exit does.
+- **Deciding and serving are separate.** `start` decides before your event loop exists and starts no thread. `Claim::serve` attaches a handler once there is somewhere to send requests; launches arriving in between wait.
+- **A launch commits.** The owner greets each connection (HELLO: app id, versions, state). The launch sends its request, the owner answers READY, and the launch commits only if it is still within its timeout. Only then is the handler called. So a launch that gave up and ran on its own is never also delivered, whether the owner was suspended, slow or killed.
+- **Any payload.** `Args` carries argv losslessly, non-UTF-8 included, plus the launch's working directory and its activation tokens (`XDG_ACTIVATION_TOKEN`, `DESKTOP_STARTUP_ID`). Implement `Payload` for your own type, or use `Json<T>` with the `serde` feature.
+- **Only the same user, at the same privilege level.** A request never runs with more or fewer rights than its launch had, so root on Unix and an elevated process on Windows each get an owner of their own: run as administrator, a launch never hands off to the normal instance, which lacks those rights. On Unix the runtime folder must be private, and both ends check the peer's uid. On Windows each integrity level has its own folder, labelled at that level; the pipe has a random name published in that folder, an access list for the user alone and an integrity label; the owner checks the launch's token, and the launch checks that the pipe is its own user's at its own level.
+- **One right folder.** Each launch has exactly one runtime folder and never falls back to another, so two launches of one user can't end up with two owners. On Linux with systemd it's `/run/user/<uid>/<id>`; a launch with no session (cron, `@reboot`) runs alone with `Reason::NoSession` instead of guessing.
+
+The crate docs have the full guarantees, the folder rule for each platform, the protocol, and notes on daemons, containers and quitting. [docs/design](docs/design) records why each of these was chosen over the alternatives.
+
+## With an event loop
+
+Start before the loop exists, then serve once the loop can be woken. The handler runs on the crate's thread, so it only forwards:
+
+```rust
+// winit 0.30
+let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+let proxy = event_loop.create_proxy();
+let ended = proxy.clone();
+let owner = claim
+    .on_end(move |end| drop(ended.send_event(UserEvent::Ended(end))))
+    .serve(move |r| proxy.send_event(UserEvent::Launch(r)).is_ok());
+```
+
+```rust
+// GPUI, or any async executor: a futures channel drained by a task
+let (tx, mut rx) = futures::channel::mpsc::unbounded();
+let owner = claim.serve(move |r| tx.unbounded_send(r).is_ok());
+cx.spawn(async move |cx| {
+    while let Some(request) = rx.next().await {
+        cx.update(|cx| open(request, cx)).ok();
+    }
+})
+.detach();
+```
+
+[`examples/cli.rs`](examples/cli.rs) is a daemon with `status` and `stop` commands, and [`examples/tokio.rs`](examples/tokio.rs) a tokio service.
 
 ## Other crates
 
 As of October 2026:
 
-- [single-instance](https://crates.io/crates/single-instance) only detects a running instance.
-- [tauri-plugin-single-instance](https://crates.io/crates/tauri-plugin-single-instance) hands off, for Tauri apps only.
-- [single-application](https://crates.io/crates/single-application), [existing_instance](https://crates.io/crates/existing_instance) and [app-single-instance](https://crates.io/crates/app-single-instance) pass a message over an [interprocess](https://crates.io/crates/interprocess) local socket. The socket decides which process is the owner, so there's no lock file. None has a reply built in, and none checks which user connected.
-- `gio::Application` from [gtk-rs](https://gtk-rs.org) hands off over D-Bus, for GLib apps.
+- [single-instance](https://crates.io/crates/single-instance) only tells you another instance exists. On Linux it uses an abstract socket, which every user on the machine shares.
+- [tauri-plugin-single-instance](https://crates.io/crates/tauri-plugin-single-instance) is the right choice inside Tauri, and only there. Arguments arrive as lossy strings, and nothing comes back to the second launch.
+- [single-application](https://crates.io/crates/single-application), [existing_instance](https://crates.io/crates/existing_instance) and [app-single-instance](https://crates.io/crates/app-single-instance): whoever binds a socket name first wins, and the name is one that every user shares, so one user's launch can reach another user's process. None replies, checks the user, or limits sizes.
+- `gio::Application` from [gtk-rs](https://gtk-rs.org) is the API this crate learns most from (open, remote command line), but it needs GLib and a D-Bus session bus.
+- [interprocess](https://crates.io/crates/interprocess), [named-lock](https://crates.io/crates/named-lock) and [fd-lock](https://crates.io/crates/fd-lock) are good building blocks. instance-handoff is the whole protocol on top.
 
 ## Development
 
@@ -45,7 +93,7 @@ just ci       # run everything CI runs on Linux
 just windows  # or one at a time
 ```
 
-`just windows` lints the Windows code from Linux and needs `rustup target add x86_64-pc-windows-gnu`. `just msrv` needs Rust 1.89 installed. CI runs the recipes on Linux, and clippy and the tests on macOS and Windows.
+`just windows` lints the Windows code from Linux and needs `rustup target add x86_64-pc-windows-gnu`. `just targets` checks the other platforms and needs their targets added too. `just msrv` needs the oldest supported Rust installed. CI runs the recipes on Linux, and clippy and the tests on macOS and Windows.
 
 ## License
 

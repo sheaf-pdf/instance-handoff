@@ -40,7 +40,7 @@ jobs:
             exit 1
           fi
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --all-features
 
   # Any step in a job that may request an identity token could publish with
   # it, so this job runs nothing but the checkout, the token exchange and
