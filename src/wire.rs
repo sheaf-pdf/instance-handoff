@@ -9,7 +9,7 @@
 
 use std::ffi::{OsStr, OsString};
 
-use crate::BoxError;
+use crate::{BoxError, Kind};
 
 pub(crate) const MAGIC: [u8; 4] = *b"IHND";
 pub(crate) const HEADER: usize = 9;
@@ -48,6 +48,14 @@ pub(crate) mod state {
     pub const TAKING: u8 = 0;
     pub const BUSY: u8 = 1;
     pub const DECLINING: u8 = 2;
+}
+
+/// An app's [`Kind`], as the first byte of HELLO's APP record.
+pub(crate) fn app_kind(kind: Kind) -> u8 {
+    match kind {
+        Kind::Windowed => 0,
+        Kind::Headless => 1,
+    }
 }
 
 /// The owner's features, in HELLO: what it does that older owners didn't.
@@ -230,6 +238,9 @@ pub(crate) struct Hello {
     pub(crate) wire_min: u16,
     pub(crate) wire_max: u16,
     pub(crate) app_id: String,
+    /// The app's kind, as [`app_kind`] writes it. A launch compares it as
+    /// it does the id.
+    pub(crate) app_kind: u8,
     /// Random for each owner, so a launch can tell a new owner from the one
     /// it committed to.
     pub(crate) nonce: u64,
@@ -245,9 +256,11 @@ impl Hello {
         let mut wire = [0; 4];
         wire[..2].copy_from_slice(&self.wire_min.to_le_bytes());
         wire[2..].copy_from_slice(&self.wire_max.to_le_bytes());
+        // The app kind byte, then the id.
+        let app = [&[self.app_kind], self.app_id.as_bytes()].concat();
         Writer::new(HELLO)
             .bytes(hello::WIRE, &wire)
-            .bytes(hello::APP, self.app_id.as_bytes())
+            .bytes(hello::APP, &app)
             .bytes(hello::NONCE, &self.nonce.to_le_bytes())
             .bytes(hello::PAYLOAD_VERSION, &self.payload_version.to_le_bytes())
             .bytes(hello::MAX_REQUEST, &self.max_request.to_le_bytes())
@@ -271,13 +284,19 @@ impl Hello {
             ],
         )?;
         let wire: [u8; 4] = r.required(WIRE)?;
-        let app_id = std::str::from_utf8(r.get(APP).ok_or(Error::Malformed)?)
+        // The app kind byte, then the id.
+        let (&app_kind, app_id) = r
+            .get(APP)
+            .and_then(<[u8]>::split_first)
+            .ok_or(Error::Malformed)?;
+        let app_id = std::str::from_utf8(app_id)
             .map_err(|_| Error::Malformed)?
             .to_owned();
         Ok(Hello {
             wire_min: u16::from_le_bytes([wire[0], wire[1]]),
             wire_max: u16::from_le_bytes([wire[2], wire[3]]),
             app_id,
+            app_kind,
             nonce: u64::from_le_bytes(r.required(NONCE)?),
             payload_version: u32::from_le_bytes(r.required(PAYLOAD_VERSION)?),
             max_request: u32::from_le_bytes(r.required(MAX_REQUEST)?),
@@ -466,6 +485,7 @@ mod tests {
             wire_min: 1,
             wire_max: 1,
             app_id: "a".into(),
+            app_kind: app_kind(Kind::Headless),
             nonce: 0x0102_0304_0506_0708,
             payload_version: 7,
             max_request: MAX_REQUEST,
@@ -475,9 +495,9 @@ mod tests {
         let bytes = hello.encode();
         #[rustfmt::skip]
         assert_eq!(bytes, [
-            b'I', b'H', b'N', b'D', 1, 61, 0, 0, 0,
+            b'I', b'H', b'N', b'D', 1, 62, 0, 0, 0,
             1, 4, 0, 0, 0, 1, 0, 1, 0,
-            2, 1, 0, 0, 0, b'a',
+            2, 2, 0, 0, 0, 1, b'a',
             3, 8, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1,
             4, 4, 0, 0, 0, 7, 0, 0, 0,
             5, 4, 0, 0, 0, 0, 0, 0x40, 0,
@@ -487,7 +507,8 @@ mod tests {
         let (kind, body, used) = split(&bytes, SMALL).unwrap().unwrap();
         assert_eq!((kind, used), (HELLO, bytes.len()));
         assert_eq!(Hello::decode(body).unwrap(), hello);
-        // The other states, which the bytes above don't show.
+        // The other app kind and states, which the bytes above don't show.
+        assert_eq!(app_kind(Kind::Windowed), 0);
         assert_eq!((state::TAKING, state::DECLINING), (0, 2));
         // An owner from before FEATURES has none.
         let old = Hello::decode(&body[..body.len() - 9]).unwrap();
@@ -650,6 +671,34 @@ mod tests {
         let bytes = Writer::new(REPLY).bytes(1, &[1]).bytes(1, &[0]).finish();
         let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
         assert_eq!(Reply::decode(body), Err(Error::Malformed));
+        // A HELLO whose APP record has no kind byte.
+        let with_app = |app: &[u8]| {
+            Writer::new(HELLO)
+                .bytes(hello::WIRE, &[1, 0, 1, 0])
+                .bytes(hello::APP, app)
+                .bytes(hello::NONCE, &[0; 8])
+                .bytes(hello::PAYLOAD_VERSION, &[0; 4])
+                .bytes(hello::MAX_REQUEST, &[0; 4])
+                .finish()
+        };
+        let bytes = with_app(&[]);
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(Hello::decode(body), Err(Error::Malformed));
+        // With the kind byte alone, it decodes, with an empty id.
+        let bytes = with_app(&[0]);
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(
+            Hello::decode(body).map(|h| (h.app_kind, h.app_id)),
+            Ok((0, "".into()))
+        );
+        // A kind from a later release decodes; the launch reads it as
+        // another app.
+        let bytes = with_app(&[2, b'a']);
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(
+            Hello::decode(body).map(|h| (h.app_kind, h.app_id)),
+            Ok((2, "a".into()))
+        );
         // A record running past the body.
         assert_eq!(
             Records::parse(&[1, 9, 0, 0, 0, 1], &[1]).err(),

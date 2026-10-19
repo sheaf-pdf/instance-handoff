@@ -57,6 +57,7 @@ impl Ctx {
             wire_min: wire::WIRE_MIN,
             wire_max: wire::WIRE_MAX,
             app_id: self.app_id.as_str().to_owned(),
+            app_kind: wire::app_kind(self.app_id.kind()),
             nonce: self.nonce,
             payload_version: self.payload_version,
             max_request: wire::MAX_REQUEST,
@@ -493,19 +494,18 @@ mod tests {
     use super::*;
     use crate::Args;
 
+    fn ctx(app_id: AppId) -> Ctx {
+        Ctx {
+            app_id,
+            payload_version: 3,
+            nonce: 7,
+            upkeep: Upkeep::default(),
+        }
+    }
+
     fn core(handler: Option<Handler<Args>>) -> Core<Args> {
         let shared = Shared::new(sys::Held::detached());
-        Core::new(
-            handler,
-            None,
-            shared,
-            Ctx {
-                app_id: AppId::headless("test"),
-                payload_version: 3,
-                nonce: 7,
-                upkeep: Upkeep::default(),
-            },
-        )
+        Core::new(handler, None, shared, ctx(AppId::headless("test")))
     }
 
     fn request(payload_version: u32, payload: Vec<u8>) -> Vec<u8> {
@@ -539,6 +539,20 @@ mod tests {
         let (kind, body) = frames.last().unwrap();
         assert_eq!(*kind, wire::REPLY);
         Reply::decode(body).unwrap()
+    }
+
+    // Only the HELLO, with no owner behind it, so the windowed app needs
+    // no display.
+    #[test]
+    fn hello_names_the_app_and_its_kind() {
+        for (app_id, byte) in [(AppId::windowed("test"), 0), (AppId::headless("test"), 1)] {
+            let hello = frames(&ctx(app_id.clone()).hello(state::TAKING));
+            assert_eq!(hello[0].0, wire::HELLO);
+            let hello = Hello::decode(&hello[0].1).unwrap();
+            assert_eq!(hello.app_id, "test");
+            assert_eq!(hello.app_kind, wire::app_kind(app_id.kind()));
+            assert_eq!(hello.app_kind, byte, "{app_id:?}");
+        }
     }
 
     #[test]

@@ -188,7 +188,10 @@ pub enum Reason {
         /// How long this launch tried.
         waited: Duration,
     },
-    /// The lock holder is another app: two app ids share a folder.
+    /// The lock holder is another app: the same id of the other [`Kind`],
+    /// or another id that shares the folder.
+    ///
+    /// [`Kind`]: crate::Kind
     #[non_exhaustive]
     OtherApp {},
     /// The owner speaks no version of the handoff protocol that this launch
@@ -324,7 +327,9 @@ impl fmt::Display for Reason {
             Reason::Unresponsive { waited } => {
                 write!(f, "an instance is running but didn't answer in {waited:?}")
             }
-            Reason::OtherApp {} => f.write_str("another app holds the runtime folder"),
+            Reason::OtherApp {} => {
+                f.write_str("another app, or this one of the other kind, holds the runtime folder")
+            }
             Reason::WireVersion { ours, theirs } => write!(
                 f,
                 "the running instance speaks handoff protocol {theirs}, this one {ours}"

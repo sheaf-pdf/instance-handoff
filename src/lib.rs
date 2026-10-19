@@ -277,9 +277,9 @@
 //!   named pipe `\\.\pipe\instance-handoff.<id>.<secret>`, where the
 //!   secret is 32 random lowercase hex digits, published as
 //!   `<id> <secret>` and a newline in `instance.pipe` beside the lock;
-//! - the exchange. The owner sends HELLO (its app id, the protocol versions
-//!   it speaks, a random nonce, its payload version, its state and its
-//!   features). The launch checks it and sends REQUEST. The owner answers
+//! - the exchange. The owner sends HELLO (its app id and kind, the protocol
+//!   versions it speaks, a random nonce, its payload version, its state and
+//!   its features). The launch checks it and sends REQUEST. The owner answers
 //!   READY. The launch, if still inside its timeout, sends COMMIT, and only
 //!   then does the owner call the handler and send REPLY. An owner that
 //!   refuses a launch never just closes the connection: it sends REPLY

@@ -5,7 +5,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crate::wire::{self, Hello, Reply, refusal, state, status};
-use crate::{Activation, Builder, Claim, Mode, OwnerInfo, Payload, Reason, Started, sys};
+use crate::{Activation, AppId, Builder, Claim, Mode, OwnerInfo, Payload, Reason, Started, sys};
 
 /// Between attempts while the owner starts, is busy or quits.
 const RETRY: Duration = Duration::from_millis(50);
@@ -329,6 +329,13 @@ fn after_commit(
     }
 }
 
+/// Whether `hello` comes from an owner of `app_id`: the same id and kind.
+/// The two kinds of an id share its folder, so an owner of the other kind
+/// is another app.
+fn same_app(hello: &Hello, app_id: &AppId) -> bool {
+    hello.app_id == app_id.as_str() && hello.app_kind == wire::app_kind(app_id.kind())
+}
+
 /// One connection: HELLO, checks, REQUEST, READY, COMMIT, REPLY. Without a
 /// request (a probe), it ends after HELLO. `committed_to` is the nonce of
 /// an owner this launch already committed to.
@@ -372,7 +379,7 @@ fn exchange(
             return Exchange::Retry(Waiting::Unresponsive);
         }
     };
-    if hello.app_id != b.app_id.as_str() {
+    if !same_app(&hello, &b.app_id) {
         return Exchange::Fail(Reason::OtherApp {});
     }
     if hello.wire_max < wire::WIRE_MIN || hello.wire_min > wire::WIRE_MAX {
@@ -557,7 +564,7 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AppId;
+    use crate::Kind;
     use refusal::*;
 
     const KNOWN: [u8; 8] = [
@@ -576,6 +583,7 @@ mod tests {
             wire_min: 1,
             wire_max: 1,
             app_id: "test".into(),
+            app_kind: wire::app_kind(Kind::Headless),
             nonce: 7,
             payload_version: 2,
             max_request: 100,
@@ -593,6 +601,26 @@ mod tests {
             ..Reply::new(false, status::REFUSED)
         };
         refused(&reply, hello, &b, &[0; 200])
+    }
+
+    // Both ways, and a kind from a later release: the two kinds of an id
+    // refuse each other.
+    #[test]
+    fn an_owner_of_the_other_kind_is_another_app() {
+        let app = |kind| AppId::parse("test", kind).unwrap();
+        let mut owner = hello();
+        for (kind, other) in [
+            (Kind::Windowed, Kind::Headless),
+            (Kind::Headless, Kind::Windowed),
+        ] {
+            owner.app_kind = wire::app_kind(kind);
+            assert!(same_app(&owner, &app(kind)), "{kind:?}");
+            assert!(!same_app(&owner, &app(other)), "{kind:?}");
+        }
+        owner.app_kind = 2;
+        assert!(!same_app(&owner, &app(Kind::Windowed)));
+        assert!(!same_app(&owner, &app(Kind::Headless)));
+        assert!(!same_app(&hello(), &AppId::headless("other")));
     }
 
     #[test]

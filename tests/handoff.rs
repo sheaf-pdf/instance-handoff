@@ -10,7 +10,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use instance_handoff::{AppId, Args, Builder, Claim, End, Mode, Owner, Reason, Request, Started};
+use instance_handoff::{
+    AppId, Args, Builder, Claim, End, Kind, Mode, Owner, Reason, Request, Started,
+};
 
 const APP: AppId = AppId::headless("test.handoff");
 const SHORT: Duration = Duration::from_millis(300);
@@ -230,6 +232,17 @@ fn mismatches_are_reported_at_once() {
             .start(&Args::default()),
     );
     assert!(matches!(reason, Reason::OtherApp { .. }), "{reason}");
+    // The same id of the other kind finds this owner in its folder. Only
+    // the kind differs.
+    let t = Instant::now();
+    let reason = alone(
+        Builder::new(AppId::parse(APP.as_str(), Kind::Windowed).unwrap())
+            .dir(&dir.path)
+            .payload_version(2)
+            .start(&Args::default()),
+    );
+    assert!(matches!(reason, Reason::OtherApp { .. }), "{reason}");
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
 
     let huge = vec![0u8; 5 << 20];
     let reason = builder(&dir)

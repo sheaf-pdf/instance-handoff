@@ -2,21 +2,23 @@ use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 
-/// Names an app: its runtime folder, its socket, its thread. An owner
-/// refuses a launch that names another app ([`Reason::OtherApp`]).
+/// Names an app: its runtime folder, its socket, its thread. A launch
+/// hands off only to an owner of the same app id, kind included: beside
+/// another app's owner it gets [`Reason::OtherApp`].
 ///
 /// An id is 1 to 48 ASCII letters, digits, `.`, `-` and `_`. It starts with
 /// a letter or a digit and ends with one, and its part before the first `.`
 /// isn't a Windows device name (`con`, `prn`, `aux`, `nul`, `com0` to
 /// `com9`, `lpt0` to `lpt9`, in any case), so it is a safe file name on
 /// every platform. A reverse-DNS name such as `org.example.Viewer` is a
-/// good choice. Keep it the same across releases of your app, or two builds will
-/// each become an owner.
+/// good choice. Keep the id and its kind the same across releases of your
+/// app: with another id, two builds each become an owner, and with another
+/// kind, launches of one run alone beside the other's owner
+/// ([`Reason::OtherApp`]).
 ///
 /// An app id also has a [`Kind`], which says who may become the owner.
 /// Two app ids with the same id and different kinds compare unequal, so
-/// give every binary of an app the same `const`. For now, launches don't
-/// compare kinds with the owner.
+/// give every binary of an app the same `const`.
 ///
 /// [`AppId::windowed`] and [`AppId::headless`] are `const fn`s, so a bad
 /// literal in a `const` is a compile error:
@@ -35,9 +37,12 @@ pub struct AppId {
 /// Who may become the owner of an app. It doesn't say whether the owner
 /// shows windows.
 ///
-/// For now the kind is only recorded: any launch may own an app of either
-/// kind, and a launch hands off to an owner of its id whatever the owner's
-/// kind.
+/// The kind doesn't change the runtime folder, so both kinds of an id meet
+/// there and never own at once: beside an owner of one kind, a launch of
+/// the other gets [`Reason::OtherApp`]. For now, any launch may own an app
+/// of either kind.
+///
+/// [`Reason::OtherApp`]: crate::Reason::OtherApp
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
     /// Only a launch that can show windows. Most apps with a GUI are

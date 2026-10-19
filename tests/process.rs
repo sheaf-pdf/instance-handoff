@@ -9,7 +9,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use instance_handoff::{AppId, Args, Builder, Claim, Mode, Reason, Started};
+use instance_handoff::{AppId, Args, Builder, Claim, Kind, Mode, Reason, Started};
 
 const APP: AppId = AppId::headless("test.process");
 const ROLE: &str = "INSTANCE_HANDOFF_TEST_ROLE";
@@ -370,6 +370,27 @@ fn a_launch_of_another_payload_version_is_refused_at_once() {
         ),
         "{reason}"
     );
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(owner.took(Duration::from_millis(500)), None);
+}
+
+// A windowed launch beside a headless owner of its id. Not the reverse: a
+// windowed owner will need a launch that can show windows, and CI may have
+// no display.
+#[test]
+fn a_launch_of_the_other_kind_is_refused_at_once() {
+    let (_tmp, dir) = dir();
+    let owner = Owner::start(&dir);
+    let t = Instant::now();
+    let reason = match Builder::new(AppId::parse(APP.as_str(), Kind::Windowed).unwrap())
+        .dir(&dir)
+        .timeout(Duration::from_secs(10))
+        .start(&Args::new(["x"]))
+    {
+        Started::Alone(reason) => reason,
+        other => panic!("{other:?}"),
+    };
+    assert!(matches!(reason, Reason::OtherApp { .. }), "{reason}");
     assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     assert_eq!(owner.took(Duration::from_millis(500)), None);
 }
