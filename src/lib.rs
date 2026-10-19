@@ -73,9 +73,10 @@
 //! - Only processes of the same user at the same privilege level hand off
 //!   to each other, so a request never runs with more or fewer rights than
 //!   its launch had; see [Privileges](#privileges). On Unix both ends check
-//!   the other's user id. On Windows the owner checks the launch's token,
-//!   and the launch checks that the pipe is its own user's, at its own
-//!   integrity level.
+//!   the other's user id. On Windows the owner checks the launch's token:
+//!   it refuses another user, and a launch whose token is at another
+//!   integrity level, naming its own level. The launch checks that the pipe
+//!   is its own user's, at its own integrity level.
 //! - [`Builder::start`], [`Builder::hand_off`] and [`Builder::probe`] never
 //!   panic, whatever the [timeout](Builder::timeout). Every failure is a
 //!   [`Reason`], and failures that waiting can't fix return at once.
@@ -232,11 +233,22 @@
 //!   owner of its own, and never reaches the normal (medium) owner; nor
 //!   does a normal launch reach an elevated one. Each level's folder is
 //!   labelled at its level, so lower levels can't read it or take its
-//!   lock. Every level locks the same [guard](Guard) in a state folder,
-//!   though, so while an owner at one level holds it, a launch at the other
-//!   runs alone with [`Reason::StateInUse`]. Below medium (low integrity,
-//!   AppContainer), launches can't make or open their folder and run alone
-//!   with [`Reason::RuntimeDir`].
+//!   lock. A launch also checks that the owner's pipe is labelled at its
+//!   own level, and refuses another with [`Reason::Peer`]. Levels are
+//!   compared as rights too: an owner marks its level in its lock and
+//!   names it in its greeting, and refuses a request from a launch whose
+//!   token is at another level, naming its own. A launch that finds an
+//!   owner at another level, from its lock, its greeting or its refusal,
+//!   hands it nothing and returns at once, with [`Reason::MoreRights`] when
+//!   the launch has the higher level, or [`Reason::OwnerHasMoreRights`]
+//!   when the owner has; [`Builder::probe`] reports such an owner
+//!   unconfirmed. While each level has its own folder, the crate's own
+//!   launches meet no owner at another level. Every level locks the same
+//!   [guard](Guard) in a state folder, though, so while an owner at one
+//!   level holds it, a launch at the other runs alone with
+//!   [`Reason::StateInUse`]. Below medium (low integrity, AppContainer),
+//!   launches can't make or open their folder and run alone with
+//!   [`Reason::RuntimeDir`].
 //!
 //! A launch whose rights were raised from a login hands off to its level's
 //! owner, but by default never becomes it ([`Builder::elevated_owner`]):
@@ -407,10 +419,12 @@
 //!   and only then does the owner call the handler and send REPLY. An
 //!   owner that refuses a launch never just closes the connection: it
 //!   sends REPLY with the cause at once, in place of READY, or in place of
-//!   HELLO when an owner on Unix refuses the launch's user. Feature bit 0
-//!   in HELLO says so, and every owner of this release sets it. A launch
-//!   reads a cause it doesn't know as a decline, and a close before HELLO
-//!   as a sign to try again. Every message is
+//!   HELLO when an owner on Unix refuses the launch's user. An owner on
+//!   Windows refuses a launch at another integrity level with its own level
+//!   in the REPLY, before it decodes the payload. Feature bit 0 in HELLO
+//!   says an owner never just closes, and every owner of this release sets
+//!   it. A launch reads a cause it doesn't know as a decline, and a close
+//!   before HELLO as a sign to try again. Every message is
 //!   `"IHND" | kind u8 | length u32 LE | records`, and a record is
 //!   `tag u8 | length u32 LE | bytes`. Peers skip records they don't know,
 //!   so later releases add to the exchange without breaking it, unless the

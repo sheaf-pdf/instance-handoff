@@ -483,8 +483,13 @@ impl Builder {
     /// [`Reason::NoOwner`] when nobody holds the lock, with
     /// [`Reason::Declined`] for an owner that turns launches away, and with
     /// [`Reason::Busy`] or [`Reason::Unresponsive`] when the owner hasn't
-    /// served (or has stopped) by the [timeout](Builder::timeout). Creates
-    /// no folder and no lock. Ignores [`Builder::mode`].
+    /// served (or has stopped) by the [timeout](Builder::timeout). An owner
+    /// at another integrity level, as the marker in its lock or its
+    /// greeting shows, won't take this launch's requests: it is `Ok` at
+    /// once, with its [level](OwnerInfo::level) and
+    /// [`OwnerInfo::confirmed`] false. While each level has its own folder,
+    /// a probe finds none (see the crate docs on privileges). Creates no
+    /// folder and no lock. Ignores [`Builder::mode`].
     pub fn probe(&self) -> Result<OwnerInfo, Reason> {
         launch::hand_off::<()>(self, None)
     }

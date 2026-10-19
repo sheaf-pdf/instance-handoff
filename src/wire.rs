@@ -92,6 +92,7 @@ mod reply {
     pub const STATUS: u8 = 2;
     pub const REFUSAL: u8 = 3;
     pub const PAYLOAD_VERSION: u8 = 4;
+    pub const LEVEL: u8 = 5;
 }
 
 /// REPLY statuses. A launch decides on `delivered` first; a status it
@@ -114,7 +115,10 @@ pub(crate) mod refusal {
     pub const TOO_LARGE: u8 = 5;
     pub const MALFORMED: u8 = 6;
     pub const UNSUPPORTED: u8 = 7;
-    // 8 PRIVILEGE, 9 SCREEN, 11 STATE and 12 PERSON are kept for later.
+    /// The launch runs at another integrity level than the owner, which
+    /// sends its own level with the refusal.
+    pub const PRIVILEGE: u8 = 8;
+    // 9 SCREEN, 11 STATE and 12 PERSON are kept for later.
     /// The launch failed the owner's same-user check.
     pub const PEER: u8 = 10;
 }
@@ -412,6 +416,9 @@ pub(crate) struct Reply {
     pub(crate) refusal: Option<u8>,
     /// The owner's payload version, sent with a payload-version refusal.
     pub(crate) payload_version: Option<u32>,
+    /// The RID of the owner's integrity level, sent with a privilege
+    /// refusal: by owners on Windows.
+    pub(crate) level: Option<u32>,
 }
 
 impl Reply {
@@ -421,6 +428,7 @@ impl Reply {
             status,
             refusal: None,
             payload_version: None,
+            level: None,
         }
     }
 
@@ -441,12 +449,15 @@ impl Reply {
         if let Some(v) = self.payload_version {
             w = w.bytes(reply::PAYLOAD_VERSION, &v.to_le_bytes());
         }
+        if let Some(level) = self.level {
+            w = w.bytes(reply::LEVEL, &level.to_le_bytes());
+        }
         w.finish()
     }
 
     pub(crate) fn decode(body: &[u8]) -> Result<Reply, Error> {
         use reply::*;
-        let r = Records::parse(body, &[DELIVERED, STATUS, REFUSAL, PAYLOAD_VERSION])?;
+        let r = Records::parse(body, &[DELIVERED, STATUS, REFUSAL, PAYLOAD_VERSION, LEVEL])?;
         let [delivered] = r.required::<1>(DELIVERED)?;
         let [status] = r.required::<1>(STATUS)?;
         Ok(Reply {
@@ -454,6 +465,7 @@ impl Reply {
             status,
             refusal: r.fixed::<1>(REFUSAL)?.map(|[b]| b),
             payload_version: r.fixed(PAYLOAD_VERSION)?.map(u32::from_le_bytes),
+            level: r.fixed(LEVEL)?.map(u32::from_le_bytes),
         })
     }
 }
@@ -690,6 +702,7 @@ mod tests {
             (refusal::TOO_LARGE, 5),
             (refusal::MALFORMED, 6),
             (refusal::UNSUPPORTED, 7),
+            (refusal::PRIVILEGE, 8),
             (refusal::PEER, 10),
         ] {
             #[rustfmt::skip]
@@ -711,6 +724,19 @@ mod tests {
             2, 1, 0, 0, 0, 3,
             3, 1, 0, 0, 0, 3,
             4, 4, 0, 0, 0, 4, 0, 0, 0,
+        ];
+        check(reply, &bytes);
+        // A privilege refusal from an owner on Windows carries the owner's
+        // level: medium here.
+        let mut reply = Reply::refused(refusal::PRIVILEGE);
+        reply.level = Some(Level::MEDIUM.rid());
+        #[rustfmt::skip]
+        let bytes = [
+            b'I', b'H', b'N', b'D', 5, 27, 0, 0, 0,
+            1, 1, 0, 0, 0, 0,
+            2, 1, 0, 0, 0, 3,
+            3, 1, 0, 0, 0, 8,
+            5, 4, 0, 0, 0, 0, 0x20, 0, 0,
         ];
         check(reply, &bytes);
     }
@@ -760,6 +786,15 @@ mod tests {
     fn bad_frames_are_refused() {
         // A duplicate record.
         let bytes = Writer::new(REPLY).bytes(1, &[1]).bytes(1, &[0]).finish();
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(Reply::decode(body), Err(Error::Malformed));
+        // A REPLY whose LEVEL isn't a u32.
+        let bytes = Writer::new(REPLY)
+            .bytes(reply::DELIVERED, &[0])
+            .bytes(reply::STATUS, &[status::REFUSED])
+            .bytes(reply::REFUSAL, &[refusal::PRIVILEGE])
+            .bytes(reply::LEVEL, &[0, 0x20])
+            .finish();
         let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
         assert_eq!(Reply::decode(body), Err(Error::Malformed));
         // A HELLO with every record it must have but STATE, and one with an

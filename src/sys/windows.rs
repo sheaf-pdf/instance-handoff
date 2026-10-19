@@ -81,8 +81,9 @@
 //! - the launch connects for identification only, and checks that the pipe
 //!   is its own user's, at the level the owner's marker shows (its own),
 //!   before it sends anything;
-//! - the owner checks the launch's token by impersonation: the same user at
-//!   the same level.
+//! - the owner checks the launch's token by impersonation. It refuses
+//!   another user with PEER, and a launch at another level with PRIVILEGE
+//!   and its own level.
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::{File, OpenOptions};
@@ -1527,10 +1528,11 @@ unsafe fn label(sacl: *mut ACL) -> Option<u32> {
     None
 }
 
-/// The owner's check of a launch, once it has read from it: the same user
-/// at the same integrity level (the pipe's label already keeps lower levels
-/// out).
-fn check_client(pipe: HANDLE) -> io::Result<()> {
+/// The owner's check of a launch, once it has read from it: the same user.
+/// Returns the launch's integrity level, which the session compares with
+/// the owner's before it takes a request. (The pipe's label already keeps
+/// lower levels out.)
+fn check_client(pipe: HANDLE) -> io::Result<crate::Level> {
     let me = me()?;
     // SAFETY: impersonation lasts until RevertToSelf below, on this thread.
     if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
@@ -1554,10 +1556,7 @@ fn check_client(pipe: HANDLE) -> io::Result<()> {
     if unsafe { EqualSid(them.sid(), me.sid()) } == 0 {
         return Err(denied(&format!("the launch is {}", them.sid_string)));
     }
-    if them.integrity != me.integrity {
-        return Err(denied("the launch runs at another integrity level"));
-    }
-    Ok(())
+    Ok(crate::Level::from_rid(them.integrity))
 }
 
 /// The security a new pipe, folder or file gets, made from SDDL.
@@ -2510,11 +2509,16 @@ pub(crate) fn serve<T: Payload>(
                         if !c.checked {
                             // Impersonation needs a read first. A launch
                             // that fails is told so at once, in place of
-                            // READY, and what it sent is dropped.
+                            // READY, and what it sent is dropped. One that
+                            // passes has its level compared with the
+                            // owner's once its REQUEST is read.
                             c.checked = true;
-                            if let Err(e) = check_client(h) {
-                                log::warn!("instance-handoff {app_id}: refused a launch: {e}");
-                                c.session.refuse(refusal::PEER, now);
+                            match check_client(h) {
+                                Ok(level) => c.session.attested(level),
+                                Err(e) => {
+                                    log::warn!("instance-handoff {app_id}: refused a launch: {e}");
+                                    c.session.refuse(refusal::PEER, now);
+                                }
                             }
                         }
                         let bytes = c.read.buf[..n].to_vec();

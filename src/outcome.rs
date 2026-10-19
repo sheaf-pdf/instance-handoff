@@ -51,8 +51,9 @@ pub struct OwnerInfo {
 
 impl OwnerInfo {
     /// The owner's process id, as the OS reported it for the connection.
-    /// `None` where the platform doesn't say, and across PID namespaces
-    /// (every Flatpak instance has its own).
+    /// `None` where the platform doesn't say, across PID namespaces (every
+    /// Flatpak instance has its own), and for an owner at another integrity
+    /// level that won't take this launch's requests.
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
@@ -62,8 +63,9 @@ impl OwnerInfo {
     /// committed its request and then got no answer: the owner stopped,
     /// hung, or died with nothing to take its place, or its handler
     /// panicked. The request may be taken late, or not at all, and this
-    /// process should still exit. It is also `false` for an owner this
-    /// launch reported without talking to it.
+    /// process should still exit. It is also `false` from `probe` for an
+    /// owner at another integrity level, which won't serve this launch,
+    /// and for an owner this launch reported without talking to it.
     ///
     /// [`Builder::probe`]: crate::Builder::probe
     pub fn confirmed(&self) -> bool {
@@ -71,11 +73,12 @@ impl OwnerInfo {
     }
 
     /// The owner's Windows integrity level, as the owner said it in its
-    /// greeting, or as the marker in its lock showed it when this launch
-    /// didn't talk to it. `None` from owners on other platforms, which have
-    /// no integrity levels and name none, and when this launch can't say
-    /// which owner has its request, as when the owner it committed to died
-    /// before it answered and no other took its place.
+    /// greeting or in its refusal of a launch at another level, or as the
+    /// marker in its lock showed it when this launch didn't talk to it.
+    /// `None` from owners on other platforms, which have no integrity
+    /// levels and name none, and when this launch can't say which owner has
+    /// its request, as when the owner it committed to died before it
+    /// answered and no other took its place.
     pub fn level(&self) -> Option<Level> {
         self.level
     }
@@ -285,10 +288,13 @@ pub enum Reason {
         /// Why.
         source: BoxError,
     },
-    /// The owner and this launch failed the same-user check: they are two
-    /// users, or on Windows one user at two integrity levels. Each end
-    /// checks the other, and an owner that refuses a launch says so at
-    /// once. See the crate docs on privileges.
+    /// The owner and this launch failed the same-user check: the socket or
+    /// pipe at this launch's address is another user's, or, on Windows
+    /// while each integrity level has its own folder, a pipe labelled at
+    /// another level than this launch's; or the check found something else
+    /// wrong or couldn't be made. Each end checks the other, and an owner
+    /// that refuses a launch says so at once. See the crate docs on
+    /// privileges.
     #[non_exhaustive]
     Peer {
         /// What the check found.
@@ -296,7 +302,8 @@ pub enum Reason {
     },
     /// This launch has rights the owner lacks, such as a higher integrity
     /// level. The request wasn't delivered, since the owner would act on it
-    /// without them.
+    /// without them. It returns at once, whatever the
+    /// [timeout](crate::Builder::timeout).
     #[non_exhaustive]
     MoreRights {
         /// The owner.
@@ -306,7 +313,8 @@ pub enum Reason {
     },
     /// The owner has rights this launch lacks, such as a higher integrity
     /// level. The request wasn't delivered, since the owner would act on it
-    /// with rights its launch never had.
+    /// with rights its launch never had. It returns at once, as
+    /// [`Reason::MoreRights`] does.
     #[non_exhaustive]
     OwnerHasMoreRights {
         /// The owner.

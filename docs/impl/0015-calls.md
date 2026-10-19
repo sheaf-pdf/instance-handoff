@@ -16,7 +16,12 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
 5. **STATE** carries the exact framed bytes the instance folder's hash is computed from. *Recommended.* Slice 13 settled two cases this leaves open. *Our call (slice 13).*
    - Every HELLO must carry STATE, even an empty one (`State::none()` with no scope). A HELLO without it is malformed, and a launch reads it as not this protocol.
    - A launch reads a HELLO body of up to 4096 bytes more than its own STATE, so an owner of the same state always fits, however long the path or scope. A longer one isn't from its owner, and reads as not this protocol too.
-6. **The owner's level in REPLY** travels in the next free REPLY tag, chosen in slice 17 and pinned by its frozen test. Unix owners don't send LEVEL. *Our call; Unix part recommended.*
+6. **The owner's level in REPLY** travels in the next free REPLY tag, chosen in slice 17 and pinned by its frozen test. Unix owners don't send LEVEL. *Our call; Unix part recommended.* Slice 17 chose tag 5 and settled what this leaves open. *Our call (slice 17).*
+   - REPLY's LEVEL is the owner's RID as a u32 LE, as in HELLO, and goes only with PRIVILEGE. One that isn't 4 bytes makes REPLY malformed.
+   - The owner compares the launch's level, from its token, with its own, both as options. So on Windows, where the owner has a level, a launch whose level wasn't read is refused too, and on Unix, where neither has one, nobody is. Rights come after the wire and payload versions, and before the payload is decoded or the owner says whether it serves.
+   - A launch decides from HELLO's LEVEL before it looks at whether the owner serves. At another level, `start` and `hand_off` fail at once with `MoreRights` or `OwnerHasMoreRights`, and `probe` returns `Ok`, unconfirmed, whether or not the owner serves.
+   - A launch reads PRIVILEGE by comparing REPLY's LEVEL with its own, whether it came after HELLO or in its place. Without a LEVEL, or with the launch's own, it can't name the rights, so it reads the cause as one it doesn't know: `Declined`.
+   - The Windows owner refuses with PEER only a launch of another user, or one it can't check.
 7. **Refusing before HELLO.** On Unix, a REPLY REFUSED PEER is the first and only frame, and launches handle both shapes. A Windows owner can refuse only after HELLO, because impersonation needs a read, so it never refuses a probe. *Recommended.*
 8. **FEATURES** ships in 0.1, though no 0.1 launch reads bit 0 yet. *Recommended.*
 9. **A STATE mismatch in HELLO** (two states with the same hash) is `Reason::OtherApp`, whose docs widen to say so. Refusal code 11 stays reserved. *Recommended.*
@@ -122,7 +127,7 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
    - A marker that can't be read gives `Reason::Lock`, naming `instance.lock`, as a lock that can't be taken does. After a commit it gives an unconfirmed handoff.
    - A launch that can't read its own level, facing a marker at another, fails closed: it connects as to an owner at its own level, which no pipe's label matches, so it gets `Reason::Peer` and sends nothing. It can't happen yet, since reading the marker needs the launch's own level.
 2. A probe at another level is answered from the marker alone, unconfirmed. *Recommended.*
-3. `MoreRights` and `OwnerHasMoreRights` don't name the owner's pid, since `instance.lock` stays unwritten. *Recommended.*
+3. `MoreRights` and `OwnerHasMoreRights` don't name the owner's pid, since `instance.lock` stays unwritten. *Recommended.* Slice 17 holds to it when the level comes from HELLO or PRIVILEGE, though the connection gives the pid there, so the reasons, and `probe`'s answer at another level, read the same whichever way the launch learns the level. *Our call (slice 17).*
 4. A committed launch whose owner died and that then finds the guard, or a lock at another level, held reports an unconfirmed handoff, never `Alone`. Running alone there would break 0004. *The critic's fix.*
 
 ## 7. Who may own (slices 32 to 37)

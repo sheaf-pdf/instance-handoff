@@ -83,11 +83,13 @@ fn meet(own: Option<Level>, owner: OwnerLevel, probe: bool) -> Meet {
 }
 
 /// What a launch at level `own` is told about an owner at `owner`, without
-/// sending anything: when the levels differ, the owner above has rights
-/// the launch lacks, or the owner below lacks the launch's. A probe is
-/// told the owner runs instead. The answer names the owner's level, but
-/// no pid, and is unconfirmed. `None` when the levels are the same: the
-/// launch talks to the owner.
+/// sending anything more: when the levels differ, the owner above has
+/// rights the launch lacks, or the owner below lacks the launch's. A probe
+/// is told the owner runs instead. The answer names the owner's level, but
+/// no pid, and is unconfirmed (call 6.3), however the launch learnt the
+/// level: from the owner's marker ([`meet`]), its HELLO ([`exchange`]) or
+/// its PRIVILEGE refusal ([`refused`]). `None` when the levels are the
+/// same.
 fn rights(own: Level, owner: Level, probe: bool) -> Option<Result<OwnerInfo, Reason>> {
     if owner == own {
         return None;
@@ -129,11 +131,11 @@ fn meet_after_commit(met: Meet, past: bool) -> Option<Meet> {
     }
 }
 
-/// [`meet`], for the owner of the lock in `folder`. A marker that can't
-/// be read gives [`Reason::Lock`].
-fn meet_owner(folder: &sys::Folder, probe: bool) -> Meet {
+/// [`meet`], for a launch at level `own` and the owner of the lock in
+/// `folder`. A marker that can't be read gives [`Reason::Lock`].
+fn meet_owner(folder: &sys::Folder, own: Option<Level>, probe: bool) -> Meet {
     match folder.owner_level() {
-        Ok(owner) => meet(sys::level(), owner, probe),
+        Ok(owner) => meet(own, owner, probe),
         Err(source) => Meet::Report(Err(Reason::Lock {
             path: folder.lock_path(),
             source,
@@ -143,7 +145,8 @@ fn meet_owner(folder: &sys::Folder, probe: bool) -> Meet {
 
 /// How one connection to the owner ended.
 enum Exchange {
-    /// The owner's handler took the request (or, for a probe, it serves).
+    /// The owner's handler took the request. For a probe: the owner serves,
+    /// or runs at another level, unconfirmed.
     Taken(OwnerInfo),
     /// Committed, and the owner went silent: delivered late or never.
     Unconfirmed(OwnerInfo),
@@ -176,16 +179,19 @@ fn post_commit_wait(timeout: Duration) -> Duration {
 }
 
 /// When a launch must stop trying, and when it must return whatever
-/// happened: the timeout, then at most one post-commit wait more.
+/// happened: the timeout, then at most one post-commit wait more. With the
+/// launch's integrity level, which bounds whom it hands off to.
 #[derive(Debug, Clone, Copy)]
 struct Limits {
     deadline: Option<Instant>,
     hard: Option<Instant>,
     timeout: Duration,
+    /// This launch's level: [`sys::level`], or one a test sets.
+    level: Option<Level>,
 }
 
 impl Limits {
-    fn new(began: Instant, timeout: Duration) -> Limits {
+    fn new(began: Instant, timeout: Duration, level: Option<Level>) -> Limits {
         let timeout = timeout.max(MIN_TIMEOUT);
         Limits {
             deadline: began.checked_add(timeout),
@@ -193,6 +199,7 @@ impl Limits {
                 .checked_add(post_commit_wait(timeout))
                 .and_then(|t| began.checked_add(t)),
             timeout,
+            level,
         }
     }
 
@@ -311,7 +318,7 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
         Err(reason) => return Started::Alone(reason),
     };
     let began = Instant::now();
-    let limits = Limits::new(began, b.timeout);
+    let limits = Limits::new(began, b.timeout, sys::level());
     let deadline = limits.deadline;
     let mut request: Option<Vec<u8>> = None;
     let mut waiting: Option<Waiting> = None;
@@ -352,7 +359,7 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
             }
             return Started::Alone(Reason::OwnerRunning {});
         }
-        let at = match meet_owner(&folder, false) {
+        let at = match meet_owner(&folder, limits.level, false) {
             Meet::Talk(at) => at,
             Meet::Wait => {
                 waiting = Some(Waiting::Unresponsive.after(waiting, deadline));
@@ -458,6 +465,15 @@ fn try_own(folder: &sys::Folder) -> Result<Option<sys::Lock>, Reason> {
 
 /// `hand_off` with a payload, `probe` without one.
 pub(crate) fn hand_off<T: Payload>(b: &Builder, payload: Option<&T>) -> Result<OwnerInfo, Reason> {
+    hand_off_at(b, payload, sys::level())
+}
+
+/// `hand_off` for a launch at integrity level `own`.
+fn hand_off_at<T: Payload>(
+    b: &Builder,
+    payload: Option<&T>,
+    own: Option<Level>,
+) -> Result<OwnerInfo, Reason> {
     if !sys::SUPPORTED {
         return Err(Reason::Unsupported {});
     }
@@ -469,7 +485,7 @@ pub(crate) fn hand_off<T: Payload>(b: &Builder, payload: Option<&T>) -> Result<O
     };
     let request = payload.map(|p| encode_request(b, p)).transpose()?;
     let began = Instant::now();
-    let limits = Limits::new(began, b.timeout);
+    let limits = Limits::new(began, b.timeout, own);
     let deadline = limits.deadline;
     let mut waiting: Option<Waiting> = None;
     loop {
@@ -486,7 +502,7 @@ pub(crate) fn hand_off<T: Payload>(b: &Builder, payload: Option<&T>) -> Result<O
         if let Some(w) = waiting.filter(|_| past(deadline)) {
             return Err(w.reason(began.elapsed()));
         }
-        let at = match meet_owner(&folder, request.is_none()) {
+        let at = match meet_owner(&folder, own, request.is_none()) {
             Meet::Talk(at) => at,
             Meet::Wait => {
                 waiting = Some(Waiting::Unresponsive.after(waiting, deadline));
@@ -562,7 +578,7 @@ fn after_commit(
         } else if !folder.lock_held().unwrap_or(true) {
             return AfterCommit::Info(unconfirmed);
         }
-        let at = match meet_after_commit(meet_owner(folder, false), past(until)) {
+        let at = match meet_after_commit(meet_owner(folder, limits.level, false), past(until)) {
             Some(Meet::Talk(at)) => at,
             Some(Meet::Wait) => {
                 pause(until);
@@ -609,6 +625,7 @@ fn exchange(
     at: Option<Level>,
 ) -> Exchange {
     let deadline = limits.deadline;
+    let own = limits.level;
     let mut conn = match folder.connect(deadline, at) {
         Ok(conn) => conn,
         Err(sys::Connect::Retry(e)) => {
@@ -632,7 +649,9 @@ fn exchange(
         // launch's user.
         Ok((wire::REPLY, body)) => {
             return Exchange::Fail(match Reply::decode(&body) {
-                Ok(r) if !r.delivered && r.status == status::REFUSED => refused(&r, None, b, &[]),
+                Ok(r) if !r.delivered && r.status == status::REFUSED => {
+                    refused(&r, None, b, &[], own)
+                }
                 _ => not_ours(),
             });
         }
@@ -655,6 +674,18 @@ fn exchange(
             ours: b.payload_version,
             theirs: hello.payload_version,
         });
+    }
+    // A request goes neither up nor down, so at another level this launch
+    // decides at once, whether or not the owner serves, and sends nothing.
+    // Where either level is unknown, as on Unix, it goes on.
+    let theirs = hello.level.map(Level::from_rid);
+    match own
+        .zip(theirs)
+        .and_then(|(own, theirs)| rights(own, theirs, request.is_none()))
+    {
+        Some(Ok(info)) => return Exchange::Taken(info),
+        Some(Err(reason)) => return Exchange::Fail(reason),
+        None => {}
     }
     if committed_to == Some(hello.nonce) {
         return Exchange::SameOwner;
@@ -690,7 +721,7 @@ fn exchange(
     }
     match reader.frame(&mut conn, wire::SMALL, deadline) {
         Ok((wire::READY, body)) if wire::check_empty(&body).is_ok() => {}
-        Ok((wire::REPLY, body)) => return reply(&body, &hello, b, request, info, false),
+        Ok((wire::REPLY, body)) => return reply(&body, &hello, b, request, own, info, false),
         Ok(_) | Err(ReadError::Bad) => return Exchange::Fail(not_ours()),
         Err(ReadError::Closed | ReadError::TimedOut) => {
             return Exchange::Retry(Waiting::Unresponsive);
@@ -713,17 +744,19 @@ fn exchange(
         ..info.clone()
     };
     match reader.frame(&mut conn, wire::SMALL, until) {
-        Ok((wire::REPLY, body)) => reply(&body, &hello, b, request, info, true),
+        Ok((wire::REPLY, body)) => reply(&body, &hello, b, request, own, info, true),
         Err(ReadError::Closed) => Exchange::Lost(hello.nonce),
         Ok(_) | Err(ReadError::Bad | ReadError::TimedOut) => Exchange::Unconfirmed(unconfirmed),
     }
 }
 
+/// The owner's REPLY to `request`. `own` is this launch's level.
 fn reply(
     body: &[u8],
     hello: &Hello,
     b: &Builder,
     request: &[u8],
+    own: Option<Level>,
     info: OwnerInfo,
     committed: bool,
 ) -> Exchange {
@@ -742,7 +775,7 @@ fn reply(
     }
     match r.status {
         status::DECLINED => Exchange::Fail(Reason::Declined {}),
-        status::REFUSED => Exchange::Fail(refused(&r, Some(hello), b, request)),
+        status::REFUSED => Exchange::Fail(refused(&r, Some(hello), b, request, own)),
         status::GAVE_UP => Exchange::Retry(Waiting::Unresponsive),
         // Busy, and statuses this build doesn't know: not delivered.
         _ => Exchange::Retry(Waiting::Busy),
@@ -750,8 +783,15 @@ fn reply(
 }
 
 /// Why the owner refused this launch. `hello` is `None` when the refusal
-/// came in place of HELLO, before this launch sent anything.
-fn refused(r: &Reply, hello: Option<&Hello>, b: &Builder, request: &[u8]) -> Reason {
+/// came in place of HELLO, before this launch sent anything. `own` is this
+/// launch's level.
+fn refused(
+    r: &Reply,
+    hello: Option<&Hello>,
+    b: &Builder,
+    request: &[u8],
+    own: Option<Level>,
+) -> Reason {
     let wire_version = Reason::WireVersion {
         ours: u32::from(wire::WIRE_MAX),
         theirs: hello.map_or(0, |h| u32::from(h.wire_max)),
@@ -760,10 +800,17 @@ fn refused(r: &Reply, hello: Option<&Hello>, b: &Builder, request: &[u8]) -> Rea
         (Some(refusal::PEER), _) => Reason::Peer {
             source: io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "the owner refused this launch: another user or level, or a check that failed",
+                "the owner refused this launch: another user, or a check that failed",
             ),
         },
         (Some(refusal::APP), _) => Reason::OtherApp {},
+        // The owner names its level with the refusal. Without one, or
+        // with this launch's own, the rights can't be named: a cause this
+        // build doesn't know.
+        (Some(refusal::PRIVILEGE), _) => own
+            .zip(r.level.map(Level::from_rid))
+            .and_then(|(own, theirs)| rights(own, theirs, false)?.err())
+            .unwrap_or(Reason::Declined {}),
         (Some(refusal::PAYLOAD_VERSION), Some(hello)) => Reason::PayloadVersion {
             ours: b.payload_version,
             theirs: r.payload_version.unwrap_or(hello.payload_version),
@@ -828,7 +875,7 @@ mod tests {
     use super::*;
     use refusal::*;
 
-    const KNOWN: [u8; 8] = [
+    const KNOWN: [u8; 9] = [
         WIRE,
         APP,
         PAYLOAD_VERSION,
@@ -836,6 +883,7 @@ mod tests {
         TOO_LARGE,
         MALFORMED,
         UNSUPPORTED,
+        PRIVILEGE,
         PEER,
     ];
 
@@ -863,7 +911,172 @@ mod tests {
             refusal: code,
             ..Reply::new(false, status::REFUSED)
         };
-        refused(&reply, hello, &b, &[0; 200])
+        refused(&reply, hello, &b, &[0; 200], None)
+    }
+
+    /// How a launch fares with an owner, by their levels: it has more
+    /// rights, the owner has, or neither is known to.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Apart {
+        Neither,
+        More,
+        Fewer,
+    }
+
+    /// A launch's level, its owner's, and how the launch fares.
+    type Row = (Option<Level>, Option<Level>, Apart);
+
+    const LEVELS: [Row; 9] = [
+        (None, None, Apart::Neither),
+        (None, Some(Level::HIGH), Apart::Neither),
+        (Some(Level::MEDIUM), None, Apart::Neither),
+        (Some(Level::MEDIUM), Some(Level::MEDIUM), Apart::Neither),
+        (Some(Level::HIGH), Some(Level::HIGH), Apart::Neither),
+        (Some(Level::HIGH), Some(Level::MEDIUM), Apart::More),
+        (Some(Level::MEDIUM), Some(Level::LOW), Apart::More),
+        (Some(Level::MEDIUM), Some(Level::HIGH), Apart::Fewer),
+        (Some(Level::LOW), Some(Level::UI_ACCESS), Apart::Fewer),
+    ];
+
+    /// Whether `reason` is what a launch gets as `row` says, naming the
+    /// owner by its level alone, unconfirmed and with no pid.
+    fn fares(reason: &Reason, (own, theirs, apart): Row) -> bool {
+        let named = |owner: &OwnerInfo, rights: &Rights| {
+            let levels = own
+                .zip(theirs)
+                .map(|(launch, owner)| Rights::Level { launch, owner });
+            (owner.pid, owner.confirmed, owner.level) == (None, false, theirs)
+                && levels.as_ref() == Some(rights)
+        };
+        match (reason, apart) {
+            (Reason::MoreRights { owner, rights }, Apart::More)
+            | (Reason::OwnerHasMoreRights { owner, rights }, Apart::Fewer) => named(owner, rights),
+            _ => false,
+        }
+    }
+
+    // At another level, a launch decides from HELLO with `rights`, as it
+    // does from the marker, and sends nothing. With the higher level it
+    // has rights the owner lacks; with the lower, the owner has rights it
+    // lacks. A probe finds the owner, unconfirmed: it won't serve this
+    // launch. Where a level is unknown, as on Unix, the launch goes on.
+    #[test]
+    fn a_launch_at_another_level_decides_from_hello() {
+        for row in LEVELS {
+            let (own, theirs, apart) = row;
+            // As `exchange` reads HELLO's LEVEL.
+            let decide = |probe| {
+                own.zip(theirs)
+                    .and_then(|(own, theirs)| rights(own, theirs, probe))
+            };
+            let handoff = decide(false);
+            let probe = decide(true);
+            if apart == Apart::Neither {
+                assert!(handoff.is_none() && probe.is_none(), "{row:?}");
+                continue;
+            }
+            match handoff {
+                Some(Err(reason)) => assert!(fares(&reason, row), "{row:?}: {reason:?}"),
+                other => panic!("{row:?}: {other:?}"),
+            }
+            match probe {
+                Some(Ok(found)) => assert_eq!(
+                    (found.pid, found.confirmed, found.level),
+                    (None, false, theirs)
+                ),
+                other => panic!("{row:?}: {other:?}"),
+            }
+        }
+    }
+
+    // PRIVILEGE comes with the owner's level, which the launch compares
+    // with its own, after HELLO or in place of it. Without a level to
+    // compare, or with its own, it can't name the rights, and reads the
+    // cause as one it doesn't know.
+    #[test]
+    fn a_privilege_refusal_names_the_rights_from_the_owners_level() {
+        let hello = hello();
+        let b = Builder::new(AppId::headless("test"), crate::State::none());
+        for row in LEVELS {
+            let (own, theirs, apart) = row;
+            let reply = Reply {
+                refusal: Some(PRIVILEGE),
+                level: theirs.map(Level::rid),
+                ..Reply::new(false, status::REFUSED)
+            };
+            for hello in [Some(&hello), None] {
+                let reason = refused(&reply, hello, &b, &[], own);
+                if apart == Apart::Neither {
+                    assert!(matches!(reason, Reason::Declined {}), "{row:?}: {reason}");
+                } else {
+                    assert!(fares(&reason, row), "{row:?}: {reason:?}");
+                }
+            }
+        }
+    }
+
+    // A busy owner that names a level in HELLO, to launches at other
+    // levels: each decides from HELLO alone, before it looks at whether the
+    // owner serves, and sends nothing. `hand_off` fails at once, and a
+    // probe finds the owner, unconfirmed, with no pid, though the
+    // connection gives one. Owners on Unix name no level and launches there
+    // have none, so the test plays a high owner and sets the launch's level.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_at_another_level_sends_nothing_whether_or_not_the_owner_serves() {
+        use std::io::{Read, Write};
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Builder::new(AppId::headless("test.levels"), crate::State::none())
+            .dir(tmp.path().join("run"))
+            .timeout(Duration::from_secs(3));
+        let folder = sys::open_folder(&b.place(None).unwrap(), true)
+            .unwrap()
+            .unwrap();
+        let _lock = folder.lock().unwrap().unwrap();
+        let socket = b.runtime_dir().unwrap().join("instance.sock");
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let hello = Hello {
+            app_id: "test.levels".into(),
+            payload_version: b.payload_version,
+            serving: serving::BUSY,
+            level: Some(Level::HIGH.rid()),
+            state: b.instance_key(None),
+            ..hello()
+        }
+        .encode();
+        let owner = std::thread::spawn(move || {
+            for stream in listener.incoming().take(3) {
+                let mut stream = stream.unwrap();
+                stream.write_all(&hello).unwrap();
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).unwrap();
+                assert!(got.is_empty(), "the launch sent {got:?}");
+            }
+        });
+        let payload = crate::Args::new(["x"]);
+        let at = |launch, owner| Rights::Level { launch, owner };
+        let t = Instant::now();
+        match hand_off_at(&b, Some(&payload), Some(Level::MEDIUM)) {
+            Err(Reason::OwnerHasMoreRights { owner, rights }) => {
+                assert_eq!(rights, at(Level::MEDIUM, Level::HIGH));
+                assert_eq!(owner.to_string(), "pid unknown, high");
+                assert!(!owner.confirmed());
+            }
+            other => panic!("{other:?}"),
+        }
+        match hand_off_at(&b, Some(&payload), Some(Level::SYSTEM)) {
+            Err(Reason::MoreRights { rights, .. }) => {
+                assert_eq!(rights, at(Level::SYSTEM, Level::HIGH));
+            }
+            other => panic!("{other:?}"),
+        }
+        let found = hand_off_at::<()>(&b, None, Some(Level::MEDIUM)).unwrap();
+        assert_eq!(
+            (found.pid(), found.confirmed(), found.level()),
+            (None, false, Some(Level::HIGH))
+        );
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        owner.join().unwrap();
     }
 
     // Both ways, and a kind from a later release: the two kinds of an id
@@ -1114,7 +1327,7 @@ mod tests {
         let state = b.canonical_state();
         let place = b.place(state.as_deref()).unwrap();
         let folder = sys::open_folder(&place, true).unwrap().unwrap();
-        let limits = Limits::new(Instant::now(), Duration::from_secs(1));
+        let limits = Limits::new(Instant::now(), Duration::from_secs(1), None);
         let key = b.instance_key(state.as_deref());
         let after = || after_commit(&folder, &b, &key, &[], 1, Some(state.as_deref()), &limits);
 
@@ -1184,7 +1397,7 @@ mod tests {
                 unconfirmed(&info);
             }
             unconfirmed(&b.probe().unwrap());
-            let limits = Limits::new(Instant::now(), b.timeout);
+            let limits = Limits::new(Instant::now(), b.timeout, Some(own));
             match after_commit(&folder, &b, &key, &[], 1, Some(None), &limits) {
                 AfterCommit::Info(info) => assert!(!info.confirmed()),
                 AfterCommit::Own(..) => panic!("owned beside an owner at {owner}"),
@@ -1222,7 +1435,7 @@ mod tests {
         }
         unresponsive(b.hand_off(&Args::default()).unwrap_err());
         unresponsive(b.probe().unwrap_err());
-        let limits = Limits::new(Instant::now(), timeout);
+        let limits = Limits::new(Instant::now(), timeout, sys::level());
         match after_commit(&folder, &b, &key, &[], 1, Some(None), &limits) {
             AfterCommit::Info(info) => assert_eq!(
                 (info.pid(), info.level(), info.confirmed()),

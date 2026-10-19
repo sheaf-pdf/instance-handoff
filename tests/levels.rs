@@ -15,7 +15,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use instance_handoff::{AppId, Args, Builder, Claim, Kind, Reason, Started, State};
+use instance_handoff::{AppId, Args, Builder, Claim, Kind, Payload, Reason, Started, State};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_NO_SUCH_LOGON_SESSION, GENERIC_READ,
     GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
@@ -54,7 +54,7 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-    LockFileEx, READ_CONTROL, UnlockFileEx,
+    LockFileEx, READ_CONTROL, SECURITY_IDENTIFICATION, UnlockFileEx,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::Pipes::CreatePipe;
@@ -265,6 +265,68 @@ fn the_guard_holds_across_levels() {
     assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     let rest = child.finish();
     assert!(!rest.iter().any(|l| l.starts_with("took ")), "{rest:?}");
+}
+
+/// A medium owner identifies a high launch from its token, though the
+/// launch connects for identification only, and refuses it at once with
+/// PRIVILEGE and its own level. The crate's own launches at high don't
+/// reach a medium owner's pipe, so a client built here connects as they
+/// would, and sends a valid REQUEST.
+#[test]
+fn a_medium_owner_refuses_a_high_client_at_once() {
+    if !elevated() {
+        return;
+    }
+    let id = app("refuses-high");
+    let mut child = medium("child_owner", &[(ID, OsStr::new(id.as_str()))]);
+    let dir = PathBuf::from(child.expect("owner "));
+    let base = app_folder(&dir, &id).to_path_buf();
+
+    let address = std::fs::read_to_string(dir.join("instance.pipe")).unwrap();
+    let (named, secret) = address.trim_end().split_once(' ').unwrap();
+    assert_eq!(named, id.as_str());
+    let name = format!(r"\\.\pipe\instance-handoff.{named}.{secret}");
+    let mut pipe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .security_qos_flags(SECURITY_IDENTIFICATION)
+        .open(name)
+        .unwrap();
+    let (kind, hello) = read_message(&mut pipe);
+    assert_eq!(kind, 1, "HELLO");
+    assert!(
+        hello.contains(&(7, MEDIUM.to_le_bytes().to_vec())),
+        "no LEVEL 0x2000 in {hello:?}"
+    );
+
+    let payload = Args::new(["from-high"]).encode().unwrap();
+    let request = message(
+        2,
+        &[
+            (1, &1u16.to_le_bytes()),
+            (2, &0u32.to_le_bytes()),
+            (6, &payload),
+        ],
+    );
+    let sent = Instant::now();
+    pipe.write_all(&request).unwrap();
+    let (kind, reply) = read_message(&mut pipe);
+    let waited = sent.elapsed();
+    assert_eq!(kind, 5, "REPLY");
+    // Not delivered; REFUSED; PRIVILEGE; the owner's level, medium.
+    let want = [
+        (1, vec![0]),
+        (2, vec![3]),
+        (3, vec![8]),
+        (5, MEDIUM.to_le_bytes().to_vec()),
+    ];
+    assert_eq!(reply, want);
+    assert!(waited < Duration::from_secs(1), "{waited:?}");
+
+    drop(pipe);
+    let rest = child.finish();
+    assert!(!rest.iter().any(|l| l.starts_with("took ")), "{rest:?}");
+    let _ = std::fs::remove_dir_all(base);
 }
 
 /// What a medium process may do with files, folders and locks a high one
@@ -559,6 +621,39 @@ fn describe(started: &Started<Args>) -> String {
         Started::HandedOff(info) => format!("handed off to {info:?}"),
         Started::Alone(reason) => format!("alone {reason:?}"),
     }
+}
+
+/// A handoff message of `kind` with `records`, each a tag and its bytes.
+fn message(kind: u8, records: &[(u8, &[u8])]) -> Vec<u8> {
+    let body: Vec<u8> = records
+        .iter()
+        .flat_map(|&(tag, bytes)| [&[tag][..], &(bytes.len() as u32).to_le_bytes(), bytes].concat())
+        .collect();
+    [
+        &b"IHND"[..],
+        &[kind],
+        &(body.len() as u32).to_le_bytes(),
+        &body,
+    ]
+    .concat()
+}
+
+/// The next handoff message from `pipe`: its kind and its records.
+fn read_message(pipe: &mut File) -> (u8, Vec<(u8, Vec<u8>)>) {
+    let mut header = [0; 9];
+    pipe.read_exact(&mut header).unwrap();
+    assert_eq!(&header[..4], b"IHND", "{header:?}");
+    let len = u32::from_le_bytes([header[5], header[6], header[7], header[8]]);
+    let mut body = vec![0; len as usize];
+    pipe.read_exact(&mut body).unwrap();
+    let mut records = Vec::new();
+    let mut rest = &body[..];
+    while !rest.is_empty() {
+        let len = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
+        records.push((rest[0], rest[5..5 + len].to_vec()));
+        rest = &rest[5 + len..];
+    }
+    (header[4], records)
 }
 
 fn result<T>(r: &io::Result<T>) -> String {

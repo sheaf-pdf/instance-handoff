@@ -261,12 +261,15 @@ enum Phase {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Peer {
     pid: Option<u32>,
+    /// Its integrity level, from its token: on Windows, once the owner has
+    /// read from it.
+    level: Option<Level>,
 }
 
 impl Peer {
     /// A launch known by its process id, where the platform gives one.
     pub(crate) fn new(pid: Option<u32>) -> Peer {
-        Peer { pid }
+        Peer { pid, level: None }
     }
 }
 
@@ -344,6 +347,14 @@ impl<T: Payload> Session<T> {
     /// The write side broke: nothing more can be said.
     pub(crate) fn broken(&mut self) {
         self.phase = Phase::Done;
+    }
+
+    /// The launch's integrity level, as its token shows it: on Windows,
+    /// read by impersonation once the launch has sent something, and
+    /// before that is read.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn attested(&mut self, level: Level) {
+        self.peer.level = Some(level);
     }
 
     /// Refuses the launch with `why`, after HELLO and whatever it has sent
@@ -425,6 +436,19 @@ impl<T: Payload> Session<T> {
         if req.payload_version != core.ctx.payload_version {
             let mut reply = Reply::refused(refusal::PAYLOAD_VERSION);
             reply.payload_version = Some(core.ctx.payload_version);
+            return self.reply(reply, now);
+        }
+        // A request goes neither up nor down. The launch's level comes from
+        // its token, never from what it sends: one that isn't the owner's,
+        // or that wasn't read while the owner's was, is refused and told
+        // the owner's. On Unix neither end has one.
+        if self.peer.level != core.ctx.level {
+            log::warn!(
+                "instance-handoff {}: refused a launch at another integrity level",
+                core.ctx.app_id
+            );
+            let mut reply = Reply::refused(refusal::PRIVILEGE);
+            reply.level = core.ctx.level.map(Level::rid);
             return self.reply(reply, now);
         }
         // The app's decoder runs on the crate's thread: a panic in it must
@@ -720,6 +744,107 @@ mod tests {
         refused(&take_out(&mut s));
         s.timed_out(s.deadline());
         assert!(s.is_done());
+    }
+
+    // A launch is admitted only at the owner's own level, as its token
+    // shows it. Any other, or none where the owner has one, is refused with
+    // PRIVILEGE and the owner's level. On Unix neither has one.
+    #[test]
+    fn a_launch_at_another_level_is_refused_with_the_owners() {
+        let (low, medium, high) = (Some(Level::LOW), Some(Level::MEDIUM), Some(Level::HIGH));
+        let rows = [
+            // (the owner's level, the launch's): whether it is admitted.
+            ((None, None), true),
+            ((medium, medium), true),
+            ((high, high), true),
+            ((medium, low), false),
+            ((medium, high), false),
+            ((high, medium), false),
+            ((medium, None), false),
+            ((None, medium), false),
+        ];
+        let now = Instant::now();
+        let bytes = request(3, Args::default().encode().unwrap());
+        for ((owner, launch), admitted) in rows {
+            let mut c = core(Some(Box::new(|_| Answer::Take)));
+            c.ctx.level = owner;
+            let mut s = Session::new(&c, Peer::default(), now);
+            if let Some(level) = launch {
+                s.attested(level);
+            }
+            take_out(&mut s);
+            assert!(s.read(&bytes, &c, now).is_none());
+            let out = take_out(&mut s);
+            if admitted {
+                assert_eq!(out[0].0, wire::READY, "{owner:?} {launch:?}");
+                continue;
+            }
+            let r = reply(&out);
+            assert_eq!(
+                (r.delivered, r.status, r.refusal, r.level),
+                (
+                    false,
+                    status::REFUSED,
+                    Some(refusal::PRIVILEGE),
+                    owner.map(Level::rid)
+                ),
+                "{owner:?} {launch:?}"
+            );
+        }
+    }
+
+    // As a high owner refuses a medium launch: its level goes with the
+    // refusal. Rights come after the versions, and before the owner decodes
+    // the payload or says whether it serves.
+    #[test]
+    fn rights_are_checked_after_the_versions_and_before_the_payload() {
+        let mut c = core(Some(Box::new(|_| Answer::Take)));
+        c.ctx.level = Some(Level::HIGH);
+        let now = Instant::now();
+        let refused = |bytes: &[u8], c: &Core<Args>| {
+            let mut s = Session::new(c, Peer::default(), now);
+            s.attested(Level::MEDIUM);
+            take_out(&mut s);
+            assert!(s.read(bytes, c, now).is_none());
+            let out = s.outgoing().to_vec();
+            s.wrote(out.len());
+            out
+        };
+        #[rustfmt::skip]
+        let privilege = [
+            b'I', b'H', b'N', b'D', 5, 27, 0, 0, 0,
+            1, 1, 0, 0, 0, 0,
+            2, 1, 0, 0, 0, 3,
+            3, 1, 0, 0, 0, 8,
+            5, 4, 0, 0, 0, 0, 0x30, 0, 0,
+        ];
+        let good = request(3, Args::default().encode().unwrap());
+        assert_eq!(refused(&good, &c), privilege);
+        // A payload that wouldn't decode is never decoded.
+        assert_eq!(refused(&request(3, vec![9]), &c), privilege);
+        // Another wire version, or payload version, is refused for that
+        // first.
+        let wire2 = wire::Request {
+            wire: 2,
+            payload_version: 3,
+            payload: Args::default().encode().unwrap(),
+            ..Default::default()
+        }
+        .encode();
+        let r = reply(&frames(&refused(&wire2, &c)));
+        assert_eq!((r.refusal, r.level), (Some(refusal::WIRE), None));
+        let r = reply(&frames(&refused(
+            &request(4, Args::default().encode().unwrap()),
+            &c,
+        )));
+        assert_eq!((r.refusal, r.level), (Some(refusal::PAYLOAD_VERSION), None));
+        // An owner that declines, or has stopped, still refuses, rather
+        // than decline or say busy.
+        let mut declining = core(None);
+        declining.ctx.level = Some(Level::HIGH);
+        assert_eq!(refused(&good, &declining), privilege);
+        c.shared.stop.store(true, Ordering::SeqCst);
+        assert_eq!(refused(&good, &c), privilege);
     }
 
     #[test]
