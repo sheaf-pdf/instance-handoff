@@ -1081,20 +1081,25 @@ impl Op {
     }
 }
 
-/// Waits for `op` until `deadline`; `TimedOut` cancels it.
+/// Waits for `op` until `deadline`; `TimedOut` cancels it. A wait counts
+/// its timeout in clock ticks and can end a little before the deadline, so
+/// it waits again until the deadline has passed.
 fn wait_op(op: &mut Op, h: HANDLE, deadline: Option<Instant>) -> io::Result<usize> {
-    // SAFETY: a valid event handle.
-    match unsafe { WaitForSingleObject(op.event.as_raw_handle(), wait_ms(deadline)) } {
-        WAIT_TIMEOUT => {
-            op.cancel(h);
-            Err(io::ErrorKind::TimedOut.into())
+    loop {
+        // SAFETY: a valid event handle.
+        match unsafe { WaitForSingleObject(op.event.as_raw_handle(), wait_ms(deadline)) } {
+            WAIT_TIMEOUT if deadline.is_some_and(|d| Instant::now() < d) => {}
+            WAIT_TIMEOUT => {
+                op.cancel(h);
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            WAIT_FAILED => {
+                let e = io::Error::last_os_error();
+                op.cancel(h);
+                return Err(e);
+            }
+            _ => return op.result(h),
         }
-        WAIT_FAILED => {
-            let e = io::Error::last_os_error();
-            op.cancel(h);
-            Err(e)
-        }
-        _ => op.result(h),
     }
 }
 
