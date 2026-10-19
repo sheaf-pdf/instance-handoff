@@ -287,9 +287,11 @@
 //! or with [`Reason::NoSession`] where it has no runtime folder to look in.
 //! On Linux, the BSDs and illumos a launch can show windows when
 //! `WAYLAND_DISPLAY` or `DISPLAY` is set and not empty, and on macOS when
-//! its login session has graphic access. Elsewhere, and on macOS when the
-//! session can't be read, every launch counts as able. A
-//! [headless](Kind::Headless) app's launches need no display to own.
+//! its login session has graphic access. On Windows it can unless it runs
+//! in session 0, as services and OpenSSH logins do, or on a window station
+//! that isn't visible. Elsewhere, and on macOS or Windows when that can't
+//! be told, every launch counts as able. A [headless](Kind::Headless)
+//! app's launches need no display to own.
 //!
 //! So where tests run without a display, as on most CI runners, a windowed
 //! app's tests can't own. Build the tests' [`AppId`] as headless, with a

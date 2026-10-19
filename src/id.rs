@@ -55,9 +55,11 @@ pub enum Kind {
     /// On Linux, the BSDs and illumos, a launch can show windows when
     /// `WAYLAND_DISPLAY` or `DISPLAY` is set and not empty. On macOS it
     /// can when its login session has graphic access, which a login over
-    /// `ssh` hasn't. On Windows and Android, and on macOS when the session
-    /// can't be read, every launch counts as able. So without a display,
-    /// the app's tests can't own: see the crate docs on windowed apps.
+    /// `ssh` hasn't. On Windows it can unless it runs in session 0, as
+    /// services and OpenSSH logins do, or on a window station that isn't
+    /// visible. On Android, and on macOS or Windows when that can't be
+    /// told, every launch counts as able. So without a display, the app's
+    /// tests can't own: see the crate docs on windowed apps.
     Windowed,
     /// Any launch, including one with no display. Daemons, services and
     /// CLI back ends are headless, and so is a daemon that opens windows

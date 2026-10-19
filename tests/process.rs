@@ -487,6 +487,103 @@ fn only_a_launch_that_can_show_windows_owns_a_windowed_app() {
     assert_eq!(owner.took(Duration::from_secs(5)), Some(hex(b"windowed")));
 }
 
+/// Not a test: a launch of `APP` as the kind ROLE names, `windowed` or
+/// `headless`, on a window station that isn't visible. It prints
+/// `station: hidden` once it has moved there, or why it couldn't. Then it
+/// serves if it owns, and otherwise prints how it started.
+#[cfg(windows)]
+#[test]
+fn hidden_launch_process() {
+    let Some(role) = std::env::var_os(ROLE) else {
+        return;
+    };
+    if let Err(e) = hide() {
+        say(&format!("station: {e}"));
+        return;
+    }
+    say("station: hidden");
+    let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
+    let kind = if role == "windowed" {
+        Kind::Windowed
+    } else {
+        Kind::Headless
+    };
+    let app = AppId::parse(APP.as_str(), kind).unwrap();
+    match Builder::new(app, state(&dir))
+        .dir(dir)
+        .timeout(Duration::from_secs(20))
+        .start(&Args::default())
+    {
+        Started::Owner(claim) => serve(claim, false),
+        Started::Alone(reason) => say(&format!("alone: {reason:?}")),
+        other => say(&format!("{other:?}")),
+    }
+}
+
+/// Moves this process to the window station that Windows names after its
+/// logon session, as it does for services. Only a session's interactive
+/// station is visible, so this one isn't.
+#[cfg(windows)]
+fn hide() -> std::io::Result<()> {
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        CreateWindowStationW, SetProcessWindowStation,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::WINSTA_READATTRIBUTES;
+    // No name, since only administrators may give one, and no security
+    // attributes, so the handle isn't inherited. It stays open while the
+    // process uses the station.
+    // SAFETY: both pointers may be null.
+    let station = unsafe {
+        CreateWindowStationW(
+            std::ptr::null(),
+            0,
+            WINSTA_READATTRIBUTES as u32,
+            std::ptr::null(),
+        )
+    };
+    if station.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a window station of this session, open.
+    if unsafe { SetProcessWindowStation(station) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A `hidden_launch_process` of the kind `role` names, once it is on its
+/// window station.
+#[cfg(windows)]
+fn hidden_launch(dir: &Path, role: &str) -> Owner {
+    let launch = Owner::spawn(dir, "hidden_launch_process", role);
+    assert_eq!(
+        launch.said("station: ", Duration::from_secs(10)).as_deref(),
+        Some("hidden")
+    );
+    launch
+}
+
+// On Windows, a launch on a window station that isn't visible can't show
+// windows: a windowed app's runs alone at once, creating nothing, and a
+// headless app's owns. Neither needs the test to run where windows show.
+#[cfg(windows)]
+#[test]
+fn a_launch_on_a_hidden_window_station_owns_only_a_headless_app() {
+    let (_tmp, dir) = dir();
+    let t = Instant::now();
+    let windowed = hidden_launch(&dir, "windowed");
+    assert_eq!(
+        windowed.said("alone: ", Duration::from_secs(10)).as_deref(),
+        Some("MayNotOwn { why: NoWindows }")
+    );
+    // Child included, well inside its 20 second timeout.
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    assert!(!dir.exists());
+
+    let headless = hidden_launch(&dir, "headless");
+    headless.wait_for("ready");
+}
+
 /// Not a test: a launch that `launch_under_fakeroot` starts. It prints the
 /// effective user the C library reports, then hands off and prints the
 /// owner's process id, or why it couldn't.

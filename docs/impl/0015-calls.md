@@ -106,6 +106,8 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
    - A variable that is set but empty counts as unset. illumos follows the BSDs. `WAYLAND_SOCKET`, which the plan also named, isn't read.
    - On macOS, a `SessionGetInfo` that fails is unknown.
    - A windowed app's launch that can't show windows gets `NoWindows` before any reason its rights give, since no `ElevatedOwner` lets it own.
+
+   Slice 37 settled how the two Windows facts combine when one can't be read. *Our call (slice 37).* Either alone can say no: session 0, or a window station that isn't visible. A visible station says yes only with a session that was read and isn't 0, since nobody sees session 0's windows. Otherwise the answer is unknown.
 7. **No test hook in 0.1.** The docs tell a windowed app to run its tests under a display (Xvfb), or to build its test `AppId` as headless with its own test state. The crate's own tests use headless ids. *Our call.*
 
 ## 8. Tests and CI (slices 6, 38)

@@ -67,8 +67,8 @@ use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, GetSidSubAuthority,
     GetSidSubAuthorityCount, GetTokenInformation, IsWellKnownSid, LABEL_SECURITY_INFORMATION,
     OWNER_SECURITY_INFORMATION, PSID, RevertToSelf, SECURITY_ATTRIBUTES, TOKEN_MANDATORY_LABEL,
-    TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser, WinBuiltinAdministratorsSid,
-    WinCreatorOwnerRightsSid, WinCreatorOwnerSid, WinLocalSystemSid,
+    TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenSessionId, TokenUser,
+    WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid, WinCreatorOwnerSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DELETE, FILE_ADD_FILE,
@@ -90,6 +90,9 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     WaitNamedPipeW,
 };
+use windows_sys::Win32::System::StationsAndDesktops::{
+    GetProcessWindowStation, GetUserObjectInformationW, UOI_FLAGS, USEROBJECTFLAGS,
+};
 use windows_sys::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE, FILE_PERSISTENT_ACLS,
     SECURITY_MANDATORY_MEDIUM_RID, SYSTEM_MANDATORY_LABEL_ACE_TYPE,
@@ -99,7 +102,7 @@ use windows_sys::Win32::System::Threading::{
     SetEvent, WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
-use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+use windows_sys::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, WSF_VISIBLE};
 
 use crate::id::valid_id;
 use crate::naming::level_folder;
@@ -259,10 +262,97 @@ pub(crate) fn above_normal() -> bool {
     false
 }
 
-/// Whether this launch can show windows. The session and window station
-/// aren't read here, so it is unknown, and every launch counts as able.
+/// Where this process would show its windows, gathered apart from the rule
+/// so that the rule can be tested. `None` where a fact couldn't be read.
+#[derive(Debug)]
+struct Station {
+    /// The token's session. Services run in session 0, whose windows
+    /// nobody sees.
+    session: Option<u32>,
+    /// Whether the process's window station is visible (`WSF_VISIBLE`).
+    /// Only a session's interactive station, `WinSta0`, is.
+    visible: Option<bool>,
+}
+
+/// Whether a launch on Windows can show windows: not in session 0, and on
+/// a visible window station. Either fact alone can say no. A visible
+/// station says yes only outside session 0, so with the session unread
+/// it is unknown.
+fn shows_windows_from(station: &Station) -> Option<bool> {
+    match (station.session, station.visible) {
+        (Some(0), _) | (_, Some(false)) => Some(false),
+        (Some(_), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+fn station() -> Station {
+    Station {
+        session: session_id().ok(),
+        visible: visible_station().ok(),
+    }
+}
+
+/// Whether this launch can show windows, or `None` where that can't be
+/// told. A launch in session 0, as services and OpenSSH logins are, or on
+/// a window station that isn't visible, can't.
 pub(crate) fn can_show_windows() -> Option<bool> {
-    None
+    shows_windows_from(&station())
+}
+
+/// This process's session, from its token.
+fn session_id() -> io::Result<u32> {
+    let mut token: HANDLE = null_mut();
+    // SAFETY: the current-process pseudo handle; `token` receives a handle
+    // that `OwnedHandle` closes.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut session = 0u32;
+    let mut len = 0;
+    // SAFETY: a token open for query. The class's information is one u32,
+    // and `session` is valid for writes of its size.
+    let ok = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenSessionId,
+            (&mut session as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(session)
+}
+
+/// Whether this process's window station is visible.
+fn visible_station() -> io::Result<bool> {
+    // SAFETY: no arguments. The handle it returns is never to be closed,
+    // and isn't.
+    let station = unsafe { GetProcessWindowStation() };
+    if station.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut flags = USEROBJECTFLAGS::default();
+    let mut len = 0;
+    // SAFETY: an open window station, and `flags` is valid for writes of
+    // the size given.
+    let ok = unsafe {
+        GetUserObjectInformationW(
+            station,
+            UOI_FLAGS,
+            (&mut flags as *mut USEROBJECTFLAGS).cast(),
+            std::mem::size_of::<USEROBJECTFLAGS>() as u32,
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags.dwFlags & WSF_VISIBLE as u32 != 0)
 }
 
 fn trusted(sid: PSID, me: &Identity) -> bool {
@@ -2181,6 +2271,44 @@ mod tests {
         folder.unpublish();
         std::fs::write(&file, "x \\\\evil\\pipe\n").unwrap();
         assert!(folder.address().is_err());
+    }
+
+    // A launch can show windows outside session 0, on a visible window
+    // station.
+    #[test]
+    fn who_can_show_windows() {
+        let (yes, no) = (Some(true), Some(false));
+        // (launch, session, visible station, can show windows), where
+        // `None` is a fact unread or an answer unknown.
+        let rows = [
+            ("a desktop", Some(1), yes, yes),
+            ("a second RDP session", Some(3), yes, yes),
+            ("a service or an OpenSSH login", Some(0), no, no),
+            ("session 0, on a visible station", Some(0), yes, no),
+            ("a station of its own", Some(1), no, no),
+            ("session 0, station unread", Some(0), None, no),
+            ("hidden, session unread", None, no, no),
+            ("visible, session unread", None, yes, None),
+            ("a desktop, station unread", Some(1), None, None),
+            ("nothing read", None, None, None),
+        ];
+        for (launch, session, visible, shows) in rows {
+            let station = Station { session, visible };
+            assert_eq!(shows_windows_from(&station), shows, "{launch}: {station:?}");
+        }
+    }
+
+    // Both facts can be read. CI's runner, at either level, runs the tests
+    // in session 2 on WinSta0, which is visible
+    // (docs/design/0015-windows-measurements.md), so they can show windows
+    // there. Over OpenSSH or in a service, they run in session 0 and can't.
+    #[test]
+    fn the_tests_session_and_window_station_are_read() {
+        let station = station();
+        let (Some(session), Some(_)) = (station.session, station.visible) else {
+            panic!("{station:?}");
+        };
+        assert_eq!(can_show_windows(), Some(session != 0), "{station:?}");
     }
 
     // Whose folders a launch may keep its state in, by owner SID.
