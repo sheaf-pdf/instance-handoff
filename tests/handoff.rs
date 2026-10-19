@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use instance_handoff::{
-    AppId, Args, Builder, Claim, ElevatedOwner, End, Guard, Kind, Level, Mode, Owner, Reason,
-    Request, Started, State,
+    AppId, Args, Builder, Claim, ElevatedOwner, End, Guard, Kind, Level, Owner, Reason, Request,
+    Started, State,
 };
 
 const APP: AppId = AppId::headless("test.handoff");
@@ -180,17 +180,123 @@ fn a_second_launch_hands_its_args_to_the_first() {
     owner.release();
 }
 
+/// The test's guard file, once the state folder exists.
+fn guard_file(dir: &Dir) -> PathBuf {
+    canonical(dir.tmp.path())
+        .join("state")
+        .join(".instance-handoff.lock")
+}
+
+/// Asserts that `reason` is StateInUse, naming `path`.
+fn in_use(reason: Reason, path: &Path) {
+    assert!(
+        matches!(&reason, Reason::StateInUse { path: p, .. } if p == path),
+        "{reason}"
+    );
+}
+
+// An exclusive run takes the guard alone, and no runtime folder: it makes
+// the missing state folder, private, and reports it. While it holds the
+// guard, a start runs alone and lets go of its lock, and another exclusive
+// run fails, both at once. An owner keeps it out in turn, from any runtime
+// folder, and gets nothing. Released or dropped, it frees the state folder
+// at once.
 #[test]
-fn separate_launches_run_alone_beside_an_owner_and_own_when_nobody_does() {
+fn an_exclusive_run_and_an_owner_keep_each_other_out() {
     let dir = dir();
-    let claim = claim(builder(&dir).mode(Mode::Separate).start(&Args::default()));
-    let (owner, rx) = serve(claim);
+    let state = canonical(dir.tmp.path()).join("state");
+    let held = builder(&dir).exclusive().unwrap();
+    assert_eq!(held.state_dir(), Some(state.as_path()));
+    assert_private(&state);
+    assert!(!dir.path.exists(), "made a runtime folder");
     let t = Instant::now();
-    let reason = alone(builder(&dir).mode(Mode::Separate).start(&args(&["x"])));
-    assert!(matches!(reason, Reason::OwnerRunning { .. }), "{reason}");
-    assert!(t.elapsed() < Duration::from_secs(1));
+    in_use(alone(builder(&dir).start(&args(&["x"]))), &guard_file(&dir));
+    in_use(builder(&dir).exclusive().unwrap_err(), &guard_file(&dir));
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    let reason = builder(&dir).probe().unwrap_err();
+    assert!(matches!(reason, Reason::NoOwner { .. }), "{reason}");
+    held.release();
+
+    let (owner, rx) = serve(claim(builder(&dir).start(&Args::default())));
+    let t = Instant::now();
+    in_use(builder(&dir).exclusive().unwrap_err(), &guard_file(&dir));
+    let other = builder(&dir).dir(dir.tmp.path().join("other"));
+    in_use(other.exclusive().unwrap_err(), &guard_file(&dir));
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     assert!(rx.try_recv().is_err());
     owner.release();
+
+    drop(builder(&dir).exclusive().unwrap());
+    claim(builder(&dir).start(&Args::default())).release();
+}
+
+// An exclusive run holds the guard alone, whatever its scope: owners with
+// scopes keep it out, and it keeps them out.
+#[test]
+fn an_exclusive_run_and_keyed_owners_keep_each_other_out() {
+    let dir = dir();
+    let a = claim(builder(&dir).scope("a").start(&Args::default()));
+    for b in [
+        builder(&dir),
+        builder(&dir).scope("a"),
+        builder(&dir).scope("b"),
+    ] {
+        in_use(b.exclusive().unwrap_err(), &guard_file(&dir));
+    }
+    a.release();
+
+    let held = builder(&dir).scope("a").exclusive().unwrap();
+    for b in [builder(&dir).scope("a"), builder(&dir).scope("b")] {
+        in_use(alone(b.start(&Args::default())), &guard_file(&dir));
+    }
+    held.release();
+    claim(builder(&dir).scope("b").start(&Args::default())).release();
+}
+
+// Without a guard, under Guard::Off or for State::none, an exclusive run
+// takes the lock in the runtime folder instead, and serves nothing. It
+// still makes the missing state folder, private, but no guard file.
+// Another exclusive run there fails at once, naming the lock file, and so
+// does one beside an owner there. While it holds the lock, a start there
+// finds nobody serving and runs alone at its timeout, and an owner of the
+// state folder in another runtime folder isn't kept out.
+#[test]
+fn an_exclusive_run_without_a_guard_takes_the_lock() {
+    let dir = dir();
+    let off = builder(&dir).guard(Guard::Off).timeout(SHORT);
+    let lock = off.runtime_dir().unwrap().join("instance.lock");
+    let held = off.exclusive().unwrap();
+    let state = canonical(dir.tmp.path()).join("state");
+    assert_eq!(held.state_dir(), Some(state.as_path()));
+    assert_private(&state);
+    assert!(!guard_file(&dir).exists());
+    let t = Instant::now();
+    in_use(off.exclusive().unwrap_err(), &lock);
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    let reason = alone(off.start(&args(&["x"])));
+    assert!(matches!(reason, Reason::Unresponsive { .. }), "{reason}");
+    let other = builder(&dir).dir(dir.tmp.path().join("other"));
+    claim(other.start(&Args::default())).release();
+    held.release();
+
+    let (owner, rx) = serve(claim(builder(&dir).start(&Args::default())));
+    let t = Instant::now();
+    in_use(off.exclusive().unwrap_err(), &lock);
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert!(rx.try_recv().is_err());
+    owner.release();
+
+    let none = Builder::new(APP, State::none())
+        .dir(&dir.path)
+        .timeout(SHORT);
+    let held = none.exclusive().unwrap();
+    assert_eq!(held.state_dir(), None);
+    let lock = none.runtime_dir().unwrap().join("instance.lock");
+    in_use(none.exclusive().unwrap_err(), &lock);
+    let reason = none.probe().unwrap_err();
+    assert!(matches!(reason, Reason::Unresponsive { .. }), "{reason}");
+    drop(held);
+    claim(none.start(&Args::default())).release();
 }
 
 // The tests don't run raised, so Allow and the default policy both own
@@ -850,14 +956,7 @@ fn a_second_runtime_folder_finds_the_state_folder_in_use() {
     assert!(first.guarded());
     let other = builder(&dir).dir(dir.tmp.path().join("other"));
     let t = Instant::now();
-    let reason = alone(other.start(&args(&["x"])));
-    let guard = canonical(dir.tmp.path())
-        .join("state")
-        .join(".instance-handoff.lock");
-    assert!(
-        matches!(&reason, Reason::StateInUse { path, .. } if *path == guard),
-        "{reason}"
-    );
+    in_use(alone(other.start(&args(&["x"]))), &guard_file(&dir));
     assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     // It let go of its lock: nobody owns that runtime folder.
     let reason = other.probe().unwrap_err();
@@ -909,14 +1008,7 @@ fn keyed_owners_share_the_guard() {
     assert!(a.guarded() && b.guarded());
     let unkeyed = builder(&dir);
     let t = Instant::now();
-    let reason = alone(unkeyed.start(&args(&["x"])));
-    let guard = canonical(dir.tmp.path())
-        .join("state")
-        .join(".instance-handoff.lock");
-    assert!(
-        matches!(&reason, Reason::StateInUse { path, .. } if *path == guard),
-        "{reason}"
-    );
+    in_use(alone(unkeyed.start(&args(&["x"]))), &guard_file(&dir));
     assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     let reason = unkeyed.probe().unwrap_err();
     assert!(matches!(reason, Reason::NoOwner { .. }), "{reason}");

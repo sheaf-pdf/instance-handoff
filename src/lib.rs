@@ -50,12 +50,15 @@
 //!   integrity level) doesn't own that state folder too: it runs alone at
 //!   once with [`Reason::StateInUse`].
 //!   Two owners that both have a [scope](Builder::scope) share the guard,
-//!   and own the state folder side by side. A process that gets
-//!   [`Started::Alone`] must not write the state the owner owns. If the
-//!   runtime folder is deleted under a running owner and another process
-//!   takes the lock there before this one re-creates it (a new owner, or a
-//!   launch that finds this owner's guard and lets go again), this one is
-//!   told ([`End::LostLock`]) within a minute, and gives its guard up.
+//!   and own the state folder side by side. [`Builder::exclusive`] holds
+//!   the guard alone, where it takes one, for a process's own work, so no
+//!   launch that takes the guard owns the state folder beside it. A
+//!   process that gets [`Started::Alone`] must not write the state the
+//!   owner owns. If the runtime folder is deleted under a running owner
+//!   and another process takes the lock there before this one re-creates
+//!   it (a new owner, or a launch that finds this owner's guard and lets
+//!   go again), this one is told ([`End::LostLock`]) within a minute, and
+//!   gives its guard up.
 //! - Each launch ends one of three ways, whatever the timing (stopped
 //!   processes, slow handlers, expired timeouts):
 //!   - it hands off ([`Started::HandedOff`]): an owner's handler takes its
@@ -77,9 +80,10 @@
 //!   it refuses another user, and a launch whose token is at another
 //!   integrity level, naming its own level. The launch checks that the pipe
 //!   is its own user's, at its own integrity level.
-//! - [`Builder::start`], [`Builder::hand_off`] and [`Builder::probe`] never
-//!   panic, whatever the [timeout](Builder::timeout). Every failure is a
-//!   [`Reason`], and failures that waiting can't fix return at once.
+//! - [`Builder::start`], [`Builder::hand_off`], [`Builder::probe`] and
+//!   [`Builder::exclusive`] never panic, whatever the
+//!   [timeout](Builder::timeout). Every failure is a [`Reason`], and
+//!   failures that waiting can't fix return at once.
 //!
 //! # Threads, blocking and fork
 //!
@@ -92,7 +96,8 @@
 //!   longer than their timeout.
 //! - `start` creates no thread. A [`Claim`] is a held lock and a listening
 //!   socket, nothing more; [`Claim::serve`] and [`Claim::decline_all`] start
-//!   the crate's one thread, named after the app id.
+//!   the crate's one thread, named after the app id. [`Builder::exclusive`]
+//!   never waits for the state folder and creates no thread.
 //! - The handler given to [`Claim::serve`] runs on that thread, one call at
 //!   a time, and is dropped there. It must not block: send the [`Request`]
 //!   to a channel or an event-loop proxy and return. Use a send that can't
@@ -107,9 +112,10 @@
 //!   The parent learns the outcome from `start` itself. Never fork after
 //!   `serve`: the crate's thread doesn't survive `fork`. A helper forked
 //!   from the owner without `exec` holds the lock and the guard until it
-//!   exits too, even after the owner has. (macOS forbids
-//!   `fork` without `exec` once Core Foundation is running: fork before
-//!   anything touches it.)
+//!   exits too, even after the owner has, and one forked while an
+//!   [`Exclusive`] is held holds it too. (macOS forbids `fork` without
+//!   `exec` once Core Foundation is running: fork before anything touches
+//!   it.)
 //!
 //! # Quitting
 //!
@@ -135,7 +141,9 @@
 //! [`Claim::decline_all`] does, and logs a warning. [`Owner::release`] gives
 //! both up while the process runs on, for tests and services that restart
 //! in place. `stop` stays necessary where destructors don't run:
-//! `process::exit`, GPUI's and AppKit's `terminate:` on macOS.
+//! `process::exit`, GPUI's and AppKit's `terminate:` on macOS. An
+//! [`Exclusive`] is different: it serves no launches, and dropping it
+//! releases the state folder at once.
 //!
 //! # Where the lock lives
 //!
@@ -207,7 +215,9 @@
 //! drive that Windows says is remote. Nor does it where the file system
 //! can't lock files: see [`Guard::Local`]. A `start` that takes the lock
 //! makes the state folder first if it is missing, private, whether or not
-//! it takes the guard.
+//! it takes the guard. [`Builder::exclusive`] takes the guard alone, with
+//! no lock in a runtime folder; where it can't take the guard, it takes the
+//! lock in the runtime folder instead, and serves nothing.
 //!
 //! # Privileges
 //!
@@ -253,17 +263,18 @@
 //! A launch whose rights were raised from a login hands off to its level's
 //! owner, but by default never becomes it ([`Builder::elevated_owner`]):
 //! with no owner running, it runs alone at once with
-//! [`Reason::MayNotOwn`]. On Unix that is root whose person is known and
-//! isn't root: `SUDO_UID` names them (`sudo`, `run0`), or `PKEXEC_UID`
-//! (`pkexec`), `DOAS_USER` (`doas`), or on Linux the login user id that
-//! `su` keeps (`/proc/self/loginuid`). Root's own login and services
-//! that systemd starts, which have no login user id, still own, and so
-//! does root after `su` on macOS and the BSDs, which keep none at all.
-//! Root in a container owns when the container runs in a user namespace or
-//! was started outside a login, by a daemon such as Docker's. A container
-//! started from `sudo` with no user namespace keeps the login user id,
-//! so its root counts as raised. On Windows no launch counts as raised:
-//! an elevated one owns in its own folder.
+//! [`Reason::MayNotOwn`], and [`Builder::exclusive`] fails with it. On
+//! Unix that is root whose person is known and isn't root: `SUDO_UID`
+//! names them (`sudo`, `run0`), or `PKEXEC_UID` (`pkexec`), `DOAS_USER`
+//! (`doas`), or on Linux the login user id that `su` keeps
+//! (`/proc/self/loginuid`). Root's own login and services that systemd
+//! starts, which have no login user id, still own, and so does root after
+//! `su` on macOS and the BSDs, which keep none at all. Root in a container
+//! owns when the container runs in a user namespace or was started outside
+//! a login, by a daemon such as Docker's. A container started from `sudo`
+//! with no user namespace keeps the login user id, so its root counts as
+//! raised. On Windows no launch counts as raised: an elevated one owns in
+//! its own folder.
 //!
 //! Two limits:
 //!
@@ -500,10 +511,10 @@ mod wire;
 )]
 mod sys;
 
-pub use builder::{Builder, ElevatedOwner, Guard, Mode, State};
+pub use builder::{Builder, ElevatedOwner, Guard, State};
 pub use id::{AppId, InvalidAppId, Kind};
 pub use level::{Level, Rights};
-pub use outcome::{End, Ineligible, OwnerInfo, Reason, Started};
+pub use outcome::{End, Exclusive, Ineligible, OwnerInfo, Reason, Started};
 pub use owner::{Claim, Owner};
 #[cfg(feature = "serde")]
 pub use payload::Json;
@@ -521,6 +532,7 @@ mod bounds {
     fn the_types_an_app_stores_cross_threads() {
         send_sync::<Owner>();
         send_sync::<Claim<Args>>();
+        send_sync::<Exclusive>();
         send_sync::<Builder>();
         send_sync::<State>();
         send_sync::<Guard>();

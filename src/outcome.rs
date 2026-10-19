@@ -1,10 +1,10 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::{BoxError, Claim, Level, Rights};
+use crate::{BoxError, Claim, Level, Rights, sys};
 
 /// What [`Builder::start`] decided. Exactly one of three things.
 ///
@@ -100,6 +100,69 @@ impl fmt::Display for OwnerInfo {
             Some(level) => write!(f, ", {level}"),
             None => Ok(()),
         }
+    }
+}
+
+/// The state folder, held for this process's own work: what
+/// [`Builder::exclusive`] returns. While it is held, no launch owns the
+/// state folder, and no other exclusive run holds it, unless one of them
+/// takes no [guard](crate::Guard): see `exclusive`.
+///
+/// Dropping it releases it at once, as [`Exclusive::release`] does, and so
+/// does the process's exit. That is unlike a [`Claim`] or an
+/// [`Owner`](crate::Owner), which keep the lock until the process exits.
+/// So bind it to a name for as long as the work runs: `let _ = …` drops it
+/// at once. A child forked from this process without `exec` holds it too,
+/// until the child drops its copy or exits.
+///
+/// [`Builder::exclusive`]: crate::Builder::exclusive
+#[must_use = "dropping an Exclusive releases the state at once"]
+pub struct Exclusive {
+    state: Option<PathBuf>,
+    held: Holding,
+}
+
+/// What an [`Exclusive`] holds, until it is dropped.
+#[derive(Debug)]
+pub(crate) enum Holding {
+    /// The state folder's guard.
+    Guard(#[allow(dead_code)] sys::Guard),
+    /// Without a guard, the lock in the runtime folder, and the folder.
+    Lock(
+        #[allow(dead_code)] sys::Folder,
+        #[allow(dead_code)] sys::Lock,
+    ),
+}
+
+impl Exclusive {
+    /// For the canonical `state` folder, or none, held by `held`.
+    pub(crate) fn new(state: Option<PathBuf>, held: Holding) -> Exclusive {
+        Exclusive { state, held }
+    }
+
+    /// The state folder given to [`Builder::new`], with its links resolved
+    /// as [`State::dir`] says, or `None` for [`State::none`]. Write the
+    /// state through this path, and only while this `Exclusive` is held.
+    ///
+    /// [`Builder::new`]: crate::Builder::new
+    /// [`State::dir`]: crate::State::dir
+    /// [`State::none`]: crate::State::none
+    pub fn state_dir(&self) -> Option<&Path> {
+        self.state.as_deref()
+    }
+
+    /// Give the state folder up, as dropping this does.
+    pub fn release(self) {
+        drop(self);
+    }
+}
+
+impl fmt::Debug for Exclusive {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Exclusive")
+            .field("state_dir", &self.state_dir())
+            .field("guarded", &matches!(self.held, Holding::Guard(_)))
+            .finish_non_exhaustive()
     }
 }
 
@@ -201,12 +264,6 @@ impl fmt::Display for Ineligible {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Reason {
-    /// [`Mode::Separate`], and another process owns the app (this one,
-    /// too, if it already holds the lock).
-    ///
-    /// [`Mode::Separate`]: crate::Mode::Separate
-    #[non_exhaustive]
-    OwnerRunning {},
     /// [`Builder::hand_off`] or [`Builder::probe`], and no process owns the
     /// app.
     ///
@@ -230,8 +287,10 @@ pub enum Reason {
         waited: Duration,
     },
     /// An owner holds the lock but didn't take the request before the
-    /// timeout: it hasn't served yet, can't listen, or is hung. The request
-    /// was not delivered, and won't be.
+    /// timeout: it hasn't served yet, can't listen, or is hung. Or an
+    /// [exclusive](crate::Builder::exclusive) run that took the lock
+    /// without a guard holds it, and serves nothing. The request was not
+    /// delivered, and won't be.
     #[non_exhaustive]
     Unresponsive {
         /// How long this launch tried.
@@ -323,14 +382,16 @@ pub enum Reason {
         rights: Rights,
     },
     /// This launch may not become the owner, and nobody it may hand off
-    /// to is running, or it is [`Mode::Separate`], which never hands off.
-    /// It never took the lock. Only a launch that can show windows may own
-    /// a [windowed] app, and [`Builder::elevated_owner`] says which
-    /// launches with raised rights may own.
+    /// to is running. Or it may not hold the state with
+    /// [`Builder::exclusive`], which never hands off. It never took the
+    /// lock. Only a launch that can show windows may own a [windowed] app,
+    /// though any may hold its state with `exclusive`, and
+    /// [`Builder::elevated_owner`] says which launches with raised rights
+    /// may do either.
     ///
     /// [windowed]: crate::Kind::Windowed
     /// [`Builder::elevated_owner`]: crate::Builder::elevated_owner
-    /// [`Mode::Separate`]: crate::Mode::Separate
+    /// [`Builder::exclusive`]: crate::Builder::exclusive
     #[non_exhaustive]
     MayNotOwn {
         /// Why it may not.
@@ -374,30 +435,38 @@ pub enum Reason {
         /// What went wrong.
         source: io::Error,
     },
-    /// Another process holds the state folder's [guard](crate::Guard), but
-    /// not the lock in this launch's runtime folder, so this launch can't
-    /// reach it: an owner in another container, one given another
-    /// [`Builder::dir`], an owner of another app id given the same state
-    /// folder, on Windows one at another integrity level, or one whose
-    /// runtime folder was deleted and isn't made again yet. Or one of the
-    /// two has a [scope](crate::Builder::scope) and the other hasn't:
-    /// owners with scopes share the guard only with one another. This
-    /// launch let go of its lock before anyone could connect.
-    /// Only [`Builder::start`] takes the guard.
+    /// Another process holds the state folder. From [`Builder::start`], it
+    /// holds the state folder's [guard](crate::Guard), but not the lock in
+    /// this launch's runtime folder, so this launch can't reach it: an
+    /// owner in another container, one given another [`Builder::dir`], an
+    /// owner of another app id given the same state folder, on Windows one
+    /// at another integrity level, one whose runtime folder was deleted and
+    /// isn't made again yet, or an [exclusive](crate::Builder::exclusive)
+    /// run. Or one of the two has a [scope](crate::Builder::scope) and the
+    /// other hasn't: owners with scopes share the guard only with one
+    /// another. This launch let go of its lock before anyone could connect.
+    /// Only `start` and `exclusive` take the guard.
+    ///
+    /// From `exclusive`, it is any owner of the state folder, or another
+    /// exclusive run, that holds the guard. Where `exclusive` takes no
+    /// guard, it is an owner or another exclusive run that holds the lock
+    /// in its runtime folder.
     ///
     /// [`Builder::dir`]: crate::Builder::dir
     /// [`Builder::start`]: crate::Builder::start
     #[non_exhaustive]
     StateInUse {
-        /// The guard file.
+        /// The guard file, or the lock file for an exclusive run that takes
+        /// no guard.
         path: PathBuf,
     },
     /// The state folder, or the folder it would be created in, belongs to
     /// another user: root given the user's home by `sudo -E`, say. Nothing
-    /// was created. Only [`Builder::start`] checks this; see
-    /// [`Builder::new`].
+    /// was created. Only [`Builder::start`] and [`Builder::exclusive`]
+    /// check this; see [`Builder::new`].
     ///
     /// [`Builder::start`]: crate::Builder::start
+    /// [`Builder::exclusive`]: crate::Builder::exclusive
     /// [`Builder::new`]: crate::Builder::new
     #[non_exhaustive]
     ForeignState {
@@ -425,7 +494,6 @@ impl Reason {
 impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Reason::OwnerRunning {} => f.write_str("another instance is running"),
             Reason::NoOwner {} => f.write_str("no instance is running"),
             Reason::Declined {} => f.write_str("the running instance turned this launch away"),
             Reason::Busy { waited } => {

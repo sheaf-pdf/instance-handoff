@@ -23,16 +23,28 @@ const DIR: &str = "INSTANCE_HANDOFF_TEST_DIR";
 /// namespace. It starts with the state folder in STATE, in the runtime
 /// folder in DIR if that is set and in its own otherwise. It prints
 /// `started` and how: `owner <pid> in <runtime folder>`, and then it
-/// serves, or how it handed off, or why it ran alone.
+/// serves, or how it handed off, or why it ran alone. When ROLE is
+/// `exclusive`, it is an exclusive run instead: it prints `exclusive` and
+/// `held`, releasing the state folder at once, or why it failed.
 #[test]
 fn launch_process() {
-    if std::env::var_os(ROLE).is_none() {
+    let Some(role) = std::env::var_os(ROLE) else {
         return;
-    }
+    };
     let state = PathBuf::from(std::env::var_os(STATE).unwrap());
     let mut builder = Builder::new(APP, State::dir(state)).timeout(Duration::from_secs(20));
     if let Some(dir) = std::env::var_os(DIR) {
         builder = builder.dir(dir);
+    }
+    if role == "exclusive" {
+        match builder.exclusive() {
+            Ok(held) => {
+                say("exclusive held");
+                held.release();
+            }
+            Err(reason) => say(&format!("exclusive failed: {reason:?}")),
+        }
+        return;
     }
     match builder.start(&Args::new(["launch"])) {
         Started::Owner(claim) => {
@@ -434,7 +446,8 @@ fn a_raised_root_in_a_user_namespace_may_not_own() {
 // A user namespace shows the folders of users it doesn't map, host root's
 // among them, as owned by the overflow user (nobody). That counts as
 // another user, whether the launch is root in the namespace or the user:
-// a state folder whose nearest folder is `/` gives ForeignState.
+// a state folder whose nearest folder is `/` gives ForeignState, to a
+// start and to an exclusive run alike, before either makes anything.
 #[test]
 fn host_roots_folders_are_another_users_in_a_user_namespace() {
     use std::os::unix::fs::MetadataExt;
@@ -456,6 +469,13 @@ fn host_roots_folders_are_another_users_in_a_user_namespace() {
         let run = run_folder(tmp.path(), &format!("run-{uid:?}"));
         let launch = Launch::run(sandboxed(tmp.path(), &state, &run, uid, false));
         assert_eq!(launch.started(), r#"alone: ForeignState { path: "/" }"#);
+        let mut command = sandboxed(tmp.path(), &state, &run, uid, false);
+        command.env(ROLE, "exclusive");
+        let held = Launch::run(command);
+        assert_eq!(
+            held.said("exclusive ", Duration::from_secs(10)).as_deref(),
+            Some(r#"failed: ForeignState { path: "/" }"#)
+        );
         assert_eq!(std::fs::read_dir(&run).unwrap().count(), 0);
     }
 }

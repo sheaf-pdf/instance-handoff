@@ -6,17 +6,19 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::level::OwnerLevel;
+use crate::outcome::Holding;
 use crate::wire::{self, Hello, Reply, refusal, serving, status};
 use crate::{
-    Activation, AppId, Builder, Claim, ElevatedOwner, Guard, Ineligible, Kind, Level, Mode,
+    Activation, AppId, Builder, Claim, ElevatedOwner, Exclusive, Guard, Ineligible, Kind, Level,
     OwnerInfo, Payload, Reason, Rights, Started, sys,
 };
 
 /// Between attempts while the owner starts, is busy or quits.
 const RETRY: Duration = Duration::from_millis(50);
-/// A `Separate` launch that finds the lock held looks again for this long,
-/// so a `hand_off` or `probe` testing the lock isn't taken for an owner.
-const SEPARATE_RETRY: Duration = Duration::from_millis(50);
+/// An exclusive run that takes no guard, and finds the lock held, looks
+/// again for this long, so a `hand_off` or `probe` testing the lock isn't
+/// taken for an owner.
+const LOCK_RETRY: Duration = Duration::from_millis(50);
 /// A launch that holds the lock and finds the guard held looks again for
 /// this long. An owner that exits lets go of its lock a moment before its
 /// guard, and a launch that takes the lock in between must not take the
@@ -261,6 +263,17 @@ fn ineligible(
     if kind == Kind::Windowed && windows == Some(false) {
         return Some(Ineligible::NoWindows);
     }
+    ineligible_rights(policy, raised, above_normal)
+}
+
+/// [`ineligible`] for its rights alone: why a launch may not own, or hold
+/// the state with `exclusive`, under `policy`, if it may not. An exclusive
+/// run serves no launches, so it needs no windows.
+fn ineligible_rights(
+    policy: ElevatedOwner,
+    raised: bool,
+    above_normal: bool,
+) -> Option<Ineligible> {
     match policy {
         ElevatedOwner::Allow => None,
         _ if raised => Some(Ineligible::Raised),
@@ -288,9 +301,6 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
     if let Some(why) = may_not_own {
         // It never takes the lock, nor creates the folder: it hands off as
         // `hand_off` does, or runs alone at once.
-        if b.mode == Mode::Separate {
-            return Started::Alone(Reason::MayNotOwn { why });
-        }
         return match hand_off(b, Some(payload)) {
             Ok(info) => Started::HandedOff(info),
             Err(Reason::NoOwner {}) => Started::Alone(Reason::MayNotOwn { why }),
@@ -346,18 +356,6 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
         // deadline.
         if let Some(w) = waiting.filter(|_| past(deadline)) {
             return Started::Alone(w.reason(began.elapsed()));
-        }
-        if b.mode == Mode::Separate {
-            let until = Instant::now() + SEPARATE_RETRY;
-            while Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(5));
-                match try_own(&folder) {
-                    Ok(Some(lock)) => return own(b, place, folder, lock, state, key),
-                    Ok(None) => {}
-                    Err(reason) => return Started::Alone(reason),
-                }
-            }
-            return Started::Alone(Reason::OwnerRunning {});
         }
         let at = match meet_owner(&folder, limits.level, false) {
             Meet::Talk(at) => at,
@@ -423,28 +421,33 @@ fn own<T>(
 }
 
 /// For a launch that holds the lock: creates the canonical `state` folder
-/// when it is missing, whatever the guard, then takes its guard. A folder
-/// that can't be made gives [`Reason::Lock`], naming it.
+/// when it is missing, whatever the guard, then takes its guard, shared
+/// for a keyed owner, so keyed owners of one state folder hold it side by
+/// side, and otherwise alone. `None` when no guard is taken: see [`Guard`].
 fn take_state(b: &Builder, state: Option<&Path>) -> Result<Option<sys::Guard>, Reason> {
-    if let Some(state) = state {
-        sys::make_state_dir(state).map_err(|source| Reason::Lock {
-            path: state.to_owned(),
-            source,
-        })?;
-    }
-    take_guard(b, state)
-}
-
-/// Takes the guard of the canonical `state` folder, which exists, for a
-/// launch that holds the lock: shared for a keyed owner, so keyed owners of
-/// one state folder hold it side by side, and otherwise exclusive. `None`
-/// when no guard is taken: see [`Guard`]. Still held after
-/// [`GUARD_RETRY`], it gives [`Reason::StateInUse`].
-fn take_guard(b: &Builder, state: Option<&Path>) -> Result<Option<sys::Guard>, Reason> {
-    let Some(state) = state.filter(|_| b.guard == Guard::Local) else {
+    let Some(state) = state else {
         return Ok(None);
     };
-    let shared = b.scope.is_some();
+    make_state(state)?;
+    if b.guard != Guard::Local {
+        return Ok(None);
+    }
+    take_guard(state, b.scope.is_some())
+}
+
+/// Creates the canonical `state` folder when it is missing. One that can't
+/// be made gives [`Reason::Lock`], naming it.
+fn make_state(state: &Path) -> Result<(), Reason> {
+    sys::make_state_dir(state).map_err(|source| Reason::Lock {
+        path: state.to_owned(),
+        source,
+    })
+}
+
+/// Takes the guard of the canonical `state` folder, which exists: `shared`
+/// or alone. `None` where the guard is skipped: see [`Guard::Local`].
+/// Still held after [`GUARD_RETRY`], it gives [`Reason::StateInUse`].
+fn take_guard(state: &Path, shared: bool) -> Result<Option<sys::Guard>, Reason> {
     let until = Instant::now() + GUARD_RETRY;
     loop {
         match sys::take_guard(state, shared) {
@@ -456,11 +459,71 @@ fn take_guard(b: &Builder, state: Option<&Path>) -> Result<Option<sys::Guard>, R
     }
 }
 
-fn try_own(folder: &sys::Folder) -> Result<Option<sys::Lock>, Reason> {
-    folder.lock().map_err(|source| Reason::Lock {
-        path: folder.lock_path(),
-        source,
-    })
+pub(crate) fn exclusive(b: &Builder) -> Result<Exclusive, Reason> {
+    if !sys::SUPPORTED {
+        return Err(Reason::Unsupported {});
+    }
+    let may_not_own = ineligible_rights(b.elevated_owner, sys::raised(), sys::above_normal());
+    exclusive_as(b, may_not_own)
+}
+
+/// `exclusive` for a launch that may hold the state, or that may not, and
+/// why. It takes the guard alone, whatever the scope, and nothing else. It
+/// takes the lock in the runtime folder instead, with nothing listening,
+/// where it takes no guard: for no state folder, under [`Guard::Off`], or
+/// where [`Guard::Local`] skips it.
+fn exclusive_as(b: &Builder, may_not_own: Option<Ineligible>) -> Result<Exclusive, Reason> {
+    if let Some(why) = may_not_own {
+        return Err(Reason::MayNotOwn { why });
+    }
+    let state = b.canonical_state();
+    // Before anything is created, as for `start`.
+    if let Some(path) = state.as_deref().and_then(crate::state::foreign) {
+        return Err(Reason::ForeignState { path });
+    }
+    if let Some(dir) = state.as_deref().filter(|_| b.guard == Guard::Local) {
+        make_state(dir)?;
+        if let Some(guard) = take_guard(dir, false)? {
+            return Ok(Exclusive::new(state, Holding::Guard(guard)));
+        }
+    }
+    let place = b.place(state.as_deref())?;
+    let (folder, lock) = lock_alone(&place)?;
+    // As `start` makes it once it holds the lock. Where the guard was
+    // skipped, it is made already, and left as it is.
+    if let Some(dir) = state.as_deref() {
+        make_state(dir)?;
+    }
+    Ok(Exclusive::new(state, Holding::Lock(folder, lock)))
+}
+
+/// Opens the runtime folder at `place`, making it if it is missing, and
+/// takes its lock for an exclusive run, looking again for [`LOCK_RETRY`].
+/// Still held, it gives [`Reason::StateInUse`], naming the lock file.
+fn lock_alone(place: &sys::Place) -> Result<(sys::Folder, sys::Lock), Reason> {
+    let open = || sys::open_folder(place, true)?.ok_or(Reason::NoRuntimeDir {});
+    let mut folder = open()?;
+    let until = Instant::now() + LOCK_RETRY;
+    loop {
+        match folder.lock() {
+            Ok(Some(lock)) => return Ok((folder, lock)),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                return Err(Reason::StateInUse {
+                    path: folder.lock_path(),
+                });
+            }
+            // The folder was deleted under this run (a cleaner, `rm`): open
+            // it afresh and keep going, as `start` does.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => folder = open()?,
+            Err(source) => {
+                return Err(Reason::Lock {
+                    path: folder.lock_path(),
+                    source,
+                });
+            }
+        }
+    }
 }
 
 /// `hand_off` with a payload, `probe` without one.
@@ -1175,6 +1238,15 @@ mod tests {
                 "{policy:?} {raised} {above}"
             );
         }
+        // An exclusive run serves no launches, so only its rights count,
+        // whatever the app's kind and its windows.
+        for ((policy, raised, above), why) in rows {
+            assert_eq!(
+                ineligible_rights(policy, raised, above),
+                why,
+                "{policy:?} {raised} {above}"
+            );
+        }
     }
 
     // What a launch does about the owner, by the level the owner's marker
@@ -1271,7 +1343,8 @@ mod tests {
 
     // A launch told it may not own never takes the lock or makes the
     // folder. It hands off to an owner that is running, and otherwise runs
-    // alone.
+    // alone. An exclusive run told so fails at once, beside an owner or
+    // not, and makes nothing either.
     #[cfg(any(unix, windows))]
     #[test]
     fn a_launch_that_may_not_own_hands_off_or_runs_alone() {
@@ -1293,7 +1366,15 @@ mod tests {
 
         let why = may_not_own(start_as(&b, &Args::default(), raised));
         assert_eq!(why, Ineligible::Raised);
-        assert!(!run.exists());
+        let state = tmp.path().join("state");
+        let held = Builder::new(AppId::headless("test.gate"), state.as_path()).dir(&run);
+        for b in [&b, &held] {
+            match exclusive_as(b, raised) {
+                Err(Reason::MayNotOwn { why }) => assert_eq!(why, Ineligible::Raised),
+                other => panic!("expected MayNotOwn: {other:?}"),
+            }
+        }
+        assert!(!run.exists() && !state.exists());
 
         let (tx, rx) = std::sync::mpsc::channel();
         let owner = own(start_as(&b, &Args::default(), None)).serve(move |r| tx.send(r).is_ok());
@@ -1304,9 +1385,11 @@ mod tests {
         }
         let got = rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(got.payload(), &sent);
-        // A separate launch never hands off.
-        let separate = b.clone().mode(Mode::Separate);
-        may_not_own(start_as(&separate, &Args::default(), raised));
+        // An exclusive run never hands off.
+        assert!(matches!(
+            exclusive_as(&b, raised),
+            Err(Reason::MayNotOwn { .. })
+        ));
 
         // The folder stays, with nobody holding its lock.
         owner.release();

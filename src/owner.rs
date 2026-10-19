@@ -93,7 +93,8 @@ impl<T> Claim<T> {
     /// Hold the lock but turn every later launch away at once
     /// ([`Reason::Declined`]). For self-tests, scripted runs and debug
     /// builds that may own the app's state when nothing else does, but must
-    /// not receive the user's launches.
+    /// not receive the user's launches. Work that never serves can hold the
+    /// state with [`Builder::exclusive`] instead, which starts no thread.
     ///
     /// [`Reason::Declined`]: crate::Reason::Declined
     pub fn decline_all(mut self) -> Owner {
@@ -107,11 +108,13 @@ impl<T> Claim<T> {
 
     /// The state folder given to [`Builder::new`], with its links resolved
     /// as [`State::dir`] says, or `None` for [`State::none`]. Write the
-    /// state through this path, and only while this process owns the app:
-    /// a launch that runs alone gets no `state_dir`.
+    /// state through this path, and only while this process owns the app,
+    /// or holds it with an [`Exclusive`]: a launch that runs alone gets no
+    /// `state_dir`.
     ///
     /// [`State::dir`]: crate::State::dir
     /// [`State::none`]: crate::State::none
+    /// [`Exclusive`]: crate::Exclusive
     pub fn state_dir(&self) -> Option<&Path> {
         self.state.as_deref()
     }

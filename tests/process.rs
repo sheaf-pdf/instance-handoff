@@ -9,7 +9,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use instance_handoff::{AppId, Args, Builder, Claim, Kind, Mode, Reason, Started, State};
+use instance_handoff::{AppId, Args, Builder, Claim, Kind, Reason, Started, State};
 
 const APP: AppId = AppId::headless("test.process");
 const ROLE: &str = "INSTANCE_HANDOFF_TEST_ROLE";
@@ -34,30 +34,60 @@ fn owner_process() {
     serve(claim, true);
 }
 
-/// Not a test: an owner that waits its turn. It tries `start` until it
-/// owns, printing `waiting` once it has found the lock held, then serves.
-/// Its launches are separate: while it waits they run alone, and hand
-/// nothing to the owner before it.
+/// Not a test: an owner that waits its turn. It probes until nobody holds
+/// the lock, printing `waiting` once it has found it held, then tries
+/// `start`, and serves once it owns. A probe hands nothing over, and a
+/// start finds no owner it could hand off to: the one before it is gone,
+/// and a launch that took the lock meanwhile never serves.
 #[test]
 fn next_owner_process() {
     if std::env::var_os(ROLE).is_none() {
         return;
     }
     let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
-    let builder = Builder::new(APP, state(&dir)).dir(dir).mode(Mode::Separate);
+    let builder = Builder::new(APP, state(&dir)).dir(dir);
+    let probe = builder.clone().timeout(Duration::from_millis(100));
     let mut waiting = false;
     let claim = loop {
+        match probe.probe() {
+            Err(Reason::NoOwner { .. }) => {}
+            _ => {
+                if !waiting {
+                    say("waiting");
+                    waiting = true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        }
         match builder.start(&Args::default()) {
             Started::Owner(claim) => break claim,
-            Started::Alone(Reason::OwnerRunning { .. }) if !waiting => {
-                say("waiting");
-                waiting = true;
-            }
-            Started::Alone(Reason::OwnerRunning { .. }) => {}
-            other => panic!("child: {other:?}"),
+            Started::HandedOff(info) => panic!("child: handed off to {info}"),
+            Started::Alone(_) => {}
         }
     };
     serve(claim, false);
+}
+
+/// Not a test: an exclusive run of the state folder. It prints `held` once
+/// it holds it, or why it couldn't. It holds it until its stdin closes,
+/// then releases it and prints `released`.
+#[test]
+fn exclusive_process() {
+    if std::env::var_os(ROLE).is_none() {
+        return;
+    }
+    let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
+    match Builder::new(APP, state(&dir)).dir(dir).exclusive() {
+        Ok(held) => {
+            say("held");
+            let mut rest = String::new();
+            let _ = std::io::stdin().read_line(&mut rest);
+            held.release();
+            say("released");
+        }
+        Err(reason) => say(&format!("failed: {reason:?}")),
+    }
 }
 
 /// Not a test: an owner that forks after `start`, before it serves. The
@@ -423,20 +453,31 @@ fn a_launch_of_the_other_kind_is_refused_at_once() {
 
 /// Not a test: a launch of `APP` as a windowed app, which
 /// `windowed_launch` starts with the display it is given. It serves if it
-/// owns, and otherwise prints how it started.
+/// owns, and otherwise prints how it started. When ROLE is `exclusive`, it
+/// is an exclusive run instead: it prints `exclusive` and `held`, releasing
+/// the state folder at once, or why it failed.
 #[cfg(target_os = "linux")]
 #[test]
 fn windowed_launch_process() {
-    if std::env::var_os(ROLE).is_none() {
+    let Some(role) = std::env::var_os(ROLE) else {
         return;
-    }
+    };
     let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
     let app = AppId::parse(APP.as_str(), Kind::Windowed).unwrap();
-    match Builder::new(app, state(&dir))
+    let builder = Builder::new(app, state(&dir))
         .dir(dir)
-        .timeout(Duration::from_secs(20))
-        .start(&Args::new(["windowed"]))
-    {
+        .timeout(Duration::from_secs(20));
+    if role == "exclusive" {
+        match builder.exclusive() {
+            Ok(held) => {
+                say("exclusive held");
+                held.release();
+            }
+            Err(reason) => say(&format!("exclusive failed: {reason:?}")),
+        }
+        return;
+    }
+    match builder.start(&Args::new(["windowed"])) {
         Started::Owner(claim) => serve(claim, false),
         Started::HandedOff(info) => say(&format!(
             "handed to {:?}, confirmed {}",
@@ -447,11 +488,11 @@ fn windowed_launch_process() {
     }
 }
 
-/// A `windowed_launch_process` whose only display variable is `DISPLAY`
-/// set to `display`, or which has none.
+/// A `windowed_launch_process` in `role`, `windowed` or `exclusive`, whose
+/// only display variable is `DISPLAY` set to `display`, or which has none.
 #[cfg(target_os = "linux")]
-fn windowed_launch(dir: &Path, display: Option<&str>) -> Owner {
-    let mut command = Owner::command(dir, "windowed_launch_process", "windowed");
+fn windowed_launch(dir: &Path, role: &str, display: Option<&str>) -> Owner {
+    let mut command = Owner::command(dir, "windowed_launch_process", role);
     command.env_remove("WAYLAND_DISPLAY").env_remove("DISPLAY");
     if let Some(display) = display {
         command.env("DISPLAY", display);
@@ -462,13 +503,14 @@ fn windowed_launch(dir: &Path, display: Option<&str>) -> Owner {
 // Only a launch that can show windows owns a windowed app: on Linux, one
 // with a display variable. One without runs alone at once, creating
 // nothing, or hands off to the owner. No display server is needed, since
-// nothing connects to it.
+// nothing connects to it. An exclusive run serves no launches, so one
+// without a display variable still holds the state folder.
 #[cfg(target_os = "linux")]
 #[test]
 fn only_a_launch_that_can_show_windows_owns_a_windowed_app() {
     let (_tmp, dir) = dir();
     let t = Instant::now();
-    let alone = windowed_launch(&dir, None);
+    let alone = windowed_launch(&dir, "windowed", None);
     assert_eq!(
         alone.said("alone: ", Duration::from_secs(10)).as_deref(),
         Some("MayNotOwn { why: NoWindows }")
@@ -476,10 +518,18 @@ fn only_a_launch_that_can_show_windows_owns_a_windowed_app() {
     // Child included, well inside its 20 second timeout.
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     assert!(!dir.exists());
+    let held = windowed_launch(&dir, "exclusive", None);
+    assert_eq!(
+        held.said("exclusive ", Duration::from_secs(10)).as_deref(),
+        Some("held")
+    );
+    // It made the state folder, and no runtime folder.
+    assert!(dir.with_file_name("state").is_dir() && !dir.exists());
+    drop(held);
 
-    let owner = windowed_launch(&dir, Some(":99"));
+    let owner = windowed_launch(&dir, "windowed", Some(":99"));
     owner.wait_for("ready");
-    let launch = windowed_launch(&dir, None);
+    let launch = windowed_launch(&dir, "windowed", None);
     assert_eq!(
         launch.said("handed to ", Duration::from_secs(10)),
         Some(format!("{:?}, confirmed true", Some(owner.pid())))
@@ -699,6 +749,43 @@ fn a_stopped_owner_never_delivers_a_launch_that_ran_alone() {
     );
 }
 
+// An exclusive run in another process holds the state folder: a start is
+// told at once, well inside its timeout, and lets go of the lock it took.
+// Once the run releases it, the launch owns. An exclusive run beside an
+// owner in another process fails, naming the guard.
+#[test]
+fn an_exclusive_run_in_another_process_is_reported_at_once() {
+    let (_tmp, dir) = dir();
+    let builder = Builder::new(APP, state(&dir))
+        .dir(&dir)
+        .timeout(Duration::from_secs(10));
+    let mut held = Owner::spawn(&dir, "exclusive_process", "exclusive");
+    held.wait_for("held");
+    let t = Instant::now();
+    let reason = match builder.start(&Args::new(["x"])) {
+        Started::Alone(reason) => reason,
+        other => panic!("{other:?}"),
+    };
+    assert!(matches!(reason, Reason::StateInUse { .. }), "{reason}");
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    let reason = builder.probe().unwrap_err();
+    assert!(matches!(reason, Reason::NoOwner { .. }), "{reason}");
+    drop(held.stdin.take());
+    held.wait_for("released");
+    match builder.start(&Args::default()) {
+        Started::Owner(claim) => claim.release(),
+        other => panic!("{other:?}"),
+    }
+
+    let _owner = Owner::start(&dir);
+    let refused = Owner::spawn(&dir, "exclusive_process", "exclusive");
+    let failed = refused.said("failed: ", Duration::from_secs(10)).unwrap();
+    assert!(
+        failed.starts_with("StateInUse") && failed.ends_with(r#".instance-handoff.lock" }"#),
+        "{failed}"
+    );
+}
+
 // Another process owns the state folder from another runtime folder: a
 // launch is told at once, well inside its timeout, and nothing reaches the
 // owner.
@@ -884,16 +971,14 @@ fn a_fork_child_leaves_the_lock_to_its_parent(role: &str) {
         owner.took(Duration::from_secs(5)).as_deref(),
         Some(hex(b"x").as_str())
     );
-    // The lock is still held: a launch that won't hand off can't own.
-    let reason = match Builder::new(APP, state(&dir))
+    // The lock is still held: an exclusive run that takes it, with no
+    // guard, can't.
+    let reason = Builder::new(APP, state(&dir))
         .dir(&dir)
-        .mode(Mode::Separate)
-        .start(&Args::default())
-    {
-        Started::Alone(reason) => reason,
-        other => panic!("{other:?}"),
-    };
-    assert!(matches!(reason, Reason::OwnerRunning { .. }), "{reason}");
+        .guard(instance_handoff::Guard::Off)
+        .exclusive()
+        .unwrap_err();
+    assert!(matches!(reason, Reason::StateInUse { .. }), "{reason}");
     // And so is the guard: a launch in another runtime folder finds the
     // state folder in use.
     let reason = match Builder::new(APP, state(&dir))

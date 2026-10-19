@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::server::Upkeep;
-use crate::{AppId, OwnerInfo, Payload, Reason, Started, launch, naming, state, sys};
+use crate::{AppId, Exclusive, OwnerInfo, Payload, Reason, Started, launch, naming, state, sys};
 
 /// The folder an app keeps its state in: the files only the owner writes.
 /// [`Builder::new`] takes it, and the owner reports it, with its links
@@ -67,28 +67,6 @@ impl From<&Path> for State {
     }
 }
 
-/// What a launch does when another process owns the app.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum Mode {
-    /// Become the owner, or hand the payload to the owner.
-    #[default]
-    Join,
-    /// Become the owner if nobody is; otherwise run alone
-    /// ([`Reason::OwnerRunning`]) without contacting the owner. For
-    /// `--new-instance` flags, self-tests, scripted runs and debug builds.
-    ///
-    /// A separate launch that finds nobody becomes the owner. Serve it with
-    /// [`Claim::decline_all`] if it must not receive the user's launches.
-    /// One that may not own runs alone at once with [`Reason::MayNotOwn`],
-    /// and one that takes the lock but finds the state folder's
-    /// [guard](Guard) held by an owner it can't share it with runs alone
-    /// with [`Reason::StateInUse`].
-    ///
-    /// [`Claim::decline_all`]: crate::Claim::decline_all
-    Separate,
-}
-
 /// Whether the owner takes the state folder's guard: see
 /// [`Builder::guard`].
 ///
@@ -107,22 +85,31 @@ pub enum Mode {
 /// runtime folders, but never beside an owner without one: whichever of
 /// the two comes second runs alone with [`Reason::StateInUse`].
 ///
-/// `start` makes the guard file in the state folder, which it has created
-/// if it was missing (see [`Builder::new`]): on Unix with mode 0600, and on
-/// Windows with an access list for the user and SYSTEM and a medium label,
-/// so that every integrity level can lock it. The file is never written.
+/// [`Builder::exclusive`] takes the guard alone, with a scope or without,
+/// and no lock in a runtime folder. So it keeps out every owner and every
+/// other exclusive run that takes the guard, wherever their runtime
+/// folders are.
+///
+/// `start` and `exclusive` make the guard file in the state folder, which
+/// they have created if it was missing (see [`Builder::new`]): on Unix with
+/// mode 0600, and on Windows with an access list for the user and SYSTEM
+/// and a medium label, so that every integrity level can lock it. The file
+/// is never written.
 /// Like the lock, the guard is held until the process exits, or until
 /// [`Owner::release`] or [`Claim::release`] gives both up, and a child
-/// forked from the owner holds it too until it exits. On Windows, while
-/// the owner holds it, the file can't be removed, nor the state folder
+/// forked from the owner holds it too until it exits. An exclusive run
+/// holds it only until its [`Exclusive`] is dropped. On Windows, while
+/// the guard is held, the file can't be removed, nor the state folder
 /// renamed or removed.
 ///
 /// No guard is taken, and no guard file made, under [`Guard::Off`] and for
 /// [`State::none`]. Nor is one held on a network file system, or where the
 /// file system can't lock files: see [`Guard::Local`].
 /// An owner that holds none doesn't keep out launches in other runtime
-/// folders, with a scope or without. [`Claim::guarded`] says
-/// whether the owner holds it.
+/// folders, with a scope or without, nor an exclusive run that takes the
+/// guard. [`Claim::guarded`] says whether the owner holds it. An exclusive
+/// run that can't take the guard takes the lock in its runtime folder
+/// instead.
 ///
 /// [`Owner::release`]: crate::Owner::release
 /// [`Claim::release`]: crate::Claim::release
@@ -159,8 +146,10 @@ pub enum Guard {
     Local,
     /// Take no guard, and make no guard file. A missing state folder is
     /// still made. Owners of the folder in two runtime folders then run
-    /// side by side. For config that is read-only or shared, and for a
-    /// folder that a sync tool copies between machines.
+    /// side by side. An [exclusive](Builder::exclusive) run takes the lock
+    /// in its runtime folder instead, so only an owner, or another
+    /// exclusive run, there keeps it out. For config that is read-only or
+    /// shared, and for a folder that a sync tool copies between machines.
     Off,
 }
 
@@ -170,7 +159,9 @@ pub enum Guard {
 /// A launch that may not own never takes the lock. It hands off to the
 /// owner if one is running, and otherwise runs alone at once with
 /// [`Reason::MayNotOwn`]. This only keeps launches from owning: it never
-/// lets one hand off where it otherwise couldn't.
+/// lets one hand off where it otherwise couldn't. It also says who may
+/// hold the state with [`Builder::exclusive`], which otherwise fails at
+/// once with [`Reason::MayNotOwn`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ElevatedOwner {
@@ -202,17 +193,17 @@ pub enum ElevatedOwner {
 /// ```
 /// use std::path::Path;
 /// use std::time::Duration;
-/// use instance_handoff::{AppId, Builder, Mode};
+/// use instance_handoff::{AppId, Builder};
 ///
 /// const APP: AppId = AppId::windowed("org.example.Viewer");
 ///
 /// // `data` is the folder the viewer keeps its state in.
 /// fn builder(data: &Path) -> Builder {
-///     Builder::new(APP, data).mode(Mode::Separate).timeout(Duration::from_secs(1))
+///     Builder::new(APP, data).timeout(Duration::from_secs(1))
 /// }
 /// # let _ = builder;
 /// ```
-#[must_use = "a Builder does nothing until `start`, `hand_off` or `probe`"]
+#[must_use = "a Builder does nothing until `start`, `hand_off`, `probe` or `exclusive`"]
 #[derive(Debug, Clone)]
 pub struct Builder {
     pub(crate) app_id: AppId,
@@ -220,7 +211,6 @@ pub struct Builder {
     pub(crate) scope: Option<OsString>,
     dir: Option<PathBuf>,
     pub(crate) guard: Guard,
-    pub(crate) mode: Mode,
     pub(crate) elevated_owner: ElevatedOwner,
     pub(crate) timeout: Duration,
     pub(crate) payload_version: u32,
@@ -230,9 +220,8 @@ pub struct Builder {
 impl Builder {
     /// A builder for `app_id`, whose state is in `state` ([`State::dir`]),
     /// or which keeps none ([`State::none`]). The defaults: the default
-    /// runtime folder, [`Guard::Local`], [`Mode::Join`],
-    /// [`ElevatedOwner::NotRaised`], a 5 second timeout and payload version
-    /// 0.
+    /// runtime folder, [`Guard::Local`], [`ElevatedOwner::NotRaised`], a 5
+    /// second timeout and payload version 0.
     ///
     /// Launches of `app_id` that name one state folder, through whatever
     /// links, and one [scope](Builder::scope) meet one owner. Launches that
@@ -245,10 +234,11 @@ impl Builder {
     /// of that state folder. Owners with a scope share the guard with one
     /// another, never with an owner without one.
     ///
-    /// Before [`start`](Builder::start) creates anything, it checks whose
-    /// the state folder is, or, while it is missing, whose the nearest
-    /// folder above it is. If that folder belongs to another user, the
-    /// launch runs alone with [`Reason::ForeignState`]. That catches root
+    /// Before [`start`](Builder::start) or [`exclusive`](Builder::exclusive)
+    /// creates anything, it checks whose the state folder is, or, while it
+    /// is missing, whose the nearest folder above it is. If that folder
+    /// belongs to another user, the launch runs alone, or `exclusive`
+    /// fails, with [`Reason::ForeignState`]. That catches root
     /// given the user's home by macOS `sudo`, `sudo -E` or `su -m`, and the
     /// separate account that Windows administrator protection elevates to,
     /// given the user's `%APPDATA%`.
@@ -266,10 +256,11 @@ impl Builder {
     /// nothing there, and don't check.
     ///
     /// Once it holds the lock, `start` creates the state folder if it is
-    /// missing, with the folders above it, whatever the [guard](Guard). The
-    /// last one is private: mode 0700 on Unix, and on Windows an access list
-    /// for the user and SYSTEM alone, which what is made in it inherits.
-    /// One that can't be made gives [`Reason::Lock`].
+    /// missing, with the folders above it, whatever the [guard](Guard).
+    /// `exclusive` does so before it takes the guard. The last one is
+    /// private: mode 0700 on Unix, and on Windows an access list for the
+    /// user and SYSTEM alone, which what is made in it inherits. One that
+    /// can't be made gives [`Reason::Lock`].
     pub fn new(app_id: AppId, state: impl Into<State>) -> Builder {
         Builder {
             app_id,
@@ -277,7 +268,6 @@ impl Builder {
             scope: None,
             dir: None,
             guard: Guard::Local,
-            mode: Mode::Join,
             elevated_owner: ElevatedOwner::NotRaised,
             timeout: Duration::from_secs(5),
             payload_version: 0,
@@ -296,7 +286,9 @@ impl Builder {
     /// without one holds it alone: while it runs, a launch with a scope that
     /// would own runs alone with [`Reason::StateInUse`], and while owners
     /// with scopes run, so does a launch without one. So pass a scope to
-    /// every launch of a state folder, or to none.
+    /// every launch of a state folder, or to none. An
+    /// [exclusive](Builder::exclusive) run holds the guard alone, whatever
+    /// its scope.
     ///
     /// The scope is a key, compared byte for byte, not a path: `cfg`,
     /// `./cfg/` and a symlink to it are three scopes, and a relative path
@@ -343,22 +335,17 @@ impl Builder {
     }
 
     /// Whether the owner takes the state folder's guard: see [`Guard`].
-    /// Defaults to [`Guard::Local`]. Only `start` takes the guard, so
-    /// `hand_off` and `probe` don't look at it.
+    /// Defaults to [`Guard::Local`]. Only `start` and `exclusive` take the
+    /// guard, so `hand_off` and `probe` don't look at it.
     pub fn guard(mut self, guard: Guard) -> Builder {
         self.guard = guard;
         self
     }
 
-    /// See [`Mode`]. Defaults to [`Mode::Join`].
-    pub fn mode(mut self, mode: Mode) -> Builder {
-        self.mode = mode;
-        self
-    }
-
     /// Which launches with raised rights may become the owner when nobody
-    /// is: see [`ElevatedOwner`]. Defaults to [`ElevatedOwner::NotRaised`].
-    /// Only `start` can own, so `hand_off` and `probe` don't look at it.
+    /// is, or hold the state with `exclusive`: see [`ElevatedOwner`].
+    /// Defaults to [`ElevatedOwner::NotRaised`]. `hand_off` and `probe`
+    /// never own, so they don't look at it.
     pub fn elevated_owner(mut self, policy: ElevatedOwner) -> Builder {
         self.elevated_owner = policy;
         self
@@ -468,8 +455,7 @@ impl Builder {
     /// Hand `payload` to the owner, and never become one: with nobody
     /// running, fail at once with [`Reason::NoOwner`]. For command-line
     /// front ends (`app --remote open x`, `appctl reload`) that only make
-    /// sense against a running app. Creates no folder and no lock. Ignores
-    /// [`Builder::mode`].
+    /// sense against a running app. Creates no folder and no lock.
     pub fn hand_off<T: Payload>(&self, payload: &T) -> Result<OwnerInfo, Reason> {
         launch::hand_off(self, Some(payload))
     }
@@ -489,8 +475,66 @@ impl Builder {
     /// once, with its [level](OwnerInfo::level) and
     /// [`OwnerInfo::confirmed`] false. While each level has its own folder,
     /// a probe finds none (see the crate docs on privileges). Creates no
-    /// folder and no lock. Ignores [`Builder::mode`].
+    /// folder and no lock.
     pub fn probe(&self) -> Result<OwnerInfo, Reason> {
         launch::hand_off::<()>(self, None)
+    }
+
+    /// Hold the state folder for this process's own work, without becoming
+    /// the owner: for batch subcommands, migrations, cron jobs, CI steps and
+    /// `--new-instance` flags. Nothing is handed off, and no launch can
+    /// reach this process. Write the state through
+    /// [`Exclusive::state_dir`], and only while the `Exclusive` is held.
+    /// Dropping it releases the state folder at once, unlike a
+    /// [`Claim`](crate::Claim) or an [`Owner`](crate::Owner), which keep
+    /// the lock until the process exits.
+    ///
+    /// ```no_run
+    /// use std::path::Path;
+    /// use instance_handoff::{AppId, Builder, Reason};
+    ///
+    /// const APP: AppId = AppId::windowed("org.example.Viewer");
+    /// # fn rewrite_library(_: &Path) {}
+    ///
+    /// fn migrate(data: &Path) -> Result<(), Reason> {
+    ///     let held = Builder::new(APP, data).exclusive()?;
+    ///     if let Some(dir) = held.state_dir() {
+    ///         rewrite_library(dir);
+    ///     }
+    ///     held.release();
+    ///     Ok(())
+    /// }
+    /// # let _ = migrate;
+    /// ```
+    ///
+    /// It takes the state folder's [guard](Guard) alone, with a
+    /// [scope](Builder::scope) or without, and no lock in a runtime folder,
+    /// so it behaves the same whoever is logged in. It fails at once with
+    /// [`Reason::StateInUse`] while an owner of the state folder, with a
+    /// scope or without, or another exclusive run holds the guard, and
+    /// while it holds the guard, a `start` that would own runs alone with
+    /// [`Reason::StateInUse`]. Like `start`, it checks whose the state
+    /// folder is first ([`Reason::ForeignState`]), and creates it if it is
+    /// missing (see [`Builder::new`]).
+    ///
+    /// An owner that holds no guard, as under [`Guard::Off`], doesn't keep
+    /// out an exclusive run that holds one. Where `exclusive` takes no
+    /// guard itself, for [`State::none`], under [`Guard::Off`], on a network
+    /// file system or where the file system can't lock files (see
+    /// [`Guard::Local`]), it takes the lock in the runtime folder instead,
+    /// as an owner would, but serves nothing. Then it fails with
+    /// [`Reason::StateInUse`] while an owner, or another exclusive run, of
+    /// that runtime folder holds the lock. While it holds the lock,
+    /// launches there find nobody serving, and run alone, or fail, with
+    /// [`Reason::Unresponsive`] at their timeout.
+    ///
+    /// A launch that may not own under [`Builder::elevated_owner`] fails at
+    /// once with [`Reason::MayNotOwn`]. A [windowed](crate::Kind::Windowed)
+    /// app's exclusive run needs no windows, since it serves no launches.
+    ///
+    /// Never waits for the state folder to come free, whatever the
+    /// [timeout](Builder::timeout). Creates no thread. Never panics.
+    pub fn exclusive(&self) -> Result<Exclusive, Reason> {
+        launch::exclusive(self)
     }
 }
