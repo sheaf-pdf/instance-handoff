@@ -1870,23 +1870,32 @@ mod tests {
         }
     }
 
-    // SUBST needs no elevation, so this runs at high and at medium. A
-    // mapping is per logon session; the final path is what every session
-    // sees.
+    // SUBST needs no elevation. A mapping is per logon session; the final
+    // path is what every session sees. CI's medium token shares the
+    // elevated runner's logon session and couldn't map a letter there, so
+    // the test skips where no letter maps; the high run covers it.
     #[test]
     fn a_subst_letter_becomes_the_real_drive() {
         let tmp = tempfile::tempdir().unwrap();
+        let mut refused = String::new();
         let subst = ('Q'..='Z')
             .filter(|l| !Path::new(&format!(r"{l}:\")).exists())
             .find_map(|l| {
-                let made = std::process::Command::new("subst")
+                let out = std::process::Command::new("subst")
                     .arg(format!("{l}:"))
                     .arg(tmp.path())
-                    .status()
+                    .output()
                     .unwrap();
-                made.success().then_some(Subst(l))
-            })
-            .expect("no free drive letter from Q to Z");
+                if !out.status.success() {
+                    refused = String::from_utf8_lossy(&out.stdout).trim().to_owned()
+                        + String::from_utf8_lossy(&out.stderr).trim();
+                }
+                out.status.success().then_some(Subst(l))
+            });
+        let Some(subst) = subst else {
+            eprintln!("skipped: subst mapped no letter from Q to Z: {refused}");
+            return;
+        };
         let root = PathBuf::from(format!(r"{}:\", subst.0));
         let real = final_path(tmp.path()).unwrap();
         assert_eq!(final_path(&root).unwrap(), real);
