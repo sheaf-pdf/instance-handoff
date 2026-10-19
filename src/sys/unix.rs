@@ -1239,12 +1239,19 @@ pub(crate) struct Guard(#[allow(dead_code)] OwnedFd);
 /// Each owner opens the file afresh, so its lock is its own: a second
 /// `flock` on one open file would only convert the first.
 /// [`Reason::StateInUse`] when another owner holds it in a mode that
-/// conflicts. `None` where the file system can't lock files: the owner
-/// goes unguarded.
+/// conflicts. `None` on a network file system, or where the file system
+/// can't lock files: the owner goes unguarded.
 pub(crate) fn take_guard(state: &Path, shared: bool) -> Result<Option<Guard>, Reason> {
     let path = state.join(naming::GUARD_FILE);
     let fd = match open_guard(state) {
-        Ok(fd) => fd,
+        Ok(Some(fd)) => fd,
+        Ok(None) => {
+            log::debug!(
+                "instance-handoff: {} is on a network file system, so this owner holds no guard",
+                state.display()
+            );
+            return Ok(None);
+        }
         Err(source) => return Err(Reason::Lock { path, source }),
     };
     let op = if shared { libc::LOCK_SH } else { libc::LOCK_EX };
@@ -1265,9 +1272,22 @@ pub(crate) fn take_guard(state: &Path, shared: bool) -> Result<Option<Guard>, Re
 /// Opens the guard file in `state`, creating it. Read-only, since `flock`
 /// needs no more on a local disk, so a guard file that exists can be
 /// locked in a folder that is read-only. Non-blocking, so a FIFO in its
-/// place can't hold the launch up.
-fn open_guard(state: &Path) -> io::Result<OwnedFd> {
+/// place can't hold the launch up. `None`, with nothing made, when `state`
+/// is on a network file system.
+fn open_guard(state: &Path) -> io::Result<Option<OwnedFd>> {
+    open_guard_with(state, is_network)
+}
+
+/// [`open_guard`], asking `network` whether the folder is on a network
+/// file system, so a test can say it is.
+fn open_guard_with(
+    state: &Path,
+    network: fn(BorrowedFd<'_>) -> bool,
+) -> io::Result<Option<OwnedFd>> {
     let dir = open_dir(None, state, true)?;
+    if network(dir.as_fd()) {
+        return Ok(None);
+    }
     let c = cstr(OsStr::new(naming::GUARD_FILE))?;
     let flags =
         libc::O_RDONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
@@ -1282,7 +1302,7 @@ fn open_guard(state: &Path) -> io::Result<OwnedFd> {
     if owner_mode(fd.as_fd())?.0 != euid() {
         return Err(denied("owned by another user"));
     }
-    Ok(fd)
+    Ok(Some(fd))
 }
 
 /// Whether `e`, from `flock` on the guard file [`open_guard`] just opened,
@@ -1296,6 +1316,113 @@ fn locks_unsupported(e: &io::Error) -> bool {
     e.raw_os_error().is_some_and(|code| {
         [libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOTSUP, libc::EBADF].contains(&code)
     })
+}
+
+/// Whether the folder open as `fd` is on a network file system, which
+/// [`Guard::Local`](crate::Guard::Local) leaves unguarded. One whose file
+/// system can't be read counts as local, and the lock decides.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn is_network(fd: BorrowedFd<'_>) -> bool {
+    // On 32-bit targets glibc's fstatfs fails with EOVERFLOW when a volume
+    // has more than 2^32 blocks or files, as a large share can. Its
+    // fstatfs64 can't, and on 64-bit targets it is the same call. musl and
+    // bionic count in 64 bits everywhere.
+    #[cfg(not(target_env = "gnu"))]
+    use libc::{fstatfs, statfs};
+    #[cfg(target_env = "gnu")]
+    use libc::{fstatfs64 as fstatfs, statfs64 as statfs};
+    // SAFETY: statfs is plain data; fstatfs fills it in.
+    let mut st: statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open, and `st` is valid for writes.
+    if unsafe { fstatfs(fd.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    // Its type differs by architecture and C library (signed or unsigned,
+    // 32 or 64 bits), but the magic numbers are 32 bits.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = st.f_type as u32;
+    network_magic(magic)
+}
+
+/// macOS and these BSDs mark each local file system `MNT_LOCAL`. The
+/// flags' type, and the constant's, differ on each.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd"
+))]
+#[allow(clippy::unnecessary_cast)]
+fn is_network(fd: BorrowedFd<'_>) -> bool {
+    // SAFETY: statfs is plain data; fstatfs fills it in.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open, and `st` is valid for writes.
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    st.f_flags as u64 & libc::MNT_LOCAL as u64 == 0
+}
+
+/// NetBSD has no `fstatfs`, but its `fstatvfs` gives the mount flags.
+#[cfg(target_os = "netbsd")]
+fn is_network(fd: BorrowedFd<'_>) -> bool {
+    // SAFETY: statvfs is plain data; fstatvfs fills it in.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open, and `st` is valid for writes.
+    if unsafe { libc::fstatvfs(fd.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    st.f_flag & libc::MNT_LOCAL as libc::c_ulong == 0
+}
+
+/// illumos marks no file system local, so this goes by its type's name.
+/// Each NFS version is a file system type of its own there.
+#[cfg(target_os = "illumos")]
+fn is_network(fd: BorrowedFd<'_>) -> bool {
+    // SAFETY: statvfs is plain data; fstatvfs fills it in.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open, and `st` is valid for writes.
+    if unsafe { libc::fstatvfs(fd.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let name = st.f_basetype.map(|c| c as u8);
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    network_type_name(&name[..len])
+}
+
+/// Whether a file system type Linux reports from `statfs` is a network or
+/// cluster file system: one whose locks reach other hosts, or that another
+/// machine serves. FUSE counts as local, whatever serves it. The numbers
+/// are from linux/magic.h and the file systems' sources, written out here
+/// since libc lacks some and gives the rest a type that differs by
+/// architecture.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn network_magic(magic: u32) -> bool {
+    const NETWORK: [u32; 14] = [
+        0x6969,      // NFS
+        0x517b,      // SMB
+        0xfe53_4d42, // SMB2
+        0xff53_4d42, // CIFS
+        0x0102_1997, // 9P
+        0x5346_414f, // AFS
+        0x6b41_4653, // kAFS
+        0x00c3_6400, // Ceph
+        0x7375_7245, // Coda
+        0x564c,      // NCP
+        0x0bd0_0bd0, // Lustre
+        0x0116_1970, // GFS2
+        0x7461_636f, // OCFS2
+        0x786f_4256, // vboxsf
+    ];
+    NETWORK.contains(&magic)
+}
+
+/// Whether a file system type illumos names in `statvfs` is a network one:
+/// NFS, which names its version 3 and 4 mounts `nfs3` and `nfs4`, or SMB.
+#[cfg(any(target_os = "illumos", test))]
+fn network_type_name(name: &[u8]) -> bool {
+    matches!(name, b"nfs" | b"nfs3" | b"nfs4" | b"smbfs")
 }
 
 // ---------------------------------------------------------------------------
@@ -2403,6 +2530,106 @@ mod tests {
         }
         for code in [libc::EACCES, libc::EROFS, libc::EIO] {
             assert!(!locks_unsupported(&error(code)), "{code}");
+        }
+    }
+
+    // A state folder on a network file system gets no guard, and no guard
+    // file is made in it.
+    #[test]
+    fn network_file_systems_go_unguarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join(".instance-handoff.lock");
+        assert!(open_guard_with(tmp.path(), |_| true).unwrap().is_none());
+        assert!(!file.exists());
+        assert!(open_guard_with(tmp.path(), |_| false).unwrap().is_some());
+        assert!(file.exists());
+    }
+
+    // The guard tests need a temporary folder to count as local. This asks
+    // directly, so macOS checks MNT_LOCAL itself.
+    #[test]
+    fn a_temporary_folder_is_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = open_dir(None, tmp.path(), true).unwrap();
+        assert!(!is_network(dir.as_fd()));
+    }
+
+    // The numbers Linux reports for network and cluster file systems, from
+    // linux/magic.h, and some local ones. FUSE is local, whatever serves
+    // it. WSL 2 mounts the Windows drives as 9p.
+    #[test]
+    fn network_file_systems_are_known_by_magic_number() {
+        let network = [
+            ("nfs", 0x6969),
+            ("smb", 0x517b),
+            ("smb2", 0xfe53_4d42),
+            ("cifs", 0xff53_4d42),
+            ("9p", 0x0102_1997),
+            ("afs", 0x5346_414f),
+            ("kafs", 0x6b41_4653),
+            ("ceph", 0x00c3_6400),
+            ("coda", 0x7375_7245),
+            ("ncp", 0x564c),
+            ("lustre", 0x0bd0_0bd0),
+            ("gfs2", 0x0116_1970),
+            ("ocfs2", 0x7461_636f),
+            ("vboxsf", 0x786f_4256),
+        ];
+        for (name, magic) in network {
+            assert!(network_magic(magic), "{name}");
+        }
+        let local = [
+            ("ext4", 0xef53),
+            ("btrfs", 0x9123_683e),
+            ("xfs", 0x5846_5342),
+            ("tmpfs", 0x0102_1994),
+            ("overlay", 0x794c_7630),
+            ("zfs", 0x2fc1_2fc1),
+            ("fuse", 0x6573_5546),
+        ];
+        for (name, magic) in local {
+            assert!(!network_magic(magic), "{name}");
+        }
+    }
+
+    // The same numbers as libc has them, where it has them, so a typo
+    // copied into both lists above can't pass.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn the_magic_numbers_match_libc() {
+        let network = [
+            libc::NFS_SUPER_MAGIC,
+            libc::SMB_SUPER_MAGIC,
+            libc::AFS_SUPER_MAGIC,
+            libc::CODA_SUPER_MAGIC,
+            libc::NCP_SUPER_MAGIC,
+            libc::OCFS2_SUPER_MAGIC,
+        ];
+        for magic in network {
+            assert!(network_magic(magic as u32), "{magic:#x}");
+        }
+        let local = [
+            libc::EXT4_SUPER_MAGIC,
+            libc::BTRFS_SUPER_MAGIC,
+            libc::XFS_SUPER_MAGIC,
+            libc::TMPFS_MAGIC,
+            libc::OVERLAYFS_SUPER_MAGIC,
+            libc::FUSE_SUPER_MAGIC,
+        ];
+        for magic in local {
+            assert!(!network_magic(magic as u32), "{magic:#x}");
+        }
+    }
+
+    // illumos names its network file systems, NFS once for each version.
+    #[test]
+    fn illumos_network_file_systems_are_known_by_name() {
+        for name in ["nfs", "nfs3", "nfs4", "smbfs"] {
+            assert!(network_type_name(name.as_bytes()), "{name}");
+        }
+        for name in ["zfs", "ufs", "tmpfs", "lofs", ""] {
+            assert!(!network_type_name(name.as_bytes()), "{name}");
         }
     }
 

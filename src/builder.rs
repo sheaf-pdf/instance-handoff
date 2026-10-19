@@ -113,9 +113,10 @@ pub enum Mode {
 /// child forked from the owner holds it too until it exits.
 ///
 /// No guard is taken, and no guard file made, under [`Guard::Off`], for
-/// [`State::none`], and on Windows. Nor is one held where the file system
-/// can't lock files. An owner that holds none doesn't keep out launches in
-/// other runtime folders, with a scope or without. [`Claim::guarded`] says
+/// [`State::none`], and on Windows. Nor is one held on a network file
+/// system, or where the file system can't lock files: see [`Guard::Local`].
+/// An owner that holds none doesn't keep out launches in other runtime
+/// folders, with a scope or without. [`Claim::guarded`] says
 /// whether the owner holds it.
 ///
 /// [`Owner::release`]: crate::Owner::release
@@ -124,14 +125,30 @@ pub enum Mode {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Guard {
-    /// Take the guard. One that can't be made or opened gives
-    /// [`Reason::Lock`]: the state folder is read-only, say, or the guard
-    /// file is another user's.
+    /// Take the guard on a local disk. One that can't be made or opened
+    /// gives [`Reason::Lock`]: the state folder is read-only, say, or the
+    /// guard file is another user's.
+    ///
+    /// On a network file system the owner takes no guard and makes no
+    /// guard file. A lock there would reach every host that mounts it, and
+    /// one held by a host that crashed can stay held. So each host keeps an
+    /// owner of its own. On Linux that means NFS, SMB and CIFS, 9p (as WSL
+    /// 2 mounts the Windows drives), AFS, Ceph, Coda, NCP, Lustre, GFS2,
+    /// OCFS2 and VirtualBox shared folders, but not FUSE, whatever serves
+    /// it. On macOS and the BSDs it means a file system not marked
+    /// `MNT_LOCAL`, and on illumos NFS and SMB.
+    ///
+    /// Where the file system can't lock files (`ENOLCK` or `EOPNOTSUPP`),
+    /// the owner holds no guard either. Either way [`Claim::guarded`] is
+    /// false.
+    ///
+    /// [`Claim::guarded`]: crate::Claim::guarded
     #[default]
     Local,
     /// Take no guard, and make no guard file. A missing state folder is
     /// still made. Owners of the folder in two runtime folders then run
-    /// side by side.
+    /// side by side. For config that is read-only or shared, and for a
+    /// folder that a sync tool copies between machines.
     Off,
 }
 

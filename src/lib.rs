@@ -195,8 +195,11 @@
 //! from owning the state beside the first: it runs alone at once with
 //! [`Reason::StateInUse`]. Owners with a [scope](Builder::scope) take the
 //! guard shared, so they own one state folder side by side, but never
-//! beside an owner without one. A `start` that takes the lock makes the
-//! state folder first if it is missing, whether or not it takes the guard.
+//! beside an owner without one. On a network file system the owner takes
+//! no guard, so each host keeps an owner of its own. Nor does it where the
+//! file system can't lock files: see [`Guard::Local`]. A `start` that takes
+//! the lock makes the state folder first if it is missing, whether or not
+//! it takes the guard.
 //! Windows owners take no guard, and make nothing in the state folder.
 //!
 //! # Privileges
@@ -290,10 +293,12 @@
 //!   shared mounts may name other files there. A container without systemd
 //!   uses its own `/tmp`, and root in a container usually its own `/run`,
 //!   so its launches and the host's can't reach each other's owner.
-//!   Whichever owns a state folder they share first holds its guard, and
-//!   the other's launches run alone with [`Reason::StateInUse`]. To have
-//!   them meet instead, pass the bind-mounted folder to [`Builder::dir`] in
-//!   both, with a state folder both see at one path. For one owner per
+//!   On a local disk, whichever owns a state folder they share first holds
+//!   its guard, and the other's launches run alone with
+//!   [`Reason::StateInUse`]. On a network file system neither takes the
+//!   guard, so each owns (see [`Guard::Local`]). To have them meet
+//!   instead, pass the bind-mounted folder to [`Builder::dir`] in both,
+//!   with a state folder both see at one path. For one owner per
 //!   container, give the launches in each container, and the host's, a
 //!   [scope](Builder::scope) of their own, such as the container's name:
 //!   owners with scopes share the guard, so the app must keep their writes
