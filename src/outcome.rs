@@ -292,9 +292,13 @@ pub enum Excluded {
     /// ids back to its real ones isn't excluded, though its saved ids may
     /// let it take its rights back.
     SetId,
-    /// On Windows, its token is below medium integrity, in an AppContainer,
-    /// or restricted. No launch gets this yet: the crate docs on privileges
-    /// say what a launch below medium gets.
+    /// On Windows, a sandbox confines it: its token is below medium
+    /// integrity, an AppContainer's, or restricted, with restricting SIDs
+    /// that access checks must pass as well. The sandbox keeps it from
+    /// what its user may do, so it must neither hand its requests to the
+    /// user's owner nor own for launches outside the sandbox. A Basic User
+    /// token, as `runas /trustlevel:0x20000` gives, is at medium and has no
+    /// restricting SIDs, so it isn't excluded.
     Sandboxed,
 }
 
@@ -475,8 +479,10 @@ pub enum Reason {
     },
     /// This process may take no part at all: on Unix, one whose real and
     /// effective user or group ids differ, as a setuid or setgid program's
-    /// do while it runs with its rights. It neither owns nor hands off, nor
-    /// holds the state with [`Builder::exclusive`]. [`Builder::start`],
+    /// do while it runs with its rights, and on Windows, one that a sandbox
+    /// confines, below medium integrity, in an AppContainer or with a
+    /// restricted token. It neither owns nor hands off, nor holds the state
+    /// with [`Builder::exclusive`]. [`Builder::start`],
     /// [`Builder::hand_off`], [`Builder::probe`] and `exclusive` return
     /// this at once, before they look for an owner or make anything. See
     /// the crate docs on privileges.

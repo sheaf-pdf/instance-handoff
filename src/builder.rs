@@ -480,8 +480,8 @@ impl Builder {
     /// [windowed](crate::Kind::Windowed) app's launch that can't show
     /// windows, or one with raised rights ([`Builder::elevated_owner`]). A
     /// process that may take no part at all, as a setuid or setgid program
-    /// that runs with its rights, does neither, and runs alone at once with
-    /// [`Reason::Excluded`].
+    /// that runs with its rights, or on Windows one in a sandbox, does
+    /// neither, and runs alone at once with [`Reason::Excluded`].
     ///
     /// Blocks for at most the [timeout](Builder::timeout) plus the greater
     /// of the timeout and one second, and usually for a few milliseconds. `payload` is encoded only if it is
@@ -593,11 +593,12 @@ impl Builder {
     /// and is answered at once (see the crate docs on privileges).
     ///
     /// A process that may take no part at all, as a setuid or setgid
-    /// program that runs with its rights, fails at once with
-    /// [`Reason::Excluded`], before anything else is checked. A launch that
-    /// may not own under [`Builder::elevated_owner`] fails at once with
-    /// [`Reason::MayNotOwn`]. A [windowed](crate::Kind::Windowed) app's
-    /// exclusive run needs no windows, since it serves no launches.
+    /// program that runs with its rights, or on Windows one in a sandbox,
+    /// fails at once with [`Reason::Excluded`], before anything else is
+    /// checked. A launch that may not own under [`Builder::elevated_owner`]
+    /// fails at once with [`Reason::MayNotOwn`]. A
+    /// [windowed](crate::Kind::Windowed) app's exclusive run needs no
+    /// windows, since it serves no launches.
     ///
     /// Never waits for the state folder to come free, whatever the
     /// [timeout](Builder::timeout). Creates no thread. Never panics.

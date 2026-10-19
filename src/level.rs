@@ -16,7 +16,9 @@ use std::fmt;
 pub struct Level(u32);
 
 impl Level {
-    /// Low (`0x1000`), below a normal process, as some sandboxes run.
+    /// Low (`0x1000`), below a normal process, as some sandboxes run. A
+    /// process below medium takes no part
+    /// ([`Excluded::Sandboxed`](crate::Excluded::Sandboxed)).
     pub const LOW: Level = Level(0x1000);
     /// Medium (`0x2000`): a normal process.
     pub const MEDIUM: Level = Level(0x2000);

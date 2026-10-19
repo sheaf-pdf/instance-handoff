@@ -4,8 +4,9 @@
 //! medium: GitHub's Windows runner is one (an administrator with UAC off).
 //! The children get the Basic User token that `runas /trustlevel:0x20000`
 //! uses: the same user, with Administrators deny-only, no admin privileges
-//! and medium integrity, as an unelevated launch has. Real UAC (a split
-//! token, consent, Windows `sudo`) needs a machine with UAC on. Below high
+//! and medium integrity, as an unelevated launch has. One test lowers that
+//! token to low instead, as a sandbox runs. Real UAC (a split token,
+//! consent, Windows `sudo`) needs a machine with UAC on. Below high
 //! integrity, each test returns at once.
 //!
 //! A child is this binary run for one of the `child_*` tests, which do
@@ -26,7 +27,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use instance_handoff::{
-    AppId, Args, Builder, Claim, Kind, Level, Payload, Reason, Rights, Started, State,
+    AppId, Args, Builder, Claim, ElevatedOwner, Kind, Level, Payload, Reason, Rights, Started,
+    State,
 };
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_NO_SUCH_LOGON_SESSION, GENERIC_READ,
@@ -81,6 +83,7 @@ const DIR: &str = "INSTANCE_HANDOFF_LEVELS_DIR";
 /// The state folder a child launches with. Without it, `State::none()`.
 const STATE: &str = "INSTANCE_HANDOFF_LEVELS_STATE";
 
+const LOW: u32 = 0x1000;
 const MEDIUM: u32 = 0x2000;
 const HIGH: u32 = 0x3000;
 /// The byte a proposed state lock would hold, after 0015.
@@ -416,6 +419,42 @@ fn the_guard_holds_across_levels() {
     assert!(!rest.iter().any(|l| l.starts_with("took ")), "{rest:?}");
 }
 
+// A launch below medium takes no part. Beside a serving owner, a child at
+// low runs alone at once with Excluded, before it looks for its folder,
+// where it used to fail later with RuntimeDir. Its hand_off, probe and
+// exclusive fail with Excluded at once too. The owner takes nothing.
+#[test]
+fn a_low_launch_is_excluded() {
+    if !elevated() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("dir");
+    // Allowed any rights, so that it owns at high with UAC on too.
+    let claim = claim(
+        Builder::new(APP, State::none())
+            .dir(&dir)
+            .elevated_owner(ElevatedOwner::Allow)
+            .start(&Args::default()),
+    );
+    let (tx, rx) = mpsc::channel();
+    let owner = claim.serve(move |r| tx.send(r).is_ok());
+
+    let id = APP;
+    let env = [(ID, OsStr::new(id.as_str())), (DIR, dir.as_os_str())];
+    let mut child = spawn_at(LOW, "child_every_call", &env);
+    let excluded = "Excluded { why: Sandboxed }";
+    for call in ["start", "hand_off", "probe", "exclusive"] {
+        let how = if call == "start" { "alone" } else { "err" };
+        let line = child.expect(&format!("{call} "));
+        assert_eq!(line, format!("{how} {excluded}"), "{call}");
+        assert_quick(&child, &format!("{call} elapsed "));
+    }
+    child.finish();
+    assert!(rx.try_recv().is_err(), "the owner took a low launch");
+    owner.release();
+}
+
 /// A medium owner identifies a high launch from its token, though the
 /// launch connects for identification only, and refuses it at once with
 /// PRIVILEGE and its own level. The crate's own launches at high read the
@@ -679,6 +718,46 @@ fn child_launch() {
         Err(reason) => println!("probe err {reason:?}"),
     }
     println!("probe elapsed {ms}");
+}
+
+/// Calls start, hand_off, probe and exclusive in turn, and prints how each
+/// ended, as `<call> <outcome>`, then how long it took, as `<call> elapsed
+/// <ms>`.
+#[test]
+fn child_every_call() {
+    if !is_role("child_every_call") {
+        return;
+    }
+    let b = child_builder();
+    let args = Args::new(["from-child"]);
+    let report = |call: &str, t: Instant, outcome: String| {
+        let ms = t.elapsed().as_millis();
+        println!("{call} {outcome}");
+        println!("{call} elapsed {ms}");
+    };
+    let t = Instant::now();
+    let started = b.start(&args);
+    report("start", t, describe(&started));
+    if let Started::Owner(claim) = started {
+        claim.release();
+    }
+    let t = Instant::now();
+    let handed = b.hand_off(&args);
+    report("hand_off", t, ended(&handed));
+    let t = Instant::now();
+    let probed = b.probe();
+    report("probe", t, ended(&probed));
+    let t = Instant::now();
+    let held = b.exclusive();
+    report("exclusive", t, ended(&held));
+}
+
+/// How a call that may fail ended, as `ok` or `err <reason>`.
+fn ended<T>(result: &Result<T, Reason>) -> String {
+    match result {
+        Ok(_) => "ok".to_owned(),
+        Err(reason) => format!("err {reason:?}"),
+    }
 }
 
 /// Reports its token, and tries what high made in the probe's folder.
@@ -1556,7 +1635,7 @@ fn try_key(key: &Path, who: &str, facts: &mut Vec<(String, String)>) {
 }
 
 // ---------------------------------------------------------------------------
-// Starting a child at medium
+// Starting a child at another level
 // ---------------------------------------------------------------------------
 
 /// Spawns one child at a time: a child's ends of its pipes are inheritable
@@ -1615,10 +1694,16 @@ impl Drop for Child {
 }
 
 /// Runs this test binary as the child `role` at medium, with `env` added
-/// to this process's environment. Panics unless the child's token really
-/// is at medium before it starts.
+/// to this process's environment.
 fn medium(role: &str, env: &[(&str, &OsStr)]) -> Child {
-    let token = medium_token();
+    spawn_at(MEDIUM, role, env)
+}
+
+/// Runs this test binary as the child `role` at the integrity level `rid`,
+/// with `env` added to this process's environment. Panics unless the
+/// child's token really is at that level before it starts.
+fn spawn_at(rid: u32, role: &str, env: &[(&str, &OsStr)]) -> Child {
+    let token = token_at(rid);
     let mut cmd = OsString::from("\"");
     cmd.push(std::env::current_exe().unwrap());
     cmd.push(format!("\" --exact {role} --nocapture --test-threads=1 -q"));
@@ -1677,16 +1762,18 @@ fn medium(role: &str, env: &[(&str, &OsStr)]) -> Child {
     let child_token = unsafe { OwnedHandle::from_raw_handle(child_token) };
     let level = token_level(child_token.as_raw_handle());
     assert_eq!(
-        level, MEDIUM,
-        "the child would run at {level:#x}, not medium"
+        level, rid,
+        "the child would run at {level:#x}, not {rid:#x}"
     );
     // SAFETY: the child's main thread, suspended.
     unsafe { ResumeThread(thread.as_raw_handle()) };
     child
 }
 
-/// This user's Basic User token, at medium integrity.
-fn medium_token() -> OwnedHandle {
+/// This user's Basic User token, at the integrity level `rid`, which must
+/// not be above that token's own level, medium: a token's level can be
+/// lowered here, not raised.
+fn token_at(rid: u32) -> OwnedHandle {
     let mut level = null_mut();
     // SAFETY: `level` receives a handle, closed below.
     let ok = unsafe {
@@ -1706,8 +1793,8 @@ fn medium_token() -> OwnedHandle {
     unsafe { SaferCloseLevel(level) };
     assert_ne!(ok, 0, "SaferComputeTokenFromLevel: {err}");
     let token = unsafe { OwnedHandle::from_raw_handle(token) };
-    if token_level(token.as_raw_handle()) != MEDIUM {
-        let text = wide(OsStr::new("S-1-16-8192"));
+    if token_level(token.as_raw_handle()) != rid {
+        let text = wide(OsStr::new(&format!("S-1-16-{rid}")));
         let mut sid = null_mut();
         // SAFETY: a NUL-terminated string; `sid` receives a LocalAlloc'd SID.
         let ok = unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) };

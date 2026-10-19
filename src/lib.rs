@@ -286,9 +286,15 @@
 //!   launch talks to an owner at its own level, or below it when it hands
 //!   down, through that folder, and checks that the folder and the owner's
 //!   pipe are labelled at the level the lock shows, refusing another with
-//!   [`Reason::Peer`]. Below medium (low integrity, AppContainer), launches
-//!   can't make or open their folder and run alone with
-//!   [`Reason::RuntimeDir`].
+//!   [`Reason::Peer`]. A process that a sandbox confines takes no part at
+//!   all: one below medium (low integrity), in an AppContainer, or with a
+//!   restricted token, which has restricting SIDs. The sandbox keeps it
+//!   from what its user may do, so it must neither reach the user's owner
+//!   nor own for launches outside the sandbox. Its launches run alone at
+//!   once with [`Reason::Excluded`], and [`Builder::hand_off`],
+//!   [`Builder::probe`] and [`Builder::exclusive`] fail with it. A Basic
+//!   User token, as `runas /trustlevel:0x20000` gives, is at medium and has
+//!   no restricting SIDs, so it takes part.
 //!
 //! The crate never decides whether a request may do without its launch's
 //! rights: the app, or its user, does. On Windows, a launch from an
@@ -390,7 +396,8 @@
 //! - Windows: mapped drives and `SUBST` letters belong to one logon
 //!   session, and every logon session of a user (a second RDP session, an
 //!   OpenSSH login, a scheduled task) finds the same owner, at any
-//!   integrity level. Hand off canonical paths when that matters.
+//!   integrity level from medium up: a process that a sandbox confines
+//!   takes no part. Hand off canonical paths when that matters.
 //!
 //! # Windowed apps
 //!

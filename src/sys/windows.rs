@@ -15,6 +15,10 @@
 //! labelled at that level, so lower levels can neither read the pipe's
 //! name nor replace it.
 //!
+//! A process that a sandbox confines takes no part at all: one whose token
+//! is below medium integrity, an AppContainer's, or one with restricting
+//! SIDs. It neither owns nor hands off, and looks for no folder.
+//!
 //! A launch refuses a Local AppData that resolves into the profiles folder
 //! (`C:\Users`) but outside its user's profile (into another user's
 //! profile or Public, say): its folders would sit where another user keeps
@@ -128,8 +132,9 @@ use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, GetSidSubAuthority,
     GetSidSubAuthorityCount, GetTokenInformation, IsWellKnownSid, LABEL_SECURITY_INFORMATION,
     OWNER_SECURITY_INFORMATION, PSID, RevertToSelf, SECURITY_ATTRIBUTES, TOKEN_MANDATORY_LABEL,
-    TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenSessionId, TokenUser,
-    WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid, WinCreatorOwnerSid, WinLocalSystemSid,
+    TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenIsAppContainer, TokenRestrictedSids,
+    TokenSessionId, TokenUser, WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid,
+    WinCreatorOwnerSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, DELETE, FILE_ADD_FILE,
@@ -265,12 +270,24 @@ fn token_info(token: HANDLE, class: i32) -> io::Result<Vec<u64>> {
     let mut len = 0;
     // SAFETY: a size query; nothing is written.
     unsafe { GetTokenInformation(token, class, null_mut(), 0, &mut len) };
+    // At least one word, so that a class of a u32 fits even when the size
+    // query gives no size.
     let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
-    // SAFETY: `buf` holds `len` bytes, aligned for the structures it holds.
-    if unsafe { GetTokenInformation(token, class, buf.as_mut_ptr().cast(), len, &mut len) } == 0 {
+    let size = (buf.len() * 8) as u32;
+    // SAFETY: `buf` holds `size` bytes, aligned for the structures it
+    // holds.
+    if unsafe { GetTokenInformation(token, class, buf.as_mut_ptr().cast(), size, &mut len) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(buf)
+}
+
+/// A token's information of one class that is a u32, or starts with one.
+fn token_u32(token: HANDLE, class: i32) -> io::Result<u32> {
+    let info = token_info(token, class)?;
+    // SAFETY: the buffer holds at least one word, aligned for a u32, and
+    // starts with the class's information.
+    Ok(unsafe { *(info.as_ptr() as *const u32) })
 }
 
 fn identity(token: HANDLE) -> io::Result<Identity> {
@@ -298,9 +315,39 @@ fn identity(token: HANDLE) -> io::Result<Identity> {
     Ok(id)
 }
 
-/// This process's user and integrity level.
-fn me() -> io::Result<&'static Identity> {
-    static ME: OnceLock<Result<Identity, i32>> = OnceLock::new();
+/// What a sandbox may have done to a token besides lowering its integrity
+/// level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sandbox {
+    /// Whether it is an AppContainer's token.
+    app_container: bool,
+    /// Whether it has restricting SIDs, as `CreateRestrictedToken` adds and
+    /// `IsTokenRestricted` reports. Access checks must pass for them as
+    /// well, or in a write-restricted token, the checks for writing.
+    restricted: bool,
+}
+
+/// Whether `token` is an AppContainer's, and whether it has restricting
+/// SIDs. Only this process's own token is read so: an owner doesn't ask
+/// it of a client (call 7.8).
+fn sandbox(token: HANDLE) -> io::Result<Sandbox> {
+    Ok(Sandbox {
+        app_container: token_u32(token, TokenIsAppContainer)? != 0,
+        // A TOKEN_GROUPS, which starts with its count.
+        restricted: token_u32(token, TokenRestrictedSids)? != 0,
+    })
+}
+
+/// This process's token, as read once.
+struct Me {
+    id: Identity,
+    sandbox: Sandbox,
+}
+
+/// This process's user and integrity level, and what a sandbox did to its
+/// token. If any of them can't be read, none is (call 7.8).
+fn mine() -> io::Result<&'static Me> {
+    static ME: OnceLock<Result<Me, i32>> = OnceLock::new();
     let me = ME.get_or_init(|| {
         let mut token: HANDLE = null_mut();
         // SAFETY: the current-process pseudo handle; `token` receives a
@@ -309,10 +356,19 @@ fn me() -> io::Result<&'static Identity> {
             return Err(io::Error::last_os_error().raw_os_error().unwrap_or(0));
         }
         let token = unsafe { OwnedHandle::from_raw_handle(token) };
-        identity(token.as_raw_handle()).map_err(|e| e.raw_os_error().unwrap_or(0))
+        let raw = token.as_raw_handle();
+        match (identity(raw), sandbox(raw)) {
+            (Ok(id), Ok(sandbox)) => Ok(Me { id, sandbox }),
+            (Err(e), _) | (_, Err(e)) => Err(e.raw_os_error().unwrap_or(0)),
+        }
     });
     me.as_ref()
         .map_err(|&code| io::Error::from_raw_os_error(code))
+}
+
+/// This process's user and integrity level.
+fn me() -> io::Result<&'static Identity> {
+    mine().map(|me| &me.id)
 }
 
 /// Whether this launch's rights were raised from a login. Elevation isn't
@@ -329,10 +385,24 @@ pub(crate) fn above_normal() -> bool {
     false
 }
 
-/// Why this process may take no part, if it may not. Sandboxed tokens
-/// aren't read here yet, so no process is excluded.
+/// Why a process whose token has this integrity level and `sandbox` may
+/// take no part, if it may not: a sandbox confines it. It runs below
+/// medium integrity (at low, as every AppContainer does, or untrusted), in
+/// an AppContainer, or with restricting SIDs. A Basic User token, which
+/// SAFER makes as `runas /trustlevel:0x20000` does, is at medium and has
+/// none, so it takes part.
+fn excluded_from(integrity: u32, sandbox: Sandbox) -> Option<crate::Excluded> {
+    (integrity < MEDIUM || sandbox.app_container || sandbox.restricted)
+        .then_some(crate::Excluded::Sandboxed)
+}
+
+/// Why this process may take no part, if it may not. A process that can't
+/// read its own token isn't excluded here: every check that needs the
+/// token fails instead, so it neither owns nor hands off.
 pub(crate) fn excluded() -> Option<crate::Excluded> {
-    None
+    mine()
+        .ok()
+        .and_then(|me| excluded_from(me.id.integrity, me.sandbox))
 }
 
 /// This process's integrity level, or `None` when its token can't be
@@ -1287,8 +1357,8 @@ impl Folder {
     /// `MARKER_RETRY`, byte 0 is given back and the answer is `None` too,
     /// so that no launch waits on an owner without a marker. If taking it
     /// fails with an error, byte 0 is given back as well, and the error
-    /// returned. An untrusted process (RID 0) would mark byte 0 itself, so
-    /// its lock fails at once.
+    /// returned. An untrusted process (RID 0), which is excluded before it
+    /// gets here, would mark byte 0 itself, so its lock fails at once.
     pub(crate) fn lock(&self) -> io::Result<Option<Lock>> {
         let marker = level_marker(me()?.integrity);
         if marker == OWNER_BYTE {
@@ -3746,6 +3816,195 @@ mod tests {
             panic!("{station:?}");
         };
         assert_eq!(can_show_windows(), Some(session != 0), "{station:?}");
+    }
+
+    // A token takes part unless a sandbox confines it: below medium, in an
+    // AppContainer, or with restricting SIDs. UIAccess and medium plus are
+    // above medium.
+    #[test]
+    fn sandboxed_tokens_are_excluded() {
+        // (token, integrity, AppContainer, restricted, excluded)
+        let rows = [
+            ("a normal launch", MEDIUM, false, false, false),
+            ("run as administrator", 0x3000, false, false, false),
+            ("a service", 0x4000, false, false, false),
+            ("UIAccess", 0x2010, false, false, false),
+            ("medium plus", 0x2100, false, false, false),
+            ("low", 0x1000, false, false, true),
+            ("untrusted", 0, false, false, true),
+            ("an AppContainer", 0x1000, true, false, true),
+            // Every AppContainer runs at low, but the rule doesn't count on
+            // it.
+            ("an AppContainer read at medium", MEDIUM, true, false, true),
+            ("restricted at medium", MEDIUM, false, true, true),
+            ("restricted at high", 0x3000, false, true, true),
+            ("restricted at low", 0x1000, false, true, true),
+        ];
+        for (token, integrity, app_container, restricted, excluded) in rows {
+            let sandbox = Sandbox {
+                app_container,
+                restricted,
+            };
+            let expected = excluded.then_some(crate::Excluded::Sandboxed);
+            assert_eq!(excluded_from(integrity, sandbox), expected, "{token}");
+        }
+    }
+
+    /// This user's Basic User token, as SAFER makes it for `runas
+    /// /trustlevel:0x20000`, set to the integrity level `rid` if it isn't
+    /// there already. The tests can lower a token's level, not raise it.
+    /// test-at-medium.ps1 and tests/levels.rs run their children with it,
+    /// at medium.
+    fn basic_user_token(rid: u32) -> OwnedHandle {
+        use windows_sys::Win32::Security::AppLocker::{
+            SAFER_LEVEL_OPEN, SAFER_LEVELID_NORMALUSER, SAFER_SCOPEID_USER, SaferCloseLevel,
+            SaferComputeTokenFromLevel, SaferCreateLevel,
+        };
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows_sys::Win32::Security::{SID_AND_ATTRIBUTES, SetTokenInformation};
+        use windows_sys::Win32::System::SystemServices::SE_GROUP_INTEGRITY;
+
+        let mut level = null_mut();
+        // SAFETY: `level` receives a handle, closed below.
+        let ok = unsafe {
+            SaferCreateLevel(
+                SAFER_SCOPEID_USER,
+                SAFER_LEVELID_NORMALUSER,
+                SAFER_LEVEL_OPEN,
+                &mut level,
+                null(),
+            )
+        };
+        assert_ne!(ok, 0, "SaferCreateLevel: {}", io::Error::last_os_error());
+        let mut token = null_mut();
+        // SAFETY: an open level; a null token means this process's, and
+        // `token` receives a handle that `OwnedHandle` closes.
+        let ok =
+            unsafe { SaferComputeTokenFromLevel(level, null_mut(), &mut token, 0, null_mut()) };
+        let err = io::Error::last_os_error();
+        // SAFETY: the level opened above.
+        unsafe { SaferCloseLevel(level) };
+        assert_ne!(ok, 0, "SaferComputeTokenFromLevel: {err}");
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        if identity(token.as_raw_handle()).unwrap().integrity == rid {
+            return token;
+        }
+
+        let text = wide(OsStr::new(&format!("S-1-16-{rid}")));
+        let mut sid: PSID = null_mut();
+        // SAFETY: a NUL-terminated string; `sid` receives a LocalAlloc'd
+        // SID, freed by `Local`.
+        assert_ne!(
+            unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) },
+            0
+        );
+        let _sid = Local(sid);
+        let label = TOKEN_MANDATORY_LABEL {
+            Label: SID_AND_ATTRIBUTES {
+                Sid: sid,
+                Attributes: SE_GROUP_INTEGRITY as u32,
+            },
+        };
+        // SAFETY: a valid SID.
+        let len =
+            std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 + unsafe { GetLengthSid(sid) };
+        // SAFETY: a token from the call above, and a label whose SID stays
+        // valid until the call returns.
+        let ok = unsafe {
+            SetTokenInformation(
+                token.as_raw_handle(),
+                TokenIntegrityLevel,
+                (&label as *const TOKEN_MANDATORY_LABEL).cast(),
+                len,
+            )
+        };
+        assert_ne!(ok, 0, "SetTokenInformation: {}", io::Error::last_os_error());
+        token
+    }
+
+    /// A copy of `token` with this user's SID as its one restricting SID,
+    /// as `CreateRestrictedToken` makes one for a sandbox.
+    fn restricted_copy(token: &OwnedHandle) -> OwnedHandle {
+        use windows_sys::Win32::Security::{CreateRestrictedToken, SID_AND_ATTRIBUTES};
+
+        let restrict = SID_AND_ATTRIBUTES {
+            Sid: me().unwrap().sid(),
+            Attributes: 0,
+        };
+        let mut copy = null_mut();
+        // SAFETY: a token SAFER made, open for duplication; one valid SID
+        // to restrict to; `copy` receives a handle that `OwnedHandle`
+        // closes.
+        let ok = unsafe {
+            CreateRestrictedToken(
+                token.as_raw_handle(),
+                0,
+                0,
+                null(),
+                0,
+                null(),
+                1,
+                &restrict,
+                &mut copy,
+            )
+        };
+        assert_ne!(
+            ok,
+            0,
+            "CreateRestrictedToken: {}",
+            io::Error::last_os_error()
+        );
+        unsafe { OwnedHandle::from_raw_handle(copy) }
+    }
+
+    // The tests' own token takes part, at high as CI's runner runs them
+    // and at medium as test-at-medium.ps1 does, and so does the Basic User
+    // token that script gives them. That token lowered to low, or a copy
+    // of it with a restricting SID, is read as sandboxed. AppContainers
+    // are left to the rule above: making one needs a profile registered
+    // for it.
+    #[test]
+    fn sandboxed_tokens_are_read() {
+        use windows_sys::Win32::Security::IsTokenRestricted;
+
+        let own = mine().unwrap();
+        let own = format!("{:#x} {:?}", own.id.integrity, own.sandbox);
+        assert_eq!(excluded(), None, "{own}");
+
+        // A token's integrity level and what a sandbox did to it.
+        let read = |token: &OwnedHandle| {
+            let token = token.as_raw_handle();
+            (identity(token).unwrap().integrity, sandbox(token).unwrap())
+        };
+        let neither = Sandbox {
+            app_container: false,
+            restricted: false,
+        };
+        let sandboxed = Some(crate::Excluded::Sandboxed);
+
+        let basic = basic_user_token(MEDIUM);
+        let facts = read(&basic);
+        assert_eq!(facts, (MEDIUM, neither));
+        assert_eq!(excluded_from(facts.0, facts.1), None);
+
+        let low = crate::Level::LOW.rid();
+        let facts = read(&basic_user_token(low));
+        assert_eq!(facts, (low, neither));
+        assert_eq!(excluded_from(facts.0, facts.1), sandboxed);
+
+        let restricted = restricted_copy(&basic);
+        let facts = read(&restricted);
+        let only_restricted = Sandbox {
+            restricted: true,
+            ..neither
+        };
+        assert_eq!(facts, (MEDIUM, only_restricted));
+        assert_eq!(excluded_from(facts.0, facts.1), sandboxed);
+        // IsTokenRestricted, which reads the same SIDs, agrees. It returns
+        // 0 for an error as well as for no, so only its yes is certain.
+        // SAFETY: tokens open for query.
+        assert_eq!(unsafe { IsTokenRestricted(basic.as_raw_handle()) }, 0);
+        assert_ne!(unsafe { IsTokenRestricted(restricted.as_raw_handle()) }, 0);
     }
 
     // Whose folders a launch may keep its state in, by owner SID.
