@@ -282,6 +282,32 @@ fn token_info(token: HANDLE, class: i32) -> io::Result<Vec<u64>> {
     Ok(buf)
 }
 
+/// A token's information of a class of a fixed size, read into a `T` of
+/// exactly that size. Some classes, `TokenElevation` and
+/// `TokenElevationType` among them, fail with ERROR_BAD_LENGTH given a
+/// larger buffer, as `token_info` passes.
+fn token_fixed<T: Copy>(token: HANDLE, class: i32) -> io::Result<T> {
+    let mut value = std::mem::MaybeUninit::<T>::zeroed();
+    let mut len = 0;
+    // SAFETY: a token open for query, and `value` is valid for writes of
+    // `size_of::<T>()` bytes, the class's information.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            class,
+            value.as_mut_ptr().cast(),
+            std::mem::size_of::<T>() as u32,
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the call succeeded, so it wrote the class's information, a
+    // `T`, whose every bit pattern is valid for the plain types read so.
+    Ok(unsafe { value.assume_init() })
+}
+
 /// A token's information of one class that is a u32, or starts with one.
 fn token_u32(token: HANDLE, class: i32) -> io::Result<u32> {
     let info = token_info(token, class)?;
@@ -341,26 +367,7 @@ fn sandbox(token: HANDLE) -> io::Result<Sandbox> {
 /// Whether UAC split a token, and if so which half it is. Only this
 /// process's own token is read so: an owner doesn't ask it of a client.
 fn elevation_type(token: HANDLE) -> io::Result<TOKEN_ELEVATION_TYPE> {
-    // Not through `token_info`: this class takes a buffer of its exact
-    // size, and a larger one fails with ERROR_BAD_LENGTH.
-    let mut elevation: TOKEN_ELEVATION_TYPE = 0;
-    let mut len = 0;
-    // SAFETY: a token open for query. The class's information is one
-    // TOKEN_ELEVATION_TYPE, and `elevation` is valid for writes of its
-    // size.
-    let ok = unsafe {
-        GetTokenInformation(
-            token,
-            TokenElevationType,
-            (&mut elevation as *mut TOKEN_ELEVATION_TYPE).cast(),
-            std::mem::size_of::<TOKEN_ELEVATION_TYPE>() as u32,
-            &mut len,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(elevation)
+    token_fixed(token, TokenElevationType)
 }
 
 /// This process's token, as read once.
@@ -4124,9 +4131,9 @@ mod tests {
             Err(e) if e.raw_os_error() == Some(ERROR_NO_SUCH_LOGON_SESSION as i32) => false,
             Err(e) => panic!("TokenLinkedToken: {e}"),
         };
-        let info = token_info(token.as_raw_handle(), TokenElevation).unwrap();
-        // SAFETY: the buffer holds a TOKEN_ELEVATION.
-        let elevated = unsafe { (*(info.as_ptr() as *const TOKEN_ELEVATION)).TokenIsElevated } != 0;
+        let elevation_info: TOKEN_ELEVATION =
+            token_fixed(token.as_raw_handle(), TokenElevation).unwrap();
+        let elevated = elevation_info.TokenIsElevated != 0;
         let facts = format!("type {elevation}, split {split}, elevated {elevated}, {level}");
         assert_eq!(split, elevation != TokenElevationTypeDefault, "{facts}");
         assert_eq!(raised(), split && elevated, "{facts}");
