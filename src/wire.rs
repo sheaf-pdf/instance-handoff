@@ -39,6 +39,8 @@ mod hello {
     pub const PAYLOAD_VERSION: u8 = 4;
     pub const MAX_REQUEST: u8 = 5;
     pub const STATE: u8 = 6;
+    // 7 to 10 are kept for records that come later.
+    pub const FEATURES: u8 = 11;
 }
 
 /// The owner's state, in HELLO.
@@ -46,6 +48,13 @@ pub(crate) mod state {
     pub const TAKING: u8 = 0;
     pub const BUSY: u8 = 1;
     pub const DECLINING: u8 = 2;
+}
+
+/// The owner's features, in HELLO: what it does that older owners didn't.
+pub(crate) mod features {
+    /// It answers every launch it refuses with REPLY REFUSED and the cause,
+    /// and never just closes the connection.
+    pub const REFUSALS: u32 = 1;
 }
 
 /// REQUEST record tags.
@@ -77,7 +86,7 @@ pub(crate) mod status {
     pub const GAVE_UP: u8 = 4;
 }
 
-/// Why an owner refused a REQUEST.
+/// Why an owner refused a launch.
 pub(crate) mod refusal {
     pub const WIRE: u8 = 1;
     pub const APP: u8 = 2;
@@ -86,6 +95,9 @@ pub(crate) mod refusal {
     pub const TOO_LARGE: u8 = 5;
     pub const MALFORMED: u8 = 6;
     pub const UNSUPPORTED: u8 = 7;
+    // 8 PRIVILEGE, 9 SCREEN, 11 STATE and 12 PERSON are kept for later.
+    /// The launch failed the owner's same-user check.
+    pub const PEER: u8 = 10;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +236,8 @@ pub(crate) struct Hello {
     pub(crate) payload_version: u32,
     pub(crate) max_request: u32,
     pub(crate) state: u8,
+    /// [`features`] bits; none from an owner that predates them.
+    pub(crate) features: u32,
 }
 
 impl Hello {
@@ -238,6 +252,7 @@ impl Hello {
             .bytes(hello::PAYLOAD_VERSION, &self.payload_version.to_le_bytes())
             .bytes(hello::MAX_REQUEST, &self.max_request.to_le_bytes())
             .bytes(hello::STATE, &[self.state])
+            .bytes(hello::FEATURES, &self.features.to_le_bytes())
             .finish()
     }
 
@@ -245,7 +260,15 @@ impl Hello {
         use hello::*;
         let r = Records::parse(
             body,
-            &[WIRE, APP, NONCE, PAYLOAD_VERSION, MAX_REQUEST, STATE],
+            &[
+                WIRE,
+                APP,
+                NONCE,
+                PAYLOAD_VERSION,
+                MAX_REQUEST,
+                STATE,
+                FEATURES,
+            ],
         )?;
         let wire: [u8; 4] = r.required(WIRE)?;
         let app_id = std::str::from_utf8(r.get(APP).ok_or(Error::Malformed)?)
@@ -259,6 +282,7 @@ impl Hello {
             payload_version: u32::from_le_bytes(r.required(PAYLOAD_VERSION)?),
             max_request: u32::from_le_bytes(r.required(MAX_REQUEST)?),
             state: r.fixed::<1>(STATE)?.map_or(state::TAKING, |[s]| s),
+            features: r.fixed(FEATURES)?.map_or(0, u32::from_le_bytes),
         })
     }
 }
@@ -446,23 +470,28 @@ mod tests {
             payload_version: 7,
             max_request: MAX_REQUEST,
             state: state::BUSY,
+            features: features::REFUSALS,
         };
         let bytes = hello.encode();
         #[rustfmt::skip]
         assert_eq!(bytes, [
-            b'I', b'H', b'N', b'D', 1, 52, 0, 0, 0,
+            b'I', b'H', b'N', b'D', 1, 61, 0, 0, 0,
             1, 4, 0, 0, 0, 1, 0, 1, 0,
             2, 1, 0, 0, 0, b'a',
             3, 8, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1,
             4, 4, 0, 0, 0, 7, 0, 0, 0,
             5, 4, 0, 0, 0, 0, 0, 0x40, 0,
             6, 1, 0, 0, 0, 1,
+            11, 4, 0, 0, 0, 1, 0, 0, 0,
         ]);
         let (kind, body, used) = split(&bytes, SMALL).unwrap().unwrap();
         assert_eq!((kind, used), (HELLO, bytes.len()));
         assert_eq!(Hello::decode(body).unwrap(), hello);
         // The other states, which the bytes above don't show.
         assert_eq!((state::TAKING, state::DECLINING), (0, 2));
+        // An owner from before FEATURES has none.
+        let old = Hello::decode(&body[..body.len() - 9]).unwrap();
+        assert_eq!(old.features, 0);
     }
 
     #[test]
@@ -549,6 +578,7 @@ mod tests {
             (refusal::TOO_LARGE, 5),
             (refusal::MALFORMED, 6),
             (refusal::UNSUPPORTED, 7),
+            (refusal::PEER, 10),
         ] {
             #[rustfmt::skip]
             let bytes = [

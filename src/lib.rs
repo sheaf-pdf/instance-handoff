@@ -263,10 +263,16 @@
 //!   secret is 32 random lowercase hex digits, published as
 //!   `<id> <secret>` and a newline in `instance.pipe` beside the lock;
 //! - the exchange. The owner sends HELLO (its app id, the protocol versions
-//!   it speaks, a random nonce, its payload version and its state). The
-//!   launch checks it and sends REQUEST. The owner answers READY. The
-//!   launch, if still inside its timeout, sends COMMIT, and only then does
-//!   the owner call the handler and send REPLY. Every message is
+//!   it speaks, a random nonce, its payload version, its state and its
+//!   features). The launch checks it and sends REQUEST. The owner answers
+//!   READY. The launch, if still inside its timeout, sends COMMIT, and only
+//!   then does the owner call the handler and send REPLY. An owner that
+//!   refuses a launch never just closes the connection: it sends REPLY
+//!   with the cause at once, in place of READY, or in place of HELLO when
+//!   an owner on Unix refuses the launch's user. Feature bit 0 in HELLO
+//!   says so, and every owner of this release sets it. A launch reads a
+//!   cause it doesn't know as a decline, and a close before HELLO as a
+//!   sign to try again. Every message is
 //!   `"IHND" | kind u8 | length u32 LE | records`, and a record is
 //!   `tag u8 | length u32 LE | bytes`. Peers skip records they don't know,
 //!   so later releases add to the exchange without breaking it, unless the

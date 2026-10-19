@@ -85,6 +85,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
 use crate::naming::level_folder;
 use crate::server::{Core, Session};
+use crate::wire::refusal;
 use crate::{AppId, Payload, Reason};
 
 pub(crate) const SUPPORTED: bool = true;
@@ -1322,6 +1323,7 @@ struct PipeConn<T> {
     read: Box<Op>,
     write: Box<Op>,
     session: Session<T>,
+    /// The launch has been checked, and refused if it failed.
     checked: bool,
 }
 
@@ -1530,13 +1532,14 @@ pub(crate) fn serve<T: Payload>(
                     Ok(0) => {}
                     Ok(n) => {
                         if !c.checked {
-                            // Impersonation needs a read first.
+                            // Impersonation needs a read first. A launch
+                            // that fails is told so at once, in place of
+                            // READY, and what it sent is dropped.
+                            c.checked = true;
                             if let Err(e) = check_client(h) {
                                 log::warn!("instance-handoff {app_id}: refused a launch: {e}");
-                                c.session.broken();
-                                continue;
+                                c.session.refuse(refusal::PEER, now);
                             }
-                            c.checked = true;
                         }
                         let bytes = c.read.buf[..n].to_vec();
                         if let Some(request) = c.session.read(&bytes, &core, now) {

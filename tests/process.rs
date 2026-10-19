@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use instance_handoff::{AppId, Args, Builder, Claim, Mode, Reason, Started};
 
@@ -343,6 +343,35 @@ fn a_launch_hands_off_to_another_process() {
             .as_str()
         )
     );
+}
+
+#[test]
+fn a_launch_of_another_payload_version_is_refused_at_once() {
+    let (_tmp, dir) = dir();
+    let owner = Owner::start(&dir);
+    let t = Instant::now();
+    let reason = match Builder::new(APP)
+        .dir(&dir)
+        .payload_version(1)
+        .timeout(Duration::from_secs(10))
+        .start(&Args::new(["x"]))
+    {
+        Started::Alone(reason) => reason,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        matches!(
+            reason,
+            Reason::PayloadVersion {
+                ours: 1,
+                theirs: 0,
+                ..
+            }
+        ),
+        "{reason}"
+    );
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(owner.took(Duration::from_millis(500)), None);
 }
 
 /// Not a test: a launch that `launch_under_fakeroot` starts. It prints the

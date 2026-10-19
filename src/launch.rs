@@ -359,6 +359,14 @@ fn exchange(
             Ok(hello) => hello,
             Err(_) => return Exchange::Fail(not_ours()),
         },
+        // Refused in place of HELLO: a Unix owner that won't serve this
+        // launch's user.
+        Ok((wire::REPLY, body)) => {
+            return Exchange::Fail(match Reply::decode(&body) {
+                Ok(r) if !r.delivered && r.status == status::REFUSED => refused(&r, None, b, &[]),
+                _ => not_ours(),
+            });
+        }
         Ok(_) | Err(ReadError::Bad) => return Exchange::Fail(not_ours()),
         Err(ReadError::Closed | ReadError::TimedOut) => {
             return Exchange::Retry(Waiting::Unresponsive);
@@ -465,29 +473,44 @@ fn reply(
     }
     match r.status {
         status::DECLINED => Exchange::Fail(Reason::Declined {}),
-        status::REFUSED => Exchange::Fail(refused(&r, hello, b, request)),
+        status::REFUSED => Exchange::Fail(refused(&r, Some(hello), b, request)),
         status::GAVE_UP => Exchange::Retry(Waiting::Unresponsive),
         // Busy, and statuses this build doesn't know: not delivered.
         _ => Exchange::Retry(Waiting::Busy),
     }
 }
 
-fn refused(r: &Reply, hello: &Hello, b: &Builder, request: &[u8]) -> Reason {
-    match r.refusal {
-        Some(refusal::APP) => Reason::OtherApp {},
-        Some(refusal::PAYLOAD_VERSION) => Reason::PayloadVersion {
+/// Why the owner refused this launch. `hello` is `None` when the refusal
+/// came in place of HELLO, before this launch sent anything.
+fn refused(r: &Reply, hello: Option<&Hello>, b: &Builder, request: &[u8]) -> Reason {
+    let wire_version = Reason::WireVersion {
+        ours: u32::from(wire::WIRE_MAX),
+        theirs: hello.map_or(0, |h| u32::from(h.wire_max)),
+    };
+    match (r.refusal, hello) {
+        (Some(refusal::PEER), _) => Reason::Peer {
+            source: io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the owner refused this launch: another user or level, or a check that failed",
+            ),
+        },
+        (Some(refusal::APP), _) => Reason::OtherApp {},
+        (Some(refusal::PAYLOAD_VERSION), Some(hello)) => Reason::PayloadVersion {
             ours: b.payload_version,
             theirs: r.payload_version.unwrap_or(hello.payload_version),
         },
-        Some(refusal::UNDECODABLE) => Reason::Undecodable {},
-        Some(refusal::TOO_LARGE) => Reason::TooLarge {
+        (Some(refusal::UNDECODABLE), Some(_)) => Reason::Undecodable {},
+        (Some(refusal::TOO_LARGE), Some(hello)) => Reason::TooLarge {
             size: request.len(),
             limit: hello.max_request as usize,
         },
-        _ => Reason::WireVersion {
-            ours: u32::from(wire::WIRE_MAX),
-            theirs: u32::from(hello.wire_max),
-        },
+        // Before HELLO, those three answer a request that was never sent.
+        (Some(refusal::PAYLOAD_VERSION | refusal::UNDECODABLE | refusal::TOO_LARGE), None)
+        | (None | Some(refusal::WIRE | refusal::MALFORMED | refusal::UNSUPPORTED), _) => {
+            wire_version
+        }
+        // A cause from a later release.
+        (Some(_), _) => Reason::Declined {},
     }
 }
 
@@ -527,6 +550,118 @@ impl Reader {
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err(ReadError::TimedOut),
                 Err(_) => return Err(ReadError::Closed),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AppId;
+    use refusal::*;
+
+    const KNOWN: [u8; 8] = [
+        WIRE,
+        APP,
+        PAYLOAD_VERSION,
+        UNDECODABLE,
+        TOO_LARGE,
+        MALFORMED,
+        UNSUPPORTED,
+        PEER,
+    ];
+
+    fn hello() -> Hello {
+        Hello {
+            wire_min: 1,
+            wire_max: 1,
+            app_id: "test".into(),
+            nonce: 7,
+            payload_version: 2,
+            max_request: 100,
+            state: state::TAKING,
+            features: wire::features::REFUSALS,
+        }
+    }
+
+    /// What this launch makes of REPLY REFUSED with `code`, after `hello`
+    /// or in place of it.
+    fn refused_with(code: Option<u8>, hello: Option<&Hello>) -> Reason {
+        let b = Builder::new(AppId::new("test")).payload_version(3);
+        let reply = Reply {
+            refusal: code,
+            ..Reply::new(false, status::REFUSED)
+        };
+        refused(&reply, hello, &b, &[0; 200])
+    }
+
+    #[test]
+    fn each_known_cause_has_its_reason() {
+        let hello = hello();
+        let at = |code| refused_with(Some(code), Some(&hello));
+        for code in [None, Some(WIRE), Some(MALFORMED), Some(UNSUPPORTED)] {
+            let reason = refused_with(code, Some(&hello));
+            assert!(
+                matches!(reason, Reason::WireVersion { ours: 1, theirs: 1 }),
+                "{code:?}: {reason}"
+            );
+        }
+        let reason = at(APP);
+        assert!(matches!(reason, Reason::OtherApp {}), "{reason}");
+        let reason = at(PAYLOAD_VERSION);
+        assert!(
+            matches!(reason, Reason::PayloadVersion { ours: 3, theirs: 2 }),
+            "{reason}"
+        );
+        let reason = at(UNDECODABLE);
+        assert!(matches!(reason, Reason::Undecodable {}), "{reason}");
+        let reason = at(TOO_LARGE);
+        assert!(
+            matches!(
+                reason,
+                Reason::TooLarge {
+                    size: 200,
+                    limit: 100
+                }
+            ),
+            "{reason}"
+        );
+        let reason = at(PEER);
+        assert!(matches!(reason, Reason::Peer { .. }), "{reason}");
+    }
+
+    #[test]
+    fn a_cause_this_build_doesnt_know_reads_as_declined() {
+        let hello = hello();
+        for code in (0..=255).filter(|c| !KNOWN.contains(c)) {
+            for hello in [Some(&hello), None] {
+                let reason = refused_with(Some(code), hello);
+                assert!(matches!(reason, Reason::Declined {}), "{code}: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_refusal_in_place_of_hello_is_about_the_launch() {
+        let reason = refused_with(Some(PEER), None);
+        assert!(matches!(reason, Reason::Peer { .. }), "{reason}");
+        let reason = refused_with(Some(APP), None);
+        assert!(matches!(reason, Reason::OtherApp {}), "{reason}");
+        // This launch hasn't sent a request: an answer to one isn't this
+        // protocol.
+        for code in [
+            WIRE,
+            PAYLOAD_VERSION,
+            UNDECODABLE,
+            TOO_LARGE,
+            MALFORMED,
+            UNSUPPORTED,
+        ] {
+            let reason = refused_with(Some(code), None);
+            assert!(
+                matches!(reason, Reason::WireVersion { ours: 1, theirs: 0 }),
+                "{code}: {reason}"
+            );
         }
     }
 }

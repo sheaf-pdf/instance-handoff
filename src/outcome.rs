@@ -167,7 +167,8 @@ pub enum Reason {
     NoOwner {},
     /// The owner turned this launch away: [`Answer::Decline`],
     /// [`Claim::decline_all`], a `Claim` dropped unserved, or an owner whose
-    /// handler panicked earlier.
+    /// handler panicked earlier. Or it refused this launch for a reason
+    /// this build doesn't know, from a later release of this crate.
     ///
     /// [`Answer::Decline`]: crate::Answer::Decline
     #[non_exhaustive]
@@ -231,9 +232,10 @@ pub enum Reason {
         /// Why.
         source: BoxError,
     },
-    /// The process at the other end of the owner's socket failed the
-    /// same-user check: another user's, or on Windows the same user's at
-    /// another integrity level. See the crate docs on privileges.
+    /// The owner and this launch failed the same-user check: they are two
+    /// users, or on Windows one user at two integrity levels. Each end
+    /// checks the other, and an owner that refuses a launch says so at
+    /// once. See the crate docs on privileges.
     #[non_exhaustive]
     Peer {
         /// What the check found.

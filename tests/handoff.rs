@@ -348,6 +348,44 @@ fn an_old_json_launch_is_refused_and_nothing_is_delivered() {
     owner.release();
 }
 
+// An owner that won't serve the launch's user says so in place of HELLO.
+// The owner here is this test, so the launch's own check of the owner
+// passes and only the owner's refusal is left.
+#[cfg(unix)]
+#[test]
+fn an_owner_that_refuses_the_launchs_user_says_so_at_once() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = dir();
+    let run = builder(&dir).runtime_dir().unwrap();
+    std::fs::DirBuilder::new().mode(0o700).create(&run).unwrap();
+    let lock = std::fs::File::create(run.join("instance.lock")).unwrap();
+    // SAFETY: flock on an open file.
+    let locked = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(locked, 0);
+    let listener = std::os::unix::net::UnixListener::bind(run.join("instance.sock")).unwrap();
+    // REPLY: not delivered, refused, cause PEER.
+    #[rustfmt::skip]
+    let refused = [
+        b'I', b'H', b'N', b'D', 5, 18, 0, 0, 0,
+        1, 1, 0, 0, 0, 0,
+        2, 1, 0, 0, 0, 3,
+        3, 1, 0, 0, 0, 10,
+    ];
+    let owner = std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            stream.unwrap().write_all(&refused).unwrap();
+        }
+    });
+    let t = Instant::now();
+    let reason = builder(&dir).probe().unwrap_err();
+    assert!(matches!(reason, Reason::Peer { .. }), "{reason}");
+    let reason = builder(&dir).hand_off(&args(&["x"])).unwrap_err();
+    assert!(matches!(reason, Reason::Peer { .. }), "{reason}");
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    owner.join().unwrap();
+}
+
 #[test]
 fn a_burst_of_launches_is_each_delivered_exactly_once() {
     let dir = Arc::new(dir());

@@ -61,6 +61,7 @@ impl Ctx {
             payload_version: self.payload_version,
             max_request: wire::MAX_REQUEST,
             state,
+            features: wire::features::REFUSALS,
         }
         .encode()
     }
@@ -241,7 +242,8 @@ enum Phase {
     Done,
 }
 
-/// One connection, from HELLO to the launch's close.
+/// One connection, from HELLO, or a refusal sent in its place, to the
+/// launch's close.
 pub(crate) struct Session<T> {
     phase: Phase,
     inbuf: Vec<u8>,
@@ -264,6 +266,23 @@ impl<T: Payload> Session<T> {
             pending: None,
             launcher_pid,
         }
+    }
+
+    /// A connection refused before HELLO: REPLY REFUSED with `why` is all
+    /// it is told.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn refused(why: u8, now: Instant) -> Session<T> {
+        let mut s = Session {
+            phase: Phase::Request,
+            inbuf: Vec::new(),
+            out: Vec::new(),
+            sent: 0,
+            deadline: now,
+            pending: None,
+            launcher_pid: None,
+        };
+        s.reply(Reply::refused(why), now);
+        s
     }
 
     /// Bytes waiting to be written.
@@ -297,6 +316,16 @@ impl<T: Payload> Session<T> {
     /// The write side broke: nothing more can be said.
     pub(crate) fn broken(&mut self) {
         self.phase = Phase::Done;
+    }
+
+    /// Refuses the launch with `why`, after HELLO and whatever it has sent
+    /// since. A session whose last message is already decided is left as
+    /// it is.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn refuse(&mut self, why: u8, now: Instant) {
+        if matches!(self.phase, Phase::Request | Phase::Commit) {
+            self.reply(Reply::refused(why), now);
+        }
     }
 
     /// Bytes from the launch. Returns a committed request for the handler;
@@ -519,7 +548,9 @@ mod tests {
         let mut s = Session::new(&core, Some(42), now);
         let hello = take_out(&mut s);
         assert_eq!(hello[0].0, wire::HELLO);
-        assert_eq!(Hello::decode(&hello[0].1).unwrap().state, state::TAKING);
+        let hello = Hello::decode(&hello[0].1).unwrap();
+        assert_eq!(hello.state, state::TAKING);
+        assert_eq!(hello.features, wire::features::REFUSALS);
 
         let args = Args::new(["a.pdf"]);
         let bytes = request(3, args.encode().unwrap());
@@ -592,6 +623,44 @@ mod tests {
                 assert_eq!(r.payload_version, Some(3));
             }
         }
+    }
+
+    #[test]
+    fn a_refused_launch_is_told_why_and_nothing_more() {
+        let core = core(Some(Box::new(|_| Answer::Take)));
+        let now = Instant::now();
+        let refused = |out: &[(u8, Vec<u8>)]| {
+            assert_eq!(out.len(), 1, "one message");
+            let r = reply(out);
+            assert_eq!(
+                (r.delivered, r.status, r.refusal),
+                (false, status::REFUSED, Some(refusal::PEER))
+            );
+        };
+        let bytes = request(3, Args::default().encode().unwrap());
+
+        // Before HELLO, as on Unix: the reply is all there is, then the
+        // launch's close is awaited.
+        let mut s = Session::<Args>::refused(refusal::PEER, now);
+        refused(&take_out(&mut s));
+        assert!(s.should_shut_write());
+        assert_eq!(s.deadline(), now + DRAIN_WAIT);
+        assert!(s.read(&bytes, &core, now).is_none());
+        s.refuse(refusal::PEER, now);
+        assert!(s.outgoing().is_empty());
+        s.eof(&core.ctx.app_id);
+        assert!(s.is_done());
+
+        // After HELLO, as on Windows, which checks a launch only once it
+        // has read from it. A second refusal adds nothing.
+        let mut s = Session::new(&core, None, now);
+        assert_eq!(take_out(&mut s)[0].0, wire::HELLO);
+        s.refuse(refusal::PEER, now);
+        s.refuse(refusal::PEER, now);
+        assert!(s.read(&bytes, &core, now).is_none());
+        refused(&take_out(&mut s));
+        s.timed_out(s.deadline());
+        assert!(s.is_done());
     }
 
     #[test]
