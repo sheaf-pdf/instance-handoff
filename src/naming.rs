@@ -122,6 +122,20 @@ pub(crate) fn level_folder(level: u32) -> String {
     }
 }
 
+/// The byte of the Windows `instance.lock` that the owner locks
+/// exclusively: holding it is owning.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const OWNER_BYTE: u64 = 0;
+
+/// The byte of the Windows `instance.lock` that marks the owner's integrity
+/// level, the last RID of its mandatory label: the byte at that RID, so
+/// 0x2000 at medium and 0x3000 at high. The owner locks it exclusively
+/// after byte 0, so its level can be read from the kernel's lock state.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn level_marker(level: u32) -> u64 {
+    u64::from(level)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +207,18 @@ mod tests {
         assert_eq!(level_folder(0x4000), "run-system");
         assert_eq!(level_folder(0x1000), "run-low");
         assert_eq!(level_folder(0x2100), "run-2100");
+    }
+
+    // Bytes of instance.lock, frozen as the names above are: a build that
+    // locked others would split one app into two owners, or show its owner
+    // at the wrong level.
+    #[test]
+    fn the_windows_lock_bytes_are_frozen() {
+        assert_eq!(OWNER_BYTE, 0);
+        assert_eq!(level_marker(0x2000), 0x2000);
+        assert_eq!(level_marker(0x3000), 0x3000);
+        assert_eq!(level_marker(0x1000), 0x1000);
+        assert_eq!(level_marker(0x2100), 0x2100);
     }
 
     #[test]

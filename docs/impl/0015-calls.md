@@ -95,6 +95,12 @@ The planning run behind [0015-plan.md](0015-plan.md) left questions that the rec
    - Byte 0 held with no marker means the owner is starting: retry until the deadline.
 
    *Recommended.*
+
+   Slice 20 settled the cases this leaves open. *Our call (slice 20).*
+   - Any failure to take the marker gives byte 0 back, an error as well as a timeout. The error then fails the lock, as other lock errors do.
+   - Byte 0 is given back with `UnlockFileEx` at once, not left to the handle's close. A launch that takes byte 0 only to see whether it is held gives it back the same way.
+   - An untrusted process (RID 0) would mark byte 0, the owning byte, so it never owns: its lock fails at once with an error (`Reason::Lock` from `start`). Slice 33 excludes it before it gets there.
+   - When a launch's marker probe finds its own level's byte held, it still searches above it, and a higher marker wins over its own.
 2. A probe at another level is answered from the marker alone, unconfirmed. *Recommended.*
 3. `MoreRights` and `OwnerHasMoreRights` don't name the owner's pid, since `instance.lock` stays unwritten. *Recommended.*
 4. A committed launch whose owner died and that then finds the guard, or a lock at another level, held reports an unconfirmed handoff, never `Alone`. Running alone there would break 0004. *The critic's fix.*

@@ -352,10 +352,13 @@
 //!   folder for an integrity level other than medium is `run-low`,
 //!   `run-high`, `run-system`, or else `run-` and the level's RID in
 //!   lowercase hex;
-//! - the lock: `flock(LOCK_EX | LOCK_NB)` on `instance.lock` on Unix, an
-//!   exclusive `LockFileEx` on its first byte on Windows. Both are held per
-//!   open file,
-//!   inherited across `fork`, and released when the last copy closes;
+//! - the lock: `flock(LOCK_EX | LOCK_NB)` on `instance.lock` on Unix, held
+//!   per open file, inherited across `fork`, and released when the last
+//!   copy closes. On Windows, exclusive `LockFileEx` locks on two bytes of
+//!   it, through one handle: byte 0, which is owning, then the byte at the
+//!   owner's integrity level's RID (0x2000 at medium), which marks its
+//!   level. An owner that can't take its marker gives byte 0 back. Closing
+//!   the handle releases both;
 //! - the guard, on Unix: `flock(LOCK_EX | LOCK_NB)` on
 //!   `.instance-handoff.lock` in the state folder, or
 //!   `flock(LOCK_SH | LOCK_NB)` for an owner with a scope, held as the lock

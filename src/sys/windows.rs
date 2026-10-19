@@ -24,6 +24,14 @@
 //! `instance.lock` gets an access list of its own too, and takes its label
 //! from its folder.
 //!
+//! The owner locks two bytes of `instance.lock`, both exclusively and
+//! through one handle: byte 0, which is owning, then the byte at its
+//! integrity level's RID (0x2000 at medium, 0x3000 at high), the level
+//! marker. So the owner's level can be read from the kernel's lock state,
+//! not from a file someone could write. An owner that can't take its
+//! marker within about 100 ms gives byte 0 back, so no launch waits on an
+//! owner without one. Closing the handle releases both.
+//!
 //! The pipe's controls, each against a threat:
 //! - its name is 128 random bits, published only after the pipe exists, in
 //!   a folder only this user can read: another user on a terminal server
@@ -80,7 +88,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_WRITE_ATTRIBUTES, FILE_WRITE_EA, GetFileInformationByHandle, GetFinalPathNameByHandleW,
     GetVolumeInformationByHandleW, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
     OPEN_ALWAYS, PIPE_ACCESS_DUPLEX, READ_CONTROL, ReadFile, SECURITY_IDENTIFICATION, SYNCHRONIZE,
-    VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER, WriteFile,
+    UnlockFileEx, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER, WriteFile,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
@@ -105,7 +113,7 @@ use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGe
 use windows_sys::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, WSF_VISIBLE};
 
 use crate::id::valid_id;
-use crate::naming::level_folder;
+use crate::naming::{OWNER_BYTE, level_folder, level_marker};
 use crate::server::{Core, Peer, Session};
 use crate::wire::refusal;
 use crate::{AppId, Payload, Reason};
@@ -836,22 +844,43 @@ pub(crate) fn open_folder(place: &Place, create: bool) -> Result<Option<Folder>,
     }))
 }
 
-/// The held lock: `LockFileEx` on the first byte of the open file, released
-/// when the handle closes. The file can't be deleted while it is open.
+/// The held lock: exclusive `LockFileEx` locks on two bytes of the open
+/// file, byte 0 and the marker of this process's integrity level. Both are
+/// released when the handle closes. The file can't be deleted while it is
+/// open.
 #[derive(Debug)]
 pub(crate) struct Lock(#[allow(dead_code)] File);
 
-fn try_lock(file: &File) -> io::Result<bool> {
-    // SAFETY: plain data; LockFileEx reads the offset from it.
+/// How long an owner that holds byte 0 tries for its marker. A launch's
+/// shared probe holds the marker's byte only for a moment.
+const MARKER_RETRY: Duration = Duration::from_millis(100);
+
+/// An `OVERLAPPED` that names `offset`, for a call on a synchronous handle.
+fn at(offset: u64) -> OVERLAPPED {
+    // SAFETY: plain data, for which all zeros is valid.
     let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
-    // SAFETY: a synchronous handle; with FAIL_IMMEDIATELY it never waits.
+    ov.Anonymous.Anonymous.Offset = offset as u32;
+    ov.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+    ov
+}
+
+/// Locks `len` bytes of `file` from `offset`, exclusively or shared, and
+/// never waits. `false` when another lock is in the way.
+fn try_lock(file: &File, offset: u64, len: u64, exclusive: bool) -> io::Result<bool> {
+    let mut flags = LOCKFILE_FAIL_IMMEDIATELY;
+    if exclusive {
+        flags |= LOCKFILE_EXCLUSIVE_LOCK;
+    }
+    let mut ov = at(offset);
+    // SAFETY: a synchronous handle; with FAIL_IMMEDIATELY it never waits,
+    // and the call is done with `ov` when it returns.
     let ok = unsafe {
         LockFileEx(
             file.as_raw_handle(),
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            flags,
             0,
-            1,
-            0,
+            len as u32,
+            (len >> 32) as u32,
             &mut ov,
         )
     };
@@ -863,6 +892,54 @@ fn try_lock(file: &File) -> io::Result<bool> {
         Ok(false)
     } else {
         Err(e)
+    }
+}
+
+/// Gives back the range that `try_lock` took through `file`, at once
+/// rather than when the handle closes.
+fn unlock(file: &File, offset: u64, len: u64) -> io::Result<()> {
+    let mut ov = at(offset);
+    // SAFETY: a synchronous handle, so the call is done with `ov` when it
+    // returns.
+    let ok = unsafe {
+        UnlockFileEx(
+            file.as_raw_handle(),
+            0,
+            len as u32,
+            (len >> 32) as u32,
+            &mut ov,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Takes the lock through `file`: byte 0, then `marker`, both exclusive.
+/// `false` when another handle holds byte 0, or when the marker can't be
+/// taken within `MARKER_RETRY`. When the marker isn't taken, after the
+/// retry or on an error, byte 0 is given back at once.
+fn take(file: &File, marker: u64) -> io::Result<bool> {
+    if !try_lock(file, OWNER_BYTE, 1, true)? {
+        return Ok(false);
+    }
+    let until = Instant::now() + MARKER_RETRY;
+    loop {
+        match try_lock(file, marker, 1, true) {
+            Ok(true) => return Ok(true),
+            Ok(false) if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            failed => {
+                // Closing the handle would free it too, but maybe not at
+                // once.
+                if let Err(e) = unlock(file, OWNER_BYTE, 1) {
+                    log::debug!("instance-handoff: giving back {LOCK_FILE}: {e}");
+                }
+                return failed;
+            }
+        }
     }
 }
 
@@ -919,17 +996,42 @@ impl Folder {
             .open(path)
     }
 
+    /// Takes the lock, creating the file: byte 0, then the marker at this
+    /// process's level, both exclusive and through one handle. `None` when
+    /// another handle holds byte 0. If the marker can't be taken within
+    /// `MARKER_RETRY`, byte 0 is given back and the answer is `None` too,
+    /// so that no launch waits on an owner without a marker. If taking it
+    /// fails with an error, byte 0 is given back as well, and the error
+    /// returned. An untrusted process (RID 0) would mark byte 0 itself, so
+    /// its lock fails at once.
     pub(crate) fn lock(&self) -> io::Result<Option<Lock>> {
+        let marker = level_marker(me()?.integrity);
+        if marker == OWNER_BYTE {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "an untrusted process can't mark its level",
+            ));
+        }
         let file = self.open_lock(true)?;
-        Ok(try_lock(&file)?.then_some(Lock(file)))
+        Ok(take(&file, marker)?.then_some(Lock(file)))
     }
 
+    /// Whether another handle holds byte 0. If this check takes the byte,
+    /// it gives it back at once, as `take` does, so a starting owner never
+    /// finds it in its way.
     pub(crate) fn lock_held(&self) -> io::Result<bool> {
-        match self.open_lock(false) {
-            Ok(file) => try_lock(&file).map(|got| !got),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e),
+        let file = match self.open_lock(false) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if !try_lock(&file, OWNER_BYTE, 1, true)? {
+            return Ok(true);
         }
+        if let Err(e) = unlock(&file, OWNER_BYTE, 1) {
+            log::debug!("instance-handoff: giving back {LOCK_FILE}: {e}");
+        }
+        Ok(false)
     }
 
     /// Writes `instance.pipe` in one step: written beside it, then renamed
@@ -2211,6 +2313,92 @@ mod tests {
         let (label, level) = security(&path, LABEL);
         assert_eq!(label.matches("(ML;").count(), 1, "{label}");
         assert_eq!(level, Some(me().unwrap().integrity), "{label}");
+    }
+
+    /// The level marker another handle holds in `file`, found as a launch
+    /// will look for it: this process's own level's byte first, then the
+    /// bytes in [1, 0x10000) by shared range locks, each given back at
+    /// once, halving the range around a conflict. The highest held byte
+    /// wins. Byte 0 is owning, never a marker, so at RID 0 only the search
+    /// runs.
+    fn marker(file: &File) -> io::Result<Option<u64>> {
+        let own = level_marker(me()?.integrity);
+        if own != OWNER_BYTE {
+            if !try_lock(file, own, 1, false)? {
+                return Ok(Some(highest_held(file, own + 1, 0x10000)?.unwrap_or(own)));
+            }
+            unlock(file, own, 1)?;
+        }
+        highest_held(file, 1, 0x10000)
+    }
+
+    /// The highest byte in `start..end` that another handle holds
+    /// exclusively. An empty range holds none.
+    fn highest_held(file: &File, start: u64, end: u64) -> io::Result<Option<u64>> {
+        if start >= end {
+            return Ok(None);
+        }
+        if try_lock(file, start, end - start, false)? {
+            unlock(file, start, end - start)?;
+            return Ok(None);
+        }
+        if end - start == 1 {
+            return Ok(Some(start));
+        }
+        let mid = start + (end - start) / 2;
+        match highest_held(file, mid, end)? {
+            Some(byte) => Ok(Some(byte)),
+            None => highest_held(file, start, mid),
+        }
+    }
+
+    // On disk: byte 0 of instance.lock is owning, and the byte at the
+    // owner's level's RID marks its level. Only a major release may change
+    // them. Every other byte stays free for launches to probe.
+    #[test]
+    fn the_lock_holds_byte_0_and_a_marker_at_its_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = open_folder(&Place::dir(tmp.path().join("run")), true)
+            .unwrap()
+            .unwrap();
+        let lock = folder.lock().unwrap().unwrap();
+        let rid = u64::from(me().unwrap().integrity);
+        let other = folder.open_lock(false).unwrap();
+        assert!(!try_lock(&other, 0, 1, false).unwrap());
+        assert!(!try_lock(&other, rid, 1, false).unwrap());
+        for (start, end) in [(1, rid), (rid + 1, 0x10000)] {
+            assert!(try_lock(&other, start, end - start, true).unwrap());
+            unlock(&other, start, end - start).unwrap();
+        }
+        assert_eq!(marker(&other).unwrap(), Some(rid));
+
+        // Dropped, the lock frees both.
+        drop(lock);
+        assert_eq!(marker(&other).unwrap(), None);
+        assert!(try_lock(&other, 0, 1, true).unwrap());
+    }
+
+    // A launch may hold the marker's byte for a moment while it probes.
+    // Held longer, the owner gives byte 0 back rather than own without a
+    // marker, and at once: its handle is still open when a third handle
+    // finds byte 0 free.
+    #[test]
+    fn an_owner_without_its_marker_gives_byte_0_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = open_folder(&Place::dir(tmp.path().join("run")), true)
+            .unwrap()
+            .unwrap();
+        let rid = u64::from(me().unwrap().integrity);
+        let other = folder.open_lock(true).unwrap();
+        assert!(try_lock(&other, rid, 1, false).unwrap());
+        let owner = folder.open_lock(false).unwrap();
+        let began = Instant::now();
+        assert!(!take(&owner, rid).unwrap());
+        assert!(began.elapsed() >= MARKER_RETRY);
+        assert!(!folder.lock_held().unwrap());
+
+        unlock(&other, rid, 1).unwrap();
+        assert!(take(&owner, rid).unwrap());
     }
 
     // Each label here is one this process may set: below its own level, or
