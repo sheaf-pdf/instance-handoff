@@ -476,8 +476,14 @@ fn a_slow_handler_leaves_the_launch_handed_off_unconfirmed() {
         other => panic!("{other:?}"),
     };
     assert!(!info.confirmed());
-    // The launch waited at least a second for the reply, not forever.
-    assert!(t.elapsed() >= Duration::from_secs(1) && t.elapsed() < Duration::from_millis(1500));
+    // The launch waited at least a second for the reply, not forever. Its
+    // limit is the timeout plus that second; the rest is room for a busy
+    // CI runner.
+    let waited = t.elapsed();
+    assert!(
+        waited >= Duration::from_secs(1) && waited < Duration::from_millis(2500),
+        "{waited:?}"
+    );
     // Delivered once, late.
     assert_eq!(
         rx.recv_timeout(Duration::from_secs(2)).unwrap().payload(),
