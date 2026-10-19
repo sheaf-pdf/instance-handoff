@@ -104,6 +104,23 @@ impl Owner {
         );
     }
 
+    /// SIGSTOP, then wait until every thread has stopped. `kill` returns
+    /// before they do, and until then the server thread can still take a
+    /// launch.
+    #[cfg(unix)]
+    fn suspend(&self) {
+        self.signal(libc::SIGSTOP);
+        let pid = self.child.id() as libc::pid_t;
+        let mut status = 0;
+        // SAFETY: status is a valid out pointer. WUNTRACED reports the
+        // stop, once the whole process has stopped, without reaping it.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+            pid
+        );
+        assert!(libc::WIFSTOPPED(status), "{status:#x}");
+    }
+
     /// SIGKILL on Unix, TerminateProcess on Windows.
     fn kill(&mut self) {
         self.child.kill().unwrap();
@@ -202,7 +219,7 @@ fn a_stopped_owner_never_delivers_a_launch_that_ran_alone() {
     // Sheaf's bug 11, from a suspended owner (Ctrl-Z, SIGSTOP, a debugger).
     let (_tmp, dir) = dir();
     let owner = Owner::start(&dir);
-    owner.signal(libc::SIGSTOP);
+    owner.suspend();
     let reason = match Builder::new(APP)
         .dir(&dir)
         .timeout(Duration::from_millis(400))
