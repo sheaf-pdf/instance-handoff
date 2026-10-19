@@ -26,3 +26,4 @@ Every fallback chain that was tested produced two owners. A fallback only fires 
 - An `@reboot` cron job, or a service started outside a login session, gets `NoSession` on Linux with systemd. The crate docs show how to fix that: lingering, `PAMName=`, or `Builder::dir`.
 - A root launch under `sudo` usually gets `NoSession` ([0013](0013-root-on-linux.md)).
 - In `sheaf-instance`, a cleaner or `rm` that deleted the lock file let a second owner start, and the second owner then deleted the live owner's socket. Now the owner re-creates its lock within a minute, and if another process became owner in that window, it is told so (`End::LostLock`).
+- On Windows a held lock can't be deleted, so no second owner starts this way. The address file can be, which [0016](0016-windows-address-file.md) addresses.
