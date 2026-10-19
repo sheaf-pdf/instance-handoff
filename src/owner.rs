@@ -82,9 +82,9 @@ impl<T> Claim<T> {
     /// after the handler is dropped: no request reaches the handler after
     /// it. For hosts whose channel doesn't close when the handler drops (an
     /// event-loop proxy, a channel with other senders), and to learn of
-    /// [`End::LostLock`]. `f` must not block. It isn't called for a `Claim`
-    /// that is released, or for a process that exits first. A second call
-    /// replaces the first.
+    /// [`End::LostLock`] and [`End::LostState`]. `f` must not block. It
+    /// isn't called for a `Claim` that is released, or for a process that
+    /// exits first. A second call replaces the first.
     pub fn on_end(self, f: impl FnOnce(End) + Send + 'static) -> Claim<T> {
         *self.on_end.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
         self
@@ -362,9 +362,9 @@ impl Owner {
 
     /// Why the owner ended, once it has: set before the handler is dropped,
     /// so it's known by the time a channel the handler fed closes. `None`
-    /// while serving or declining. [`End::LostLock`] replaces
-    /// [`End::Stopped`] if the lock is lost after `stop`: check this before
-    /// writing state.
+    /// while serving or declining. [`End::LostLock`] or [`End::LostState`]
+    /// replaces [`End::Stopped`] if the lock or the state folder is lost
+    /// after `stop`: check this before writing state.
     pub fn ended(&self) -> Option<End> {
         self.shared.ended()
     }
@@ -387,8 +387,9 @@ impl Owner {
         self.shared.close.store(true, Ordering::SeqCst);
         {
             let mut held = self.shared.held();
-            // After LostLock the files at the path are another owner's.
-            if self.shared.ended() != Some(End::LostLock) {
+            // After LostLock or LostState the files at the path are another
+            // owner's, or will be.
+            if !matches!(self.shared.ended(), Some(End::LostLock | End::LostState)) {
                 held.unlink_socket();
             }
             let guard = held.guard.take();

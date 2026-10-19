@@ -99,7 +99,12 @@ impl From<&Path> for State {
 /// forked from the owner holds it too until it exits. An exclusive run
 /// holds it only until its [`Exclusive`] is dropped. On Windows, while
 /// the guard is held, the file can't be removed, nor the state folder
-/// renamed or removed.
+/// renamed or removed. On Unix they can, and every minute the owner checks
+/// that their paths still name the folder and the file it holds. It makes
+/// and locks a removed guard file again, unless another process holds the
+/// new one. A state folder removed or replaced, or a new guard file that
+/// another process holds, ends the owner with [`End::LostState`]. An
+/// exclusive run never checks: see [`Exclusive`].
 ///
 /// No guard is taken, and no guard file made, under [`Guard::Off`] and for
 /// [`State::none`]. Nor is one held on a network file system, or where the
@@ -113,6 +118,7 @@ impl From<&Path> for State {
 /// [`Owner::release`]: crate::Owner::release
 /// [`Claim::release`]: crate::Claim::release
 /// [`Claim::guarded`]: crate::Claim::guarded
+/// [`End::LostState`]: crate::End::LostState
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Guard {

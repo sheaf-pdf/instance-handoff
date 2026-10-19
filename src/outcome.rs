@@ -115,6 +115,13 @@ impl fmt::Display for OwnerInfo {
 /// at once. A child forked from this process without `exec` holds it too,
 /// until the child drops its copy or exits.
 ///
+/// It never checks that the state folder is still in place, as an owner
+/// does every minute. On Unix, should the folder be removed or replaced
+/// while this is held (renamed aside and made anew, say), nothing tells
+/// it, as [`End::LostState`] tells an owner, and a launch may own the
+/// folder now at the path. On Windows a held guard keeps the folder in
+/// place.
+///
 /// [`Builder::exclusive`]: crate::Builder::exclusive
 #[must_use = "dropping an Exclusive releases the state at once"]
 pub struct Exclusive {
@@ -175,8 +182,9 @@ impl fmt::Debug for Exclusive {
 pub enum End {
     /// [`Owner::stop`] or [`Owner::release`] was called, or the `Owner` was
     /// dropped. After `stop`, launches are told the owner is busy; after a
-    /// drop or `release`, they find nobody listening. If the lock is lost
-    /// afterwards, [`End::LostLock`] replaces it.
+    /// drop or `release`, they find nobody listening. If the lock or the
+    /// state folder is lost afterwards, [`End::LostLock`] or
+    /// [`End::LostState`] replaces it.
     ///
     /// [`Owner::stop`]: crate::Owner::stop
     /// [`Owner::release`]: crate::Owner::release
@@ -185,12 +193,28 @@ pub enum End {
     /// ([`Reason::Declined`]); this process still holds the lock.
     Panicked,
     /// Something deleted the runtime folder under this owner, and another
-    /// process took the lock there before this one could re-create it: a
-    /// new owner, or a launch that lets go again because this owner holds
-    /// the state folder's [guard](crate::Guard). Either way this one must
-    /// stop writing the state. It gives the guard up as it ends, so a later
-    /// launch can own the state folder.
+    /// process took the lock there before this one could re-create it. This
+    /// one must stop writing the state. It gives the guard up as it ends, so
+    /// a later launch can own the state folder.
+    ///
+    /// Only an owner that doesn't hold the state folder's
+    /// [guard](crate::Guard) alone ends this way: one that holds none, or
+    /// one with a [scope](crate::Builder::scope), which holds it shared, so
+    /// that a launch of its scope that re-creates the folder takes the guard
+    /// too and owns. An owner that holds it alone waits instead: a launch
+    /// that took the lock in the re-created folder finds the guard held and
+    /// lets go again, and the owner then takes the lock there itself.
     LostLock,
+    /// The state folder was removed or replaced under this owner, which held
+    /// its [guard](crate::Guard): renamed aside and made anew, say. Or the
+    /// guard file was, and another process holds the new one. Another launch
+    /// may own what is at the path now, so this one must stop writing the
+    /// state. It gives up the guard, its socket and the lock as it ends, so
+    /// the next launch can own the folder now at the path. Only an owner
+    /// that holds the guard ends this way. A guard file removed from a state
+    /// folder that is still in place is made and locked again, if nobody
+    /// else holds the new one.
+    LostState,
 }
 
 impl fmt::Display for End {
@@ -199,6 +223,7 @@ impl fmt::Display for End {
             End::Stopped => "stopped",
             End::Panicked => "the handler panicked",
             End::LostLock => "another process took the lock",
+            End::LostState => "the state folder or its guard file was removed or replaced",
         })
     }
 }
@@ -632,6 +657,15 @@ mod tests {
             "the running instance (pid unknown, high) has high integrity, which this launch lacks"
         );
         assert!(more.source().is_none() && fewer.source().is_none());
+    }
+
+    #[test]
+    fn ends_say_why() {
+        assert_eq!(End::LostLock.to_string(), "another process took the lock");
+        assert_eq!(
+            End::LostState.to_string(),
+            "the state folder or its guard file was removed or replaced"
+        );
     }
 
     #[test]

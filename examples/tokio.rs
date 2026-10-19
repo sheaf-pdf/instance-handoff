@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 _ = &mut ctrl_c, if !owner.is_stopped() => owner.stop(),
             }
         }
-        if owner.ended() != Some(End::LostLock) {
+        if !matches!(owner.ended(), Some(End::LostLock | End::LostState)) {
             // ...flush state here, still holding the lock...
         }
     });

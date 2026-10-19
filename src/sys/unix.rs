@@ -20,6 +20,15 @@ use crate::server::{Core, Peer, Session};
 use crate::wire::refusal;
 use crate::{AppId, Payload, Reason};
 
+// On 32-bit targets glibc's stat calls fail with EOVERFLOW for a file whose
+// inode number doesn't fit in 32 bits, as on XFS with inode64 or overlayfs
+// with xino. Its *64 calls can't, and on 64-bit targets they are the same
+// calls. musl and bionic count in 64 bits everywhere.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+use libc::{fstat as sys_fstat, fstatat as sys_fstatat, lstat as sys_lstat, stat as Stat};
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+use libc::{fstat64 as sys_fstat, fstatat64 as sys_fstatat, lstat64 as sys_lstat, stat64 as Stat};
+
 pub(crate) const SUPPORTED: bool = true;
 
 pub(crate) type Listener = UnixListener;
@@ -487,9 +496,9 @@ fn open_dir(at: Option<BorrowedFd<'_>>, path: &Path, nofollow: bool) -> io::Resu
         match e.raw_os_error() {
             Some(libc::ELOOP | libc::ENOTDIR) => {
                 // SAFETY: stat is plain data; fstatat fills it in.
-                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let mut st: Stat = unsafe { std::mem::zeroed() };
                 let r =
-                    unsafe { libc::fstatat(dirfd, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+                    unsafe { sys_fstatat(dirfd, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
                 if r == 0 && st.st_mode & libc::S_IFMT == libc::S_IFLNK {
                     denied("a symlink, not a folder")
                 } else {
@@ -503,10 +512,10 @@ fn open_dir(at: Option<BorrowedFd<'_>>, path: &Path, nofollow: bool) -> io::Resu
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn fstat(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
+fn fstat(fd: BorrowedFd<'_>) -> io::Result<Stat> {
     // SAFETY: stat is plain data; fstat fills it in.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    cvt(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) })?;
+    let mut st: Stat = unsafe { std::mem::zeroed() };
+    cvt(unsafe { sys_fstat(fd.as_raw_fd(), &mut st) })?;
     Ok(st)
 }
 
@@ -544,9 +553,9 @@ fn path_owner(path: &Path) -> io::Result<libc::uid_t> {
         }
     }
     // SAFETY: stat is plain data; fstatat fills it in.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let mut st: Stat = unsafe { std::mem::zeroed() };
     // SAFETY: `c` is a valid C string, and `st` is valid for writes.
-    cvt(unsafe { libc::fstatat(libc::AT_FDCWD, c.as_ptr(), &mut st, 0) })?;
+    cvt(unsafe { sys_fstatat(libc::AT_FDCWD, c.as_ptr(), &mut st, 0) })?;
     Ok(st.st_uid)
 }
 
@@ -719,7 +728,7 @@ fn flock_nb(fd: BorrowedFd<'_>, op: libc::c_int) -> io::Result<bool> {
     }
 }
 
-fn stat_key(st: &libc::stat) -> (u64, u64) {
+fn stat_key(st: &Stat) -> (u64, u64) {
     #[allow(clippy::unnecessary_cast)]
     (st.st_dev as u64, st.st_ino as u64)
 }
@@ -775,8 +784,8 @@ impl Folder {
             return false;
         };
         // SAFETY: stat is plain data; lstat fills it in.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 {
+        let mut st: Stat = unsafe { std::mem::zeroed() };
+        if unsafe { sys_lstat(c.as_ptr(), &mut st) } != 0 {
             return false;
         }
         fstat(lock.0.as_fd()).is_ok_and(|ours| stat_key(&ours) == stat_key(&st))
@@ -848,13 +857,13 @@ impl Folder {
     /// Identifies the socket file at the address, if there is one.
     fn socket_key(&self) -> Option<SocketKey> {
         // SAFETY: stat is plain data, filled in by the calls below.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let mut st: Stat = unsafe { std::mem::zeroed() };
         let r = match self.address(false).ok()? {
             Address::InFolder(_) => {
                 let c = cstr(OsStr::new(SOCKET_FILE)).ok()?;
                 // SAFETY: `c` is a valid C string and `self.fd` an open folder.
                 unsafe {
-                    libc::fstatat(
+                    sys_fstatat(
                         self.fd.as_raw_fd(),
                         c.as_ptr(),
                         &mut st,
@@ -865,7 +874,7 @@ impl Folder {
             Address::Elsewhere(path) => {
                 let c = cstr(path.as_os_str()).ok()?;
                 // SAFETY: `c` is a valid C string.
-                unsafe { libc::lstat(c.as_ptr(), &mut st) }
+                unsafe { sys_lstat(c.as_ptr(), &mut st) }
             }
         };
         (r == 0).then(|| stat_key(&st))
@@ -1247,8 +1256,41 @@ pub(crate) fn make_state_dir(state: &Path) -> io::Result<()> {
 /// folder, exclusive or shared. Like [`Lock`], it is released when the
 /// last descriptor closes and never unlocked explicitly, so a forked child
 /// that keeps a copy keeps the guard.
+///
+/// The state folder is held open beside the file. An inode that is open
+/// stays in use, so no other folder or file gets the device and inode of
+/// either while they are held, and the owner's upkeep can tell from them
+/// whether the paths still name what it holds ([`Guard::look`]).
 #[derive(Debug)]
-pub(crate) struct Guard(#[allow(dead_code)] OwnedFd);
+pub(crate) struct Guard {
+    file: OwnedFd,
+    dir: OwnedFd,
+    /// The canonical state folder.
+    state: PathBuf,
+    shared: bool,
+}
+
+/// What the owner's upkeep found at the guard's paths.
+enum GuardFound {
+    /// The state folder and the guard file the owner holds.
+    InPlace,
+    /// The guard file was removed or replaced, and the owner now locks the
+    /// file at its path instead.
+    Retaken,
+    /// The state folder was removed or replaced, or another process holds
+    /// the guard file now at its path.
+    Lost,
+    /// The guard file was removed or replaced, and the one at its path
+    /// can't be made, opened or locked now; or a path, or what the guard
+    /// holds, can't be looked at. The owner keeps what it holds, and looks
+    /// again.
+    Unknown(io::Error),
+}
+
+/// `LOCK_SH` for a keyed owner's guard, and otherwise `LOCK_EX`.
+fn guard_op(shared: bool) -> libc::c_int {
+    if shared { libc::LOCK_SH } else { libc::LOCK_EX }
+}
 
 /// Takes the guard in the canonical `state` folder, which
 /// [`make_state_dir`] has made: `shared` (`LOCK_SH`) for a keyed owner, so
@@ -1260,8 +1302,8 @@ pub(crate) struct Guard(#[allow(dead_code)] OwnedFd);
 /// can't lock files: the owner goes unguarded.
 pub(crate) fn take_guard(state: &Path, shared: bool) -> Result<Option<Guard>, Reason> {
     let path = state.join(naming::GUARD_FILE);
-    let fd = match open_guard(state) {
-        Ok(Some(fd)) => fd,
+    let (dir, file) = match open_guard(state) {
+        Ok(Some(opened)) => opened,
         Ok(None) => {
             log::debug!(
                 "instance-handoff: {} is on a network file system, so this owner holds no guard",
@@ -1271,9 +1313,13 @@ pub(crate) fn take_guard(state: &Path, shared: bool) -> Result<Option<Guard>, Re
         }
         Err(source) => return Err(Reason::Lock { path, source }),
     };
-    let op = if shared { libc::LOCK_SH } else { libc::LOCK_EX };
-    match flock_nb(fd.as_fd(), op) {
-        Ok(true) => Ok(Some(Guard(fd))),
+    match flock_nb(file.as_fd(), guard_op(shared)) {
+        Ok(true) => Ok(Some(Guard {
+            file,
+            dir,
+            state: state.to_owned(),
+            shared,
+        })),
         Ok(false) => Err(Reason::StateInUse { path }),
         Err(e) if locks_unsupported(&e) => {
             log::warn!(
@@ -1286,12 +1332,9 @@ pub(crate) fn take_guard(state: &Path, shared: bool) -> Result<Option<Guard>, Re
     }
 }
 
-/// Opens the guard file in `state`, creating it. Read-only, since `flock`
-/// needs no more on a local disk, so a guard file that exists can be
-/// locked in a folder that is read-only. Non-blocking, so a FIFO in its
-/// place can't hold the launch up. `None`, with nothing made, when `state`
-/// is on a network file system.
-fn open_guard(state: &Path) -> io::Result<Option<OwnedFd>> {
+/// Opens the `state` folder, and the guard file in it ([`open_guard_in`]).
+/// `None`, with nothing made, when `state` is on a network file system.
+fn open_guard(state: &Path) -> io::Result<Option<(OwnedFd, OwnedFd)>> {
     open_guard_with(state, is_network)
 }
 
@@ -1300,11 +1343,20 @@ fn open_guard(state: &Path) -> io::Result<Option<OwnedFd>> {
 fn open_guard_with(
     state: &Path,
     network: fn(BorrowedFd<'_>) -> bool,
-) -> io::Result<Option<OwnedFd>> {
+) -> io::Result<Option<(OwnedFd, OwnedFd)>> {
     let dir = open_dir(None, state, true)?;
     if network(dir.as_fd()) {
         return Ok(None);
     }
+    let file = open_guard_in(dir.as_fd())?;
+    Ok(Some((dir, file)))
+}
+
+/// Opens the guard file in the state folder open as `dir`, creating it.
+/// Read-only, since `flock` needs no more on a local disk, so a guard file
+/// that exists can be locked in a folder that is read-only. Non-blocking,
+/// so a FIFO in its place can't hold the launch up.
+fn open_guard_in(dir: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     let c = cstr(OsStr::new(naming::GUARD_FILE))?;
     let flags =
         libc::O_RDONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
@@ -1319,7 +1371,82 @@ fn open_guard_with(
     if owner_mode(fd.as_fd())?.0 != euid() {
         return Err(denied("owned by another user"));
     }
-    Ok(Some(fd))
+    Ok(fd)
+}
+
+/// The device and inode of what is at `path`, from the folder open as
+/// `at` or else from the working directory, without following a link
+/// there.
+fn lstat_key(at: Option<BorrowedFd<'_>>, path: &Path) -> io::Result<(u64, u64)> {
+    let c = cstr(path.as_os_str())?;
+    let dirfd = at.map_or(libc::AT_FDCWD, |fd| fd.as_raw_fd());
+    // SAFETY: stat is plain data; fstatat fills it in.
+    let mut st: Stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid C string, and `st` is valid for writes.
+    cvt(unsafe { sys_fstatat(dirfd, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) })?;
+    Ok(stat_key(&st))
+}
+
+impl Guard {
+    /// The guard file's path.
+    fn path(&self) -> PathBuf {
+        self.state.join(naming::GUARD_FILE)
+    }
+
+    /// Whether the state folder's path, then the guard file's path in the
+    /// folder held, still name what this guard holds: the same device and
+    /// inode, and not a link. A guard file removed (its path names nothing)
+    /// or replaced (it names another file) in that folder is opened, made
+    /// if missing, and locked again in the same mode, unless another
+    /// process holds the new one in a mode that conflicts. Any other error
+    /// is [`GuardFound::Unknown`]: a second lock on the file held, were it
+    /// still in place, would conflict with this guard's own.
+    fn look(&mut self) -> GuardFound {
+        let held = |fd: &OwnedFd| fstat(fd.as_fd()).map(|st| stat_key(&st));
+        match (lstat_key(None, &self.state), held(&self.dir)) {
+            (Ok(found), Ok(ours)) if found == ours => {}
+            (Ok(_), Ok(_)) => return GuardFound::Lost,
+            (Err(e), _)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return GuardFound::Lost;
+            }
+            (Err(e), _) | (_, Err(e)) => return GuardFound::Unknown(e),
+        }
+        let ours = match held(&self.file) {
+            Ok(ours) => ours,
+            Err(e) => return GuardFound::Unknown(e),
+        };
+        let name = Path::new(naming::GUARD_FILE);
+        match lstat_key(Some(self.dir.as_fd()), name) {
+            Ok(found) if found == ours => return GuardFound::InPlace,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return GuardFound::Unknown(e),
+        }
+        let file = match open_guard_in(self.dir.as_fd()) {
+            Ok(file) => file,
+            Err(e) => return GuardFound::Unknown(e),
+        };
+        // Put back since the look above: it is the file held.
+        match held(&file) {
+            Ok(found) if found == ours => return GuardFound::InPlace,
+            Ok(_) => {}
+            Err(e) => return GuardFound::Unknown(e),
+        }
+        match flock_nb(file.as_fd(), guard_op(self.shared)) {
+            Ok(true) => {
+                // Closing the old file gives its lock up.
+                self.file = file;
+                GuardFound::Retaken
+            }
+            Ok(false) => GuardFound::Lost,
+            Err(e) => GuardFound::Unknown(e),
+        }
+    }
 }
 
 /// Whether `e`, from `flock` on the guard file [`open_guard`] just opened,
@@ -1694,7 +1821,8 @@ struct Connection<T> {
     shut: bool,
 }
 
-/// Runs the owner's thread until the handle closes it or the lock is lost.
+/// Runs the owner's thread until the handle closes it, or the lock or the
+/// state folder is lost.
 pub(crate) fn serve<T: Payload>(
     mut core: Core<T>,
     mut listener: Option<UnixListener>,
@@ -1706,6 +1834,7 @@ pub(crate) fn serve<T: Payload>(
     let upkeep = core.ctx.upkeep;
     let mut next_check = Instant::now() + upkeep.check;
     let mut next_touch = Instant::now() + upkeep.touch;
+    let mut kept_out = None;
 
     while core.poll_control() {
         let now = Instant::now();
@@ -1815,9 +1944,10 @@ pub(crate) fn serve<T: Payload>(
             }
         }
         if now >= next_check {
-            next_check = now + upkeep.check;
-            if !check_lock(&mut core, &mut listener, &place) {
-                break;
+            match check_lock(&mut core, &mut listener, &place, &mut kept_out) {
+                Upkept::Kept => next_check = now + upkeep.check,
+                Upkept::Soon => next_check = now + upkeep.check.min(SOON),
+                Upkept::Ended => break,
             }
         }
     }
@@ -1825,21 +1955,96 @@ pub(crate) fn serve<T: Payload>(
     drop(listener);
 }
 
-/// Every minute: is the lock file still the one held? Re-creates the
-/// folder, the lock and the socket when something deleted them. `false`
-/// when another process took the lock meanwhile.
+/// How soon the owner looks again at a lock that a launch holds in its
+/// re-made folder: the launch finds the guard held, and lets go.
+const SOON: Duration = Duration::from_secs(1);
+
+/// How long another process may hold the lock in the re-made folder before
+/// the owner says so at warn. A launch lets go within about 50 ms of
+/// finding the guard held, so one that holds the lock this long is an
+/// owner, or an [exclusive](crate::Builder::exclusive) run, under
+/// [`Guard::Off`](crate::Guard::Off), and launches can't reach this owner
+/// meanwhile.
+const KEPT_OUT: Duration = Duration::from_secs(10);
+
+/// Since when another process has held the lock in the re-made folder,
+/// and whether the owner has said so at warn.
+struct KeptOut {
+    since: Instant,
+    told: bool,
+}
+
+/// What the owner's upkeep did, and when it looks next.
+enum Upkept {
+    /// All is in place, or in place again: look at the next check.
+    Kept,
+    /// Another process holds the lock in the re-made folder: look again
+    /// [`SOON`].
+    Soon,
+    /// The owner has ended.
+    Ended,
+}
+
+/// Every minute: are the state folder and its guard file, while the owner
+/// holds the guard, and the lock file still the ones held? Ends the owner
+/// with [`End::LostState`] when the state folder isn't, or another process
+/// holds the guard file now at its path. Re-creates the guard file when
+/// only it was removed, and the folder, the lock and the socket when
+/// something deleted them. Ends the owner with
+/// [`End::LostLock`] when another process took the lock meanwhile, unless
+/// the owner holds the guard alone: it then waits, and `kept_out` says
+/// since when.
+///
+/// [`End::LostState`]: crate::End::LostState
+/// [`End::LostLock`]: crate::End::LostLock
 fn check_lock<T: Payload>(
     core: &mut Core<T>,
     listener: &mut Option<UnixListener>,
     place: &Place,
-) -> bool {
+    kept_out: &mut Option<KeptOut>,
+) -> Upkept {
     let app_id = core.ctx.app_id.clone();
+    // Kept only while another process still holds the lock.
+    let kept = kept_out.take();
     let mut held = core.shared.held();
     if core.shared.close.load(Ordering::SeqCst) {
-        return true;
+        return Upkept::Kept;
+    }
+    if let Some(guard) = &mut held.guard {
+        match guard.look() {
+            GuardFound::InPlace => {}
+            GuardFound::Retaken => log::warn!(
+                "instance-handoff {app_id}: the guard file {} was removed or replaced; \
+                 locked it again",
+                guard.path().display()
+            ),
+            GuardFound::Unknown(e) => log::warn!(
+                "instance-handoff {app_id}: looking at the state folder {} and its guard \
+                 file: {e}",
+                guard.state.display()
+            ),
+            GuardFound::Lost => {
+                log::warn!(
+                    "instance-handoff {app_id}: the state folder {} was removed or replaced, \
+                     or another process holds its guard: this process is no longer the owner",
+                    guard.state.display()
+                );
+                // The socket and the lock go too, so the next launch can own
+                // the folder now at the path. The guard first, as `release`
+                // gives them up.
+                held.unlink_socket();
+                held.socket = None;
+                drop(held.guard.take());
+                drop(held.lock.take());
+                drop(held);
+                *listener = None;
+                core.end(crate::End::LostState);
+                return Upkept::Ended;
+            }
+        }
     }
     let (Some(folder), Some(lock)) = (&held.folder, &held.lock) else {
-        return true;
+        return Upkept::Kept;
     };
     if folder.holds(lock) {
         // Gone, or replaced by a socket that nobody answers on (a forked
@@ -1866,7 +2071,7 @@ fn check_lock<T: Payload>(
                 Err(e) => log::warn!("instance-handoff {app_id}: socket: {e}"),
             }
         }
-        return true;
+        return Upkept::Kept;
     }
     match open_folder(place, true) {
         Ok(Some(new)) => match new.lock() {
@@ -1888,7 +2093,35 @@ fn check_lock<T: Payload>(
                 }
                 held.folder = Some(new);
                 held.lock = Some(new_lock);
-                true
+                Upkept::Kept
+            }
+            // A launch that took the lock finds the guard this owner holds
+            // alone, and lets go again. An owner with a scope shares the
+            // guard, so a launch of its scope would own, and does.
+            Ok(None) if held.guard.as_ref().is_some_and(|g| !g.shared) => {
+                let now = Instant::now();
+                let mut kept = kept.unwrap_or(KeptOut {
+                    since: now,
+                    told: false,
+                });
+                let waited = now.duration_since(kept.since);
+                if !kept.told && waited >= KEPT_OUT {
+                    log::warn!(
+                        "instance-handoff {app_id}: another process has held the lock in the \
+                         re-made runtime folder {} for {} s, so launches can't reach this \
+                         owner; it takes the lock there once that process lets go",
+                        new.path().display(),
+                        waited.as_secs()
+                    );
+                    kept.told = true;
+                } else {
+                    log::debug!(
+                        "instance-handoff {app_id}: another process holds the lock in the \
+                         re-made runtime folder; looking again soon"
+                    );
+                }
+                *kept_out = Some(kept);
+                Upkept::Soon
             }
             Ok(None) => {
                 log::warn!(
@@ -1903,19 +2136,19 @@ fn check_lock<T: Payload>(
                 // The files at the path are the new owner's: remove nothing.
                 *listener = None;
                 core.end(crate::End::LostLock);
-                false
+                Upkept::Ended
             }
             Err(e) => {
                 log::warn!("instance-handoff {app_id}: re-creating the lock: {e}");
-                true
+                Upkept::Kept
             }
         },
         // The folder can't be made now (the session's runtime folder is
         // gone until the next login): keep the lock held, and look again.
-        Ok(None) => true,
+        Ok(None) => Upkept::Kept,
         Err(reason) => {
             log::debug!("instance-handoff {app_id}: re-creating the folder: {reason}");
-            true
+            Upkept::Kept
         }
     }
 }
@@ -2475,6 +2708,88 @@ mod tests {
         assert!(matches!(err, Reason::StateInUse { .. }), "{err}");
         drop(unkeyed);
         assert!(take_guard(state, true).unwrap().is_some());
+    }
+
+    /// What the owner's upkeep finds at `guard`'s paths, by name.
+    fn look(guard: &mut Guard) -> &'static str {
+        match guard.look() {
+            GuardFound::InPlace => "in place",
+            GuardFound::Retaken => "retaken",
+            GuardFound::Lost => "lost",
+            GuardFound::Unknown(e) => panic!("{e}"),
+        }
+    }
+
+    // A guard file removed or replaced in the state folder the owner holds
+    // is made, or opened, and locked again in the owner's mode, so a launch
+    // finds it held as before. Keyed owners lock the new one side by side.
+    #[test]
+    fn a_guard_file_removed_from_its_folder_is_locked_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        make_state_dir(&state).unwrap();
+        let file = state.join(".instance-handoff.lock");
+        let mut guard = take_guard(&state, false).unwrap().unwrap();
+        assert_eq!(look(&mut guard), "in place");
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(look(&mut guard), "retaken");
+        assert!(file.is_file());
+        assert_eq!(look(&mut guard), "in place");
+        let err = take_guard(&state, true).unwrap_err();
+        assert!(matches!(err, Reason::StateInUse { .. }), "{err}");
+        let new = tmp.path().join("new");
+        std::fs::write(&new, b"").unwrap();
+        std::fs::rename(&new, &file).unwrap();
+        assert_eq!(look(&mut guard), "retaken");
+        let err = take_guard(&state, false).unwrap_err();
+        assert!(matches!(err, Reason::StateInUse { .. }), "{err}");
+        drop(guard);
+
+        let mut a = take_guard(&state, true).unwrap().unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let b = take_guard(&state, true).unwrap().unwrap();
+        assert_eq!(look(&mut a), "retaken");
+        let err = take_guard(&state, false).unwrap_err();
+        assert!(matches!(err, Reason::StateInUse { .. }), "{err}");
+        drop((a, b));
+    }
+
+    // Another owner that locks the new guard file first, in a mode that
+    // conflicts, owns the state folder now.
+    #[test]
+    fn a_new_guard_file_held_by_another_owner_is_lost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        let file = state.join(".instance-handoff.lock");
+        for (ours, theirs) in [(false, false), (false, true), (true, false)] {
+            let mut guard = take_guard(state, ours).unwrap().unwrap();
+            std::fs::remove_file(&file).unwrap();
+            let other = take_guard(state, theirs).unwrap().unwrap();
+            assert_eq!(look(&mut guard), "lost", "{ours} {theirs}");
+            drop((guard, other));
+        }
+    }
+
+    // The state folder is looked at by its path, not followed through a
+    // link: renamed aside, made anew, or a link to the old one, it isn't
+    // the folder the guard is in. Put back, it is again.
+    #[test]
+    fn a_replaced_state_folder_is_lost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let old = tmp.path().join("old");
+        make_state_dir(&state).unwrap();
+        let mut guard = take_guard(&state, false).unwrap().unwrap();
+        std::fs::rename(&state, &old).unwrap();
+        assert_eq!(look(&mut guard), "lost");
+        make_state_dir(&state).unwrap();
+        assert_eq!(look(&mut guard), "lost");
+        std::fs::remove_dir(&state).unwrap();
+        std::os::unix::fs::symlink(&old, &state).unwrap();
+        assert_eq!(look(&mut guard), "lost");
+        std::fs::remove_file(&state).unwrap();
+        std::fs::rename(&old, &state).unwrap();
+        assert_eq!(look(&mut guard), "in place");
     }
 
     // A lock needs no write, so a guard file that exists is locked in a

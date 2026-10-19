@@ -98,8 +98,8 @@ fn main() -> ExitCode {
     }
 
     handle(&Request::local(args));
-    // Ends by itself: the owner drops the handler when it ends (stop() or a
-    // lost lock), which closes the channel.
+    // Ends by itself: the owner drops the handler when it ends (stop(), or a
+    // lost lock or state folder), which closes the channel.
     for request in rx {
         if request.payload().first().is_some_and(|a| a == "stop") {
             owner.stop();
@@ -107,7 +107,7 @@ fn main() -> ExitCode {
         }
         handle(&request);
     }
-    if owner.ended() == Some(End::LostLock) {
+    if matches!(owner.ended(), Some(End::LostLock | End::LostState)) {
         eprintln!("notes: another daemon took over; not saving");
         return ExitCode::from(2);
     }

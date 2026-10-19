@@ -754,21 +754,52 @@ fn a_busy_handler_makes_launches_retry_then_run_alone() {
     owner.release();
 }
 
-// Windows can't delete or open up a folder the owner holds.
+// Windows can't delete or open up a folder the owner holds. A launch
+// before the owner's next check makes the folder again and takes the lock
+// there, but finds the guard held and lets go; the owner then takes the
+// lock there itself.
 #[cfg(unix)]
 #[test]
 fn a_deleted_folder_is_re_created() {
     let dir = dir();
-    let check = Duration::from_millis(100);
+    let check = Duration::from_millis(400);
     let (owner, rx) = serve(claim(
         builder(&dir)
             .__upkeep(check, Duration::from_secs(3600))
             .start(&Args::default()),
     ));
     std::fs::remove_dir_all(&dir.path).unwrap();
-    std::thread::sleep(check * 4);
+    let reason = alone(builder(&dir).start(&args(&["gap"])));
+    assert!(matches!(reason, Reason::StateInUse { .. }), "{reason}");
+    std::thread::sleep(check * 3);
     let run = builder(&dir).runtime_dir().unwrap();
     assert!(run.join("instance.lock").exists());
+    builder(&dir).hand_off(&args(&["after"])).unwrap();
+    assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["after"]));
+    assert_eq!(owner.ended(), None);
+    owner.release();
+}
+
+// An owner that holds the guard alone outlasts another process that holds
+// the lock in its re-made folder: it looks again until the lock is free.
+// A launch lets go as soon as it finds the guard held; an owner without
+// the guard stands in for it here, and holds on longer.
+#[cfg(unix)]
+#[test]
+fn an_owner_with_the_guard_waits_for_the_lock_in_its_re_made_folder() {
+    let dir = dir();
+    let check = Duration::from_millis(400);
+    let (owner, rx) = serve(claim(
+        builder(&dir)
+            .__upkeep(check, Duration::from_secs(3600))
+            .start(&Args::default()),
+    ));
+    std::fs::remove_dir_all(&dir.path).unwrap();
+    let other = claim(builder(&dir).guard(Guard::Off).start(&Args::default()));
+    std::thread::sleep(check * 3);
+    assert_eq!(owner.ended(), None);
+    other.release();
+    std::thread::sleep(check * 3);
     builder(&dir).hand_off(&args(&["after"])).unwrap();
     assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["after"]));
     assert_eq!(owner.ended(), None);
@@ -811,16 +842,20 @@ fn an_owner_whose_lock_was_taken_ends_with_lost_lock() {
     second.release();
 }
 
-// An owner told to stop writing the state gives its guard up too, so a
-// launch in another runtime folder can own the state folder.
+// An owner with a scope shares the guard, so a launch of its scope that
+// makes its deleted folder again takes the guard too, and owns. The first
+// is told to stop writing the state, and gives its share of the guard up
+// too, so once the second lets go, an owner without a scope, in another
+// runtime folder, can own the state folder.
 #[cfg(unix)]
 #[test]
-fn an_owner_that_lost_its_lock_gives_the_guard_up() {
+fn a_keyed_owner_that_lost_its_lock_gives_the_guard_up() {
     let dir = dir();
     let check = Duration::from_millis(400);
     let (tx, rx) = mpsc::channel();
     let first = claim(
         builder(&dir)
+            .scope("a")
             .__upkeep(check, Duration::from_secs(3600))
             .start(&Args::default()),
     );
@@ -829,10 +864,11 @@ fn an_owner_that_lost_its_lock_gives_the_guard_up() {
         .on_end(move |why| tx.send(why).unwrap())
         .serve(|_: Request<Args>| true);
     std::fs::remove_dir_all(&dir.path).unwrap();
-    // An owner without a guard takes the re-made folder before the first
-    // one looks.
-    let second = claim(builder(&dir).guard(Guard::Off).start(&Args::default()));
+    // It takes the re-made folder before the first one looks.
+    let second = claim(builder(&dir).scope("a").start(&Args::default()));
+    assert!(second.guarded());
     assert_eq!(rx.recv_timeout(check * 4).unwrap(), End::LostLock);
+    second.release();
     let other = claim(
         builder(&dir)
             .dir(dir.tmp.path().join("other"))
@@ -840,8 +876,118 @@ fn an_owner_that_lost_its_lock_gives_the_guard_up() {
     );
     assert!(other.guarded());
     other.release();
-    second.release();
     drop(first);
+}
+
+// The owner looks at its state folder at every check. One renamed aside
+// and made anew isn't the folder whose guard it holds, so the owner is
+// told to stop writing the state, and gives up its guard, its socket and
+// its lock: the next launch owns the new folder, and one that names the
+// folder renamed aside owns that. Nor does it remove anything after.
+#[cfg(unix)]
+#[test]
+fn an_owner_whose_state_folder_was_replaced_ends_with_lost_state() {
+    let dir = dir();
+    let check = Duration::from_millis(400);
+    let (tx, rx) = mpsc::channel();
+    let first = claim(
+        builder(&dir)
+            .__upkeep(check, Duration::from_secs(3600))
+            .start(&Args::default()),
+    );
+    let state = first.state_dir().unwrap().to_owned();
+    let first = first
+        .on_end(move |why| tx.send(why).unwrap())
+        .serve(|_: Request<Args>| true);
+    let old = state.with_extension("old");
+    std::fs::rename(&state, &old).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        End::LostState
+    );
+    assert_eq!(first.ended(), Some(End::LostState));
+    let aside = claim(
+        Builder::new(APP, State::dir(&old))
+            .dir(&dir.path)
+            .start(&Args::default()),
+    );
+    assert!(aside.guarded());
+    aside.release();
+    let second = claim(builder(&dir).start(&Args::default()));
+    assert_eq!(second.dir(), first.dir());
+    assert!(second.guarded());
+    let (second, rx2) = serve(second);
+    drop(first);
+    builder(&dir).hand_off(&args(&["x"])).unwrap();
+    assert_eq!(rx2.recv_timeout(SHORT).unwrap().payload(), &args(&["x"]));
+    second.release();
+}
+
+// A guard file removed from the state folder is made again at the owner's
+// next check, unless another process locks the new one first: here an
+// owner in another runtime folder. The first is then told to stop writing
+// the state, and gives up its lock, so a launch in its runtime folder
+// takes the lock there and finds the state folder in use.
+#[cfg(unix)]
+#[test]
+fn an_owner_whose_guard_file_another_owner_locks_ends_with_lost_state() {
+    let dir = dir();
+    let check = Duration::from_millis(400);
+    let (tx, rx) = mpsc::channel();
+    let first = claim(
+        builder(&dir)
+            .__upkeep(check, Duration::from_secs(3600))
+            .start(&Args::default()),
+    );
+    let file = first.state_dir().unwrap().join(".instance-handoff.lock");
+    let first = first
+        .on_end(move |why| tx.send(why).unwrap())
+        .serve(|_: Request<Args>| true);
+    let other = loop {
+        std::fs::remove_file(&file).unwrap();
+        match builder(&dir)
+            .dir(dir.tmp.path().join("other"))
+            .start(&Args::default())
+        {
+            Started::Owner(claim) => break claim,
+            // The first owner's check made the file again in between.
+            Started::Alone(Reason::StateInUse { .. }) => {}
+            started => panic!("{started:?}"),
+        }
+    };
+    assert!(other.guarded());
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        End::LostState
+    );
+    assert_eq!(first.ended(), Some(End::LostState));
+    let reason = alone(builder(&dir).start(&args(&["after"])));
+    assert!(matches!(reason, Reason::StateInUse { .. }), "{reason}");
+    other.release();
+    drop(first);
+}
+
+// An owner that holds no guard doesn't look at its state folder.
+#[cfg(unix)]
+#[test]
+fn an_unguarded_owner_keeps_a_replaced_state_folder() {
+    let dir = dir();
+    let check = Duration::from_millis(400);
+    let (owner, rx) = serve(claim(
+        builder(&dir)
+            .guard(Guard::Off)
+            .__upkeep(check, Duration::from_secs(3600))
+            .start(&Args::default()),
+    ));
+    let state = owner.state_dir().unwrap().to_owned();
+    std::fs::rename(&state, state.with_extension("old")).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    std::thread::sleep(check * 4);
+    assert_eq!(owner.ended(), None);
+    builder(&dir).hand_off(&args(&["x"])).unwrap();
+    assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["x"]));
+    owner.release();
 }
 
 // The owner holds its folders, its lock and its address open, sharing no

@@ -53,11 +53,16 @@
 //!   the guard alone, where it takes one, for a process's own work, so no
 //!   launch that takes the guard owns the state folder beside it. A
 //!   process that gets [`Started::Alone`] must not write the state the
-//!   owner owns. If the runtime folder is deleted under a running owner
-//!   and another process takes the lock there before this one re-creates
-//!   it (a new owner, or a launch that finds this owner's guard and lets
-//!   go again), this one is told ([`End::LostLock`]) within a minute, and
-//!   gives its guard up.
+//!   owner owns. If the state folder is removed or replaced under an owner
+//!   that holds its guard, the owner is told ([`End::LostState`]) within a
+//!   minute, and gives up its guard and its lock, so the next launch owns
+//!   the folder now at the path. If the runtime folder is deleted under a
+//!   running owner, the owner makes it again within a minute, once no
+//!   other process holds the lock there. Where the owner holds the guard
+//!   alone, a launch that takes the lock there first finds the guard held
+//!   and lets go, and the owner waits for any other process that holds it.
+//!   Otherwise, if another process takes the lock there first, the owner
+//!   is told ([`End::LostLock`]), and gives its guard up.
 //! - Each launch ends one of three ways, whatever the timing (stopped
 //!   processes, slow handlers, expired timeouts):
 //!   - it hands off ([`Started::HandedOff`]): an owner's handler takes its
@@ -131,7 +136,7 @@
 //!    an event-loop proxy or a channel that has other senders, the callback
 //!    given to [`Claim::on_end`] marks the same moment.
 //! 3. Write your state while still holding the lock, unless the owner ended
-//!    with [`End::LostLock`].
+//!    with [`End::LostLock`] or [`End::LostState`].
 //! 4. Exit. The lock and the guard go with the process.
 //!
 //! Dropping an [`Owner`] stops serving but **keeps the lock and the guard
@@ -217,9 +222,15 @@
 //! remote. Nor does it where the file system can't lock files: see
 //! [`Guard::Local`]. A `start` that takes the lock makes the state folder
 //! first if it is missing, private, whether or not it takes the guard.
-//! [`Builder::exclusive`] takes the guard alone, with no lock in a runtime
-//! folder; where it can't take the guard, it takes the lock in the runtime
-//! folder instead, and serves nothing.
+//! Every minute, an owner that holds the guard checks that the paths of
+//! the state folder and of the guard file still name the ones it holds. It
+//! makes a removed guard file again, and ends with [`End::LostState`] when
+//! the state folder was removed or replaced, or another process holds the
+//! new guard file. On Windows nothing can change either while the owner
+//! holds the guard. [`Builder::exclusive`] takes the guard alone, with no
+//! lock in a runtime folder; where it can't take the guard, it takes the
+//! lock in the runtime folder instead, and serves nothing. Unlike an
+//! owner, it never checks that the state folder is still in place.
 //!
 //! # Privileges
 //!

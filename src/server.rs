@@ -88,8 +88,10 @@ pub(crate) struct Shared {
     pub(crate) ended: Mutex<Option<End>>,
     pub(crate) waker: sys::Waker,
     /// The folder, the lock and the guard. The thread's upkeep replaces the
-    /// folder and the lock when the folder is deleted under it; `release`
-    /// closes the guard and the lock.
+    /// folder and the lock when the folder is deleted under it, and the
+    /// guard when its file is removed from the state folder. It closes the
+    /// guard and the lock when the state folder is lost; `release` closes
+    /// them too.
     pub(crate) held: Mutex<sys::Held>,
 }
 
@@ -217,12 +219,12 @@ impl<T: Payload> Core<T> {
 
     /// Ends serving: records why, drops the handler (closing whatever it
     /// fed), then tells `on_end`, once. The first reason is kept, except
-    /// that a lost lock replaces it: an app that stopped must still learn
-    /// that it no longer owns the state.
+    /// that a lost lock or state folder replaces it: an app that stopped
+    /// must still learn that it no longer owns the state.
     pub(crate) fn end(&mut self, why: End) {
         {
             let mut ended = self.shared.ended.lock().unwrap_or_else(|e| e.into_inner());
-            if ended.is_none() || why == End::LostLock {
+            if ended.is_none() || matches!(why, End::LostLock | End::LostState) {
                 *ended = Some(why);
             }
         }
@@ -923,6 +925,16 @@ mod tests {
         assert_eq!(c.shared.ended(), Some(End::Stopped));
         c.end(End::LostLock);
         assert_eq!(c.shared.ended(), Some(End::LostLock));
+    }
+
+    #[test]
+    fn a_lost_state_overrides_stop_too() {
+        let mut c = core(Some(Box::new(|_| Answer::Take)));
+        c.shared.stop.store(true, Ordering::SeqCst);
+        assert!(c.poll_control());
+        assert_eq!(c.shared.ended(), Some(End::Stopped));
+        c.end(End::LostState);
+        assert_eq!(c.shared.ended(), Some(End::LostState));
     }
 
     #[test]

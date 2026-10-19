@@ -54,11 +54,13 @@
 //! or lock the guard there, and so is a link or a junction in the state
 //! folder's place. The handle shares no delete, so while the owner holds
 //! it, the file can't be removed, nor the state folder renamed or removed.
-//! A missing state folder is made with an access list of its own, for this
-//! user and SYSTEM, and no label of its own: it still takes one that the
-//! folder above it hands down, and one above medium is then refused. No
-//! guard is taken on a share, which a mapped drive resolves to, or on a
-//! drive that Windows says is remote.
+//! The owner's upkeep still checks that the guard's path names the file it
+//! holds, by its file index, and ends the owner with `End::LostState` when
+//! it doesn't. A missing state folder is made with an access list of its
+//! own, for this user and SYSTEM, and no label of its own: it still takes
+//! one that the folder above it hands down, and one above medium is then
+//! refused. No guard is taken on a share, which a mapped drive resolves
+//! to, or on a drive that Windows says is remote.
 //!
 //! A launch that finds byte 0 held reads the owner's level from its marker
 //! before it connects. It tries its own level's byte with a shared lock.
@@ -1800,7 +1802,47 @@ pub(crate) fn make_state_dir(state: &Path) -> io::Result<()> {
 /// delete, so while it is open nobody can remove the file, or rename or
 /// remove the state folder.
 #[derive(Debug)]
-pub(crate) struct Guard(#[allow(dead_code)] File);
+pub(crate) struct Guard {
+    file: File,
+    /// The guard file's path, in the canonical state folder.
+    path: PathBuf,
+}
+
+impl Guard {
+    /// Whether the guard file's path still names the file this guard
+    /// locks: the same volume and file index. Nothing can remove the file,
+    /// or rename the state folder, while the guard is held, so it always
+    /// should.
+    fn in_place(&self) -> io::Result<bool> {
+        let found = match OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&self.path)
+        {
+            Ok(found) => found,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        Ok(file_id(&found)? == file_id(&self.file)?)
+    }
+}
+
+/// The volume serial number and file index of the open `file`, which tell
+/// two files apart on NTFS.
+fn file_id(file: &File) -> io::Result<(u32, u32, u32)> {
+    // SAFETY: plain data, filled in by the call.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: an open handle, and a struct the call fills in.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        info.dwVolumeSerialNumber,
+        info.nFileIndexHigh,
+        info.nFileIndexLow,
+    ))
+}
 
 /// Takes the guard in the canonical `state` folder, which
 /// [`make_state_dir`] has made: shared for a keyed owner, so keyed owners
@@ -1833,7 +1875,7 @@ fn take_guard_with(
         Err(source) => return Err(Reason::Lock { path, source }),
     };
     match try_lock(&file, GUARD_BYTE, 1, !shared) {
-        Ok(true) => Ok(Some(Guard(file))),
+        Ok(true) => Ok(Some(Guard { file, path })),
         Ok(false) => Err(Reason::StateInUse { path }),
         Err(e) if locks_unsupported(&e) => {
             log::warn!(
@@ -2425,7 +2467,8 @@ fn pump<T: Payload>(c: &mut PipeConn<T>, app_id: &AppId) {
     }
 }
 
-/// Runs the owner's thread until the handle closes it.
+/// Runs the owner's thread until the handle closes it or the state folder
+/// is lost.
 pub(crate) fn serve<T: Payload>(
     mut core: Core<T>,
     mut listener: Option<PipeListener>,
@@ -2631,6 +2674,9 @@ pub(crate) fn serve<T: Payload>(
         conns.retain(|c| !c.session.is_done());
 
         if now >= next_check {
+            if !check_guard(&mut core, &mut listener) {
+                break;
+            }
             let published = check_address(&core, listener.as_mut());
             next_check = now + if published { upkeep.check } else { soon };
         }
@@ -2691,6 +2737,50 @@ fn connected<T: Payload>(
     };
     pump(&mut c, app_id);
     conns.push(c);
+}
+
+/// While the owner holds the guard: does the guard file's path still name
+/// the file it locks? Nothing can remove the file or rename the state
+/// folder while the owner holds it open, so this is a last check, and
+/// nothing is made again: an owner that finds another file there, or none,
+/// gives up its guard, its address and its lock, and ends with
+/// [`End::LostState`]. `false` once it has.
+///
+/// [`End::LostState`]: crate::End::LostState
+fn check_guard<T: Payload>(core: &mut Core<T>, listener: &mut Option<PipeListener>) -> bool {
+    let app_id = core.ctx.app_id.clone();
+    let mut held = core.shared.held();
+    if core.shared.close.load(std::sync::atomic::Ordering::SeqCst) {
+        return true;
+    }
+    let Some(guard) = &held.guard else {
+        return true;
+    };
+    match guard.in_place() {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(e) => {
+            log::warn!(
+                "instance-handoff {app_id}: looking at the guard file {}: {e}",
+                guard.path.display()
+            );
+            return true;
+        }
+    }
+    log::warn!(
+        "instance-handoff {app_id}: the guard file {} was removed or replaced: this process \
+         is no longer the owner",
+        guard.path.display()
+    );
+    // The address and the lock go too, so the next launch can own the
+    // folder now at the path. The guard first, as `release` gives them up.
+    held.unlink_socket();
+    drop(held.guard.take());
+    drop(held.lock.take());
+    drop(held);
+    *listener = None;
+    core.end(crate::End::LostState);
+    false
 }
 
 /// The address file must name this owner's pipe: written again when it
@@ -3130,6 +3220,32 @@ mod tests {
         unlock(&other, GUARD_BYTE, 1).unwrap();
         assert!(take_guard(&state, false).unwrap().is_some());
         assert_eq!(std::fs::metadata(&file).unwrap().len(), 0);
+    }
+
+    // The owner's upkeep compares the file at the guard's path with the one
+    // it holds. Held, the guard file can't be removed or replaced, so only a
+    // guard made up here finds another file there, or none.
+    #[test]
+    fn a_guard_is_in_place_only_while_its_path_names_its_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        make_state_dir(&state).unwrap();
+        let guard = take_guard(&state, false)
+            .unwrap()
+            .expect("a local folder locks");
+        assert!(guard.in_place().unwrap());
+        let other = tmp.path().join("other");
+        std::fs::write(&other, b"").unwrap();
+        let elsewhere = Guard {
+            file: File::open(&other).unwrap(),
+            path: guard.path.clone(),
+        };
+        assert!(!elsewhere.in_place().unwrap());
+        let gone = Guard {
+            file: File::open(&other).unwrap(),
+            path: tmp.path().join("missing").join(GUARD_FILE),
+        };
+        assert!(!gone.in_place().unwrap());
     }
 
     // Frozen with the guard's modes: a keyed owner's lock is shared, so
