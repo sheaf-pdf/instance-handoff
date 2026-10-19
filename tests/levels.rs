@@ -74,12 +74,15 @@ const HIGH: u32 = 0x3000;
 /// The byte a proposed state lock would hold, after 0015.
 const GUARD: u64 = 1 << 31;
 
-/// Files high makes for medium to try, and the label each gets.
-const FILES: [(&str, Option<&str>); 4] = [
+/// Files high makes for medium to try, and the label each gets. The last is
+/// owned by Administrators, as an elevated process's files are with UAC on;
+/// CI's runner, the built-in Administrator, makes them owned by the user.
+const FILES: [(&str, Option<&str>); 5] = [
     ("no-label", None),
     ("medium-label", Some("S:(ML;;NW;;;ME)")),
     ("high-label", Some("S:(ML;;NW;;;HI)")),
     ("high-label-nr", Some("S:(ML;;NWNR;;;HI)")),
+    ("administrators-owned", Some("O:BAS:(ML;;NW;;;ME)")),
 ];
 /// Folders high makes for medium to create a file in.
 const FOLDERS: [(&str, Option<&str>); 2] = [
@@ -210,15 +213,15 @@ fn what_each_level_may_do_with_the_others_files() {
     let dir = tmp.path();
     let mut facts = vec![("high: token".to_owned(), token_facts())];
 
-    for (name, sacl) in FILES {
-        let made = create(&dir.join(name), sacl, false).map(drop);
+    for (name, sddl) in FILES {
+        let made = create(&dir.join(name), sddl, false).map(drop);
         facts.push((
             format!("{name}: made by high"),
             made_as(&dir.join(name), &made),
         ));
     }
-    for (name, sacl) in FOLDERS {
-        let made = create(&dir.join(name), sacl, true).map(drop);
+    for (name, sddl) in FOLDERS {
+        let made = create(&dir.join(name), sddl, true).map(drop);
         facts.push((
             format!("{name}: made by high"),
             made_as(&dir.join(name), &made),
@@ -610,17 +613,17 @@ fn security(path: &Path) -> String {
     names(&sddl)
 }
 
-/// Creates the file or folder `path` with the label in `sacl` (such as
-/// `S:(ML;;NW;;;ME)`), or none, and the rest inherited. A file comes back
-/// open to read and write, shared.
-fn create(path: &Path, sacl: Option<&str>, folder: bool) -> io::Result<Option<File>> {
+/// Creates the file or folder `path` with the owner and label in `sddl`
+/// (such as `S:(ML;;NW;;;ME)`), or the defaults, and the access list
+/// inherited. A file comes back open to read and write, shared.
+fn create(path: &Path, sddl: Option<&str>, folder: bool) -> io::Result<Option<File>> {
     let mut sd = null_mut();
-    if let Some(sacl) = sacl {
-        let sacl = wide(OsStr::new(sacl));
+    if let Some(sddl) = sddl {
+        let sddl = wide(OsStr::new(sddl));
         // SAFETY: a NUL-terminated string; `sd` receives a LocalAlloc'd block.
         let ok = unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sacl.as_ptr(),
+                sddl.as_ptr(),
                 SDDL_REVISION_1,
                 &mut sd,
                 null_mut(),

@@ -30,5 +30,8 @@ The labels make the separation enforced by the OS, not by convention: a lower le
 ## Consequences
 
 - On Windows, launches from an admin terminal, or from an SSH session that runs elevated, don't reach the normal desktop owner. They get an owner of their own. This is the cost under review.
+- On 2026-10-18 this held on a Windows 11 machine with UAC on, with real tokens ([0015-windows-measurements.md](0015-windows-measurements.md)). Launches from Run as administrator, and from Windows `sudo` in its new-window and inline modes, each became an owner beside the normal one, and `status` and `stop` reached only their own level's owner. Run as administrator was tried in both orders.
+  - An app folder made at high is owned by Administrators, but the crate gives it an explicit access list for the user, so medium launches still own beside it.
+  - An inline `sudo` owner belongs to the terminal that started it: Ctrl+C or closing the window ends it, and its lock is free at once.
 - Owners at two levels may share files: the Windows profile, or root under `sudo -E` writing into the user's home. Apps that write shared state must keep it apart per level, or refuse to run elevated.
 - Within one Unix user, finer privileges aren't compared: supplementary groups (`newgrp`), capabilities, LSM confinement. A sandbox that must keep its processes away from the owner hides the runtime folder from them, as Flatpak and snap do.
