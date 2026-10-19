@@ -454,8 +454,8 @@
 //!   when the handle closes. A launch with no runtime folder to look in
 //!   takes it for a moment, in the mode an owner of its scope would, and
 //!   gives it back at once, with `LOCK_UN` or `UnlockFileEx`. So a launch
-//!   or an owner that would take it, and finds it held, looks again for
-//!   50 ms;
+//!   that would take it, and finds it held, looks again for 50 ms, and a
+//!   Unix owner that locks a replaced guard file again, for 250 ms;
 //! - the address. On Unix, `instance.sock` beside the lock. When that path
 //!   is too long for a socket address, Linux reaches it through
 //!   `/proc/self/fd`; otherwise, and on other Unixes, it uses

@@ -1592,10 +1592,12 @@ impl Guard {
 }
 
 /// An owner that locks a new guard file again ([`Guard::look`]) and finds
-/// it held looks again for this long, as `start` does, so a launch that
-/// takes the guard for a moment to look at it ([`guard_held`]) doesn't end
-/// the owner.
-const RELOCK_RETRY: Duration = Duration::from_millis(50);
+/// it held looks again for this long, so a launch that takes the guard for
+/// a moment to look at it ([`guard_held`]) doesn't end the owner, even a
+/// launch slowed down on a busy machine. Longer than `start`'s 50 ms: the
+/// owner waits only after its guard file was replaced, and a wrong
+/// [`LostState`](crate::End::LostState) costs more than the wait.
+const RELOCK_RETRY: Duration = Duration::from_millis(250);
 
 /// Whether `e`, from `flock` on the guard file [`open_guard`] or
 /// [`guard_held`] just opened, says that the file system can't lock it.
