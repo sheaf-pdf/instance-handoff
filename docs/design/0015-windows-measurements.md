@@ -104,9 +104,49 @@ Inline `sudo` runs the elevated program attached to the terminal that started it
 
 After each, `status` from high said "not running", and the medium owner answered throughout.
 
+## The layout, built by hand on CI
+
+On 2026-10-19 the probe in `tests/levels.rs` built 0015's Windows layout by hand on GitHub's runner (image windows-2025-vs2026, 20261007.264.1; runs 39221106656 and 39224197678). It ran at high, and at medium through the SAFER token.
+
+The two tokens:
+
+| | High (the runner) | Medium (SAFER) |
+|---|---|---|
+| Level | 0x3000 | 0x2000 |
+| Elevation type | default, no linked token | default, no linked token |
+| Restricted | no; 0 restricting SIDs | no; 0 restricting SIDs |
+| AppContainer | no | no |
+| Session | 2 | 2 |
+| Window station | `WinSta0`, visible | `WinSta0`, visible |
+
+UAC is on (`EnableLUA` 1, `FilterAdministratorToken` not set), but the runner's user is the built-in Administrator, whose token UAC doesn't split. So CI can't make a full, split token.
+
+What each level made, with its label ACEs counted:
+
+| Object | Security as made | Labels |
+|---|---|---|
+| Key folder, by either level | `D:P(A;OICI;FA;;;<user>)(A;OICI;FA;;;SY)S:(ML;;NWNR;;;ME)` | one: medium, explicit |
+| `instance.lock` in it | `D:P(A;;FA;;;<user>)(A;;FA;;;SY)S:(ML;;NWNR;;;ME)` | one: medium, explicit |
+| `run` in it, by medium | `S:(ML;OICI;NWNR;;;ME)` | one: medium, explicit |
+| `run-high` in it, by high | `S:(ML;OICI;NWNR;;;HI)` | one: high, explicit |
+| The key folder with its label protected, `S:P(...)` | not made at either level: error 1314, "A required privilege is not held by the client" | |
+
+Across levels, with the owner holding byte 0 and the byte at its level's RID:
+
+| Try | Medium, in high's key folder | High, in medium's key folder |
+|---|---|---|
+| Open `instance.lock` to write | ok | ok |
+| Exclusive lock on byte 0 | lock violation | lock violation |
+| Find the marker with shared range locks | 0x3000, after 33 locks | 0x2000, after 33 locks |
+| Make its own level folder | `run`: made | `run-high`: made |
+| List the other level's folder | `run-high`: access denied | not tried |
+
+Medium could also open high's key folder. So labels that aren't protected stay single, a folder's label that doesn't inherit reaches none of its children, and each level finds the other's marker. A protected label can't be set by either level, so the layout uses labels that aren't protected (call 5.8 in [docs/impl/0015-calls.md](../impl/0015-calls.md)).
+
 ## Not measured
 
 - The probe's folder rows, and the reverse direction, with the real limited token (only with SAFER).
 - `sudo`'s input-closed mode.
 - Elevated SSH, other users, low integrity and AppContainer.
-- 0015's layout itself, which isn't built. These are the facts it would rest on.
+- 0015's layout as the crate builds it. The probe builds it by hand.
+- A full, split token on CI.
