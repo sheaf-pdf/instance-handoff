@@ -155,6 +155,8 @@
 //! lock would span machines. The owner touches its files every hour, so
 //! cleaners that go by age leave them alone, and checks every minute that
 //! its lock is still in place, re-creating it when something deleted it.
+//! On Windows nothing can: the owner holds its folder, its lock and
+//! `instance.pipe` open, sharing no delete.
 //!
 //! # Privileges
 //!

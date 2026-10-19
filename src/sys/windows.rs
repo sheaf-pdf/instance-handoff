@@ -31,7 +31,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
@@ -337,6 +337,9 @@ pub(crate) fn default_place(id: &AppId) -> Result<Place, Reason> {
 pub(crate) struct Folder {
     path: PathBuf,
     _handle: File,
+    /// `instance.pipe`, held open while this process publishes it, so that
+    /// a delete can't leave launches unable to find the pipe.
+    address: Mutex<Option<File>>,
 }
 
 fn open_dir(path: &Path) -> io::Result<File> {
@@ -494,7 +497,11 @@ pub(crate) fn open_folder(place: &Place, create: bool) -> Result<Option<Folder>,
             Err(e) => return Err(Reason::runtime_dir(&path, e)),
         };
     }
-    Ok(Some(Folder { path, _handle: dir }))
+    Ok(Some(Folder {
+        path,
+        _handle: dir,
+        address: Mutex::new(None),
+    }))
 }
 
 /// The held lock: `LockFileEx` on the first byte of the open file, released
@@ -565,13 +572,41 @@ impl Folder {
     }
 
     /// Writes `instance.pipe` in one step: written beside it, then renamed
-    /// over it.
+    /// over it. Then holds it open.
     fn publish(&self, app_id: &AppId, secret: &str) -> io::Result<()> {
+        // Held, it can't be renamed over.
+        self.let_go_of_address();
         let tmp = self.path.join(format!("{ADDRESS_FILE}.{secret}.tmp"));
         std::fs::write(&tmp, format!("{app_id} {secret}\n"))?;
         std::fs::rename(&tmp, self.path.join(ADDRESS_FILE)).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
-        })
+        })?;
+        self.hold_address();
+        Ok(())
+    }
+
+    /// Opens `instance.pipe` to read, sharing only reads, unless this
+    /// process already holds it. Nothing else can then delete it, rename
+    /// over it or write to it, and launches can still read it. A failure
+    /// leaves it as before; the owner's upkeep tries again.
+    fn hold_address(&self) {
+        let mut held = self.address.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_some() {
+            return;
+        }
+        match OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(self.path.join(ADDRESS_FILE))
+        {
+            Ok(file) => *held = Some(file),
+            Err(e) => log::debug!("instance-handoff: holding {ADDRESS_FILE}: {e}"),
+        }
+    }
+
+    fn let_go_of_address(&self) {
+        *self.address.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn published(&self) -> io::Result<Option<String>> {
@@ -583,6 +618,7 @@ impl Folder {
     }
 
     fn unpublish(&self) {
+        self.let_go_of_address();
         if let Err(e) = std::fs::remove_file(self.path.join(ADDRESS_FILE)) {
             if e.kind() != io::ErrorKind::NotFound {
                 log::debug!("instance-handoff: removing {ADDRESS_FILE}: {e}");
@@ -1598,6 +1634,7 @@ fn check_address<T: Payload>(core: &Core<T>, listener: Option<&mut PipeListener>
     };
     let want = format!("{} {}\n", core.ctx.app_id, listener.secret);
     if folder.published().ok().flatten().as_deref() == Some(want.as_str()) {
+        folder.hold_address();
         listener.published = true;
         return true;
     }
@@ -1697,11 +1734,11 @@ mod tests {
         let _second = listener.instance(false).unwrap();
         let address = folder.address().unwrap().unwrap();
         assert_eq!(address.pipe, listener.name);
-        std::fs::write(
-            tmp.path().join("run").join(ADDRESS_FILE),
-            "x \\\\evil\\pipe\n",
-        )
-        .unwrap();
+        // Held while published: nothing else can rewrite it.
+        let file = tmp.path().join("run").join(ADDRESS_FILE);
+        assert!(std::fs::write(&file, "x \\\\evil\\pipe\n").is_err());
+        folder.unpublish();
+        std::fs::write(&file, "x \\\\evil\\pipe\n").unwrap();
         assert!(folder.address().is_err());
     }
 }

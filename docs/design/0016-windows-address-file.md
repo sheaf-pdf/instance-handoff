@@ -1,6 +1,6 @@
 # 0016. The Windows owner keeps its address file open
 
-**Status:** Accepted, 2026-10-18, by the maintainer. Not built yet.
+**Status:** Accepted, 2026-10-18, by the maintainer. Built on `migrate-to-0015`; its Windows test awaits CI.
 
 ## Context
 

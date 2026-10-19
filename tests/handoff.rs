@@ -437,6 +437,30 @@ fn an_owner_whose_lock_was_taken_ends_with_lost_lock() {
     second.release();
 }
 
+// The owner holds its folder, its lock and its address open, sharing no
+// delete: nothing there can be removed or replaced, so a launch still
+// finds it, with the owner's next check an hour away.
+#[cfg(windows)]
+#[test]
+fn a_live_owners_folder_and_address_stay_put() {
+    let dir = dir();
+    let hour = Duration::from_secs(3600);
+    let (owner, rx) = serve(claim(
+        builder(&dir).__upkeep(hour, hour).start(&Args::default()),
+    ));
+    let address = dir.path.join("instance.pipe");
+    assert!(std::fs::remove_file(&address).is_err());
+    let other = dir.path.join("other");
+    std::fs::write(&other, "x\n").unwrap();
+    assert!(std::fs::rename(&other, &address).is_err());
+    assert!(std::fs::remove_dir_all(&dir.path).is_err());
+    assert!(std::fs::rename(&dir.path, dir.path.with_extension("moved")).is_err());
+    assert!(address.exists());
+    builder(&dir).hand_off(&args(&["after"])).unwrap();
+    assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["after"]));
+    owner.release();
+}
+
 #[test]
 fn scopes_make_separate_owners() {
     let dir = dir();
