@@ -1,6 +1,6 @@
 # 0009. What two builds share is frozen at 0.1
 
-**Status:** Proposed, 2026-10-18. Awaiting maintainer review.
+**Status:** Accepted in part, 2026-10-18, by the maintainer. Accepted: only a major release of this crate changes what two builds share. What is on that list follows [0015](0015-state-keyed-identity.md), and nothing is frozen until 0.1 ships.
 
 ## Context
 

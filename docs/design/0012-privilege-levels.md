@@ -1,6 +1,6 @@
 # 0012. Hand off only within one user and privilege level
 
-**Status:** Accepted, 2026-10-18, by the maintainer. It replaces the review's earlier proposal that an elevated launch on Windows hand off to the normal owner. Under review: its cost for admin shells and elevated SSH sessions led to a wider identity review, which proposes [0015](0015-state-keyed-identity.md). That would keep this record's principle but replace its per-level owners.
+**Status:** Superseded by [0015](0015-state-keyed-identity.md), 2026-10-18. Its principle stays: a request never runs with more or fewer rights than its launch had, unless the app opts into `hand_down`. Its per-level owners give way to one owner per state. The maintainer had accepted it earlier that day, in place of the review's first proposal that an elevated launch on Windows hand off to the normal owner.
 
 ## Context
 

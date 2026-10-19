@@ -1,6 +1,6 @@
 # 0004. The launch commits before the owner delivers
 
-**Status:** Proposed, 2026-10-18. Built on `api-0.1`; awaiting maintainer review.
+**Status:** Accepted, 2026-10-18, by the maintainer. Built on `api-0.1`.
 
 ## Context
 

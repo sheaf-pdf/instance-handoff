@@ -1,6 +1,6 @@
 # 0002. Decide before the event loop exists, serve after
 
-**Status:** Proposed, 2026-10-18. Built on `api-0.1`; awaiting maintainer review.
+**Status:** Accepted in part, 2026-10-18, by the maintainer. Built on `api-0.1`. Accepted: the shape, meaning `start`, `Claim`, `serve`, a handler that only forwards, and non-exhaustive `Reason` and `End`. The `Builder`'s arguments, such as the state and `Mode`, follow [0015](0015-state-keyed-identity.md).
 
 ## Context
 

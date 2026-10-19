@@ -7,6 +7,7 @@ The crate docs say what the crate does. These records say why it does that and n
 ## Status
 
 - **Accepted**: a maintainer decided it.
+- **Accepted in part**: a maintainer accepted its principle; the status line says which details wait on another record.
 - **Proposed**: recommended by a review and built on the branch, but not yet confirmed by a maintainer.
 - **Deferred**: considered and postponed until a stated trigger.
 - **Superseded by NNNN**: replaced; kept for its reasoning.
@@ -26,18 +27,18 @@ Decisions about how one app uses the crate, such as sheaf's app id, belong in th
 | # | Decision | Status |
 |---|---|---|
 | [0001](0001-scope.md) | Scope: funnel every launch into one owning process | Accepted |
-| [0002](0002-decide-then-serve.md) | Decide before the event loop exists, serve after | Proposed |
-| [0003](0003-payloads.md) | A `Payload` trait, lossless `Args` by default | Proposed |
-| [0004](0004-commit-point.md) | The launch commits before the owner delivers | Proposed |
-| [0005](0005-replies-later.md) | Replies, exit codes and `--wait` wait for 0.2 | Proposed |
-| [0006](0006-lock-held-until-exit.md) | Dropping an owner keeps the lock until the process exits | Proposed |
-| [0007](0007-unserved-claim-declines.md) | A claim dropped without serving declines launches | Proposed |
-| [0008](0008-one-folder.md) | One right runtime folder, never a fallback | Proposed |
-| [0009](0009-contract-between-builds.md) | What two builds share is frozen at 0.1 | Proposed |
-| [0010](0010-lock-primitive.md) | `flock` and `LockFileEx` directly; elsewhere `Unsupported` | Proposed |
-| [0011](0011-windows-named-pipes.md) | Named pipes on Windows, with seven controls | Proposed |
-| [0012](0012-privilege-levels.md) | Hand off only within one user and privilege level | Accepted, under review |
-| [0013](0013-root-on-linux.md) | No special case for root or `sudo` on Linux | Accepted |
-| [0014](0014-process-ids.md) | Process ids come from the OS, never from the peer | Proposed |
-| [0015](0015-state-keyed-identity.md) | One owner per state; rights and placement decided separately | Proposed |
+| [0002](0002-decide-then-serve.md) | Decide before the event loop exists, serve after | Accepted in part (the shape) |
+| [0003](0003-payloads.md) | A `Payload` trait, lossless `Args` by default | Accepted |
+| [0004](0004-commit-point.md) | The launch commits before the owner delivers | Accepted |
+| [0005](0005-replies-later.md) | Replies, exit codes and `--wait` wait for 0.2 | Deferred until 0.2 |
+| [0006](0006-lock-held-until-exit.md) | Dropping an owner keeps the lock until the process exits | Accepted |
+| [0007](0007-unserved-claim-declines.md) | A claim dropped without serving declines launches | Accepted |
+| [0008](0008-one-folder.md) | One right runtime folder, never a fallback | Accepted in part (no fallback) |
+| [0009](0009-contract-between-builds.md) | What two builds share is frozen at 0.1 | Accepted in part (frozen by major releases) |
+| [0010](0010-lock-primitive.md) | `flock` and `LockFileEx` directly; elsewhere `Unsupported` | Accepted |
+| [0011](0011-windows-named-pipes.md) | Named pipes on Windows, with seven controls | Accepted |
+| [0012](0012-privilege-levels.md) | Hand off only within one user and privilege level | Superseded by 0015 |
+| [0013](0013-root-on-linux.md) | No special case for root or `sudo` on Linux | Superseded by 0015 |
+| [0014](0014-process-ids.md) | Process ids come from the OS, never from the peer | Accepted |
+| [0015](0015-state-keyed-identity.md) | One owner per state; rights and placement decided separately | Accepted with changes, not built |
 | [0016](0016-windows-address-file.md) | The Windows owner keeps its address file open | Accepted, not built |

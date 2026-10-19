@@ -1,6 +1,6 @@
 # 0011. Named pipes on Windows, with seven controls
 
-**Status:** Proposed, 2026-10-18. Built on `api-0.1` and compile-checked only; awaiting maintainer review and Windows CI.
+**Status:** Accepted, 2026-10-18, by the maintainer. Built on `api-0.1`. Control 7 follows [0012](0012-privilege-levels.md) and [0015](0015-state-keyed-identity.md).
 
 ## Context
 
@@ -27,4 +27,6 @@ Named pipes, with seven controls:
 ## Consequences
 
 - About 450 lines of overlapped I/O on `windows-sys`.
-- It is written and lint-clean, but nothing has run on Windows yet. Windows CI is a release blocker.
+- It passes Windows CI at high and medium integrity, and passed on a Windows 11 machine with UAC on (2026-10-18).
+- Remote means another computer, reached through file sharing. Launches from SSH, Remote Desktop and RDS or AVD sessions on the same machine are local, and reach the pipe.
+- [0016](0016-windows-address-file.md) has the owner keep `instance.pipe` open, so a delete can't remove it.

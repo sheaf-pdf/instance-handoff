@@ -1,6 +1,6 @@
 # 0003. A `Payload` trait, lossless `Args` by default
 
-**Status:** Proposed, 2026-10-18. Built on `api-0.1`; awaiting maintainer review.
+**Status:** Accepted, 2026-10-18, by the maintainer. Built on `api-0.1`.
 
 ## Context
 

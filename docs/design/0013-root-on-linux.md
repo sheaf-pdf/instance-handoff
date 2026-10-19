@@ -1,6 +1,6 @@
 # 0013. No special case for root or `sudo` on Linux
 
-**Status:** Accepted, 2026-10-18, by the maintainer. One exception is deferred (see below). Revisited by [0015](0015-state-keyed-identity.md), which proposes a fixed root folder and the exception below.
+**Status:** Superseded by [0015](0015-state-keyed-identity.md), 2026-10-18. Root gets a fixed folder, `/run/instance-handoff`, and a raised launch doesn't own by default, which adopts the exception below for owning. The maintainer had accepted this record earlier that day.
 
 ## Context
 
@@ -21,7 +21,7 @@ Both cases follow the one rule: same user, same level, same folder. An exception
 
 ## Deferred: elevation always runs alone
 
-A possible exception: a process whose euid is 0 but whose audit login uid (`/proc/self/loginuid`) isn't 0 was elevated from another user's session (`sudo`, `su`), and would always run alone. The maintainer leans toward adding it. The trigger is real-world reports of `sudo` launches meeting a root owner they didn't expect. Don't add it unprompted.
+A possible exception: a process whose euid is 0 but whose audit login uid (`/proc/self/loginuid`) isn't 0 was elevated from another user's session (`sudo`, `su`), and would always run alone. The maintainer leans toward adding it. The trigger is real-world reports of `sudo` launches meeting a root owner they didn't expect. Don't add it unprompted. 0015 adopted it for owning. Whether a raised launch may hand off to a root owner waits for placement in 0.2.
 
 ## Consequences
 

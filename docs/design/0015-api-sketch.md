@@ -1,6 +1,6 @@
 # 0015 appendix: the review's API sketch
 
-This is the API the identity review proposed on 2026-10-18 for [0015](0015-state-keyed-identity.md), kept word for word from the review's output. It is a sketch, not the accepted API. Its decisions await the maintainer, and the recommendation in 0015 holds several parts back until 0.2: placement (`Screens`, `Context`, `OtherScreen`, `OtherPerson`), completion (`wait`, `Completion`, `Finish`), capabilities and credentials (`privileged_owner`, `Logon`), and the diagnostics (`Claim::others`, `canonical_path`, `Guard::Always`). Line references point into the code as of commit f19d695.
+This is the API the identity review proposed on 2026-10-18 for [0015](0015-state-keyed-identity.md), kept word for word from the review's output. It is a sketch, not the accepted API. Where the maintainer's calls in 0015 (2026-10-18) differ from it, 0015 wins: for example, a headless app is one where any launch may own, and its owner may still show windows. Several parts wait until 0.2 or until an app asks: placement (`Screens`, `Context`, `OtherScreen`, `OtherPerson`), completion (`wait`, `Completion`, `Finish`), capabilities and credentials (`privileged_owner`, `Logon`), and the diagnostics (`Claim::others`, `canonical_path`, `Guard::Always`). Line references point into the code as of commit f19d695.
 
 ## Re-exports (src/lib.rs)
 

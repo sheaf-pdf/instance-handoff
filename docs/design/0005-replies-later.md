@@ -1,6 +1,6 @@
 # 0005. Replies, exit codes and `--wait` wait for 0.2
 
-**Status:** Proposed, 2026-10-18. Awaiting maintainer review.
+**Status:** Deferred, 2026-10-18, by the maintainer, until 0.2 is planned.
 
 ## Context
 
