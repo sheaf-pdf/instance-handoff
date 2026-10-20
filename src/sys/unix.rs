@@ -1,5 +1,6 @@
 //! Unix: the runtime folder, an `flock` on `instance.lock`, an AF_UNIX
-//! socket beside it, and a `poll` loop on the crate's thread.
+//! socket beside it, another `flock` on the guard in the state folder, and
+//! a `poll` loop on the crate's thread.
 
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{self, Read};
@@ -13,9 +14,20 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use crate::level::OwnerLevel;
 use crate::naming;
-use crate::server::{Core, Session};
+use crate::server::{Core, Peer, Session};
+use crate::wire::refusal;
 use crate::{AppId, Payload, Reason};
+
+// On 32-bit targets glibc's stat calls fail with EOVERFLOW for a file whose
+// inode number doesn't fit in 32 bits, as on XFS with inode64 or overlayfs
+// with xino. Its *64 calls can't, and on 64-bit targets they are the same
+// calls. musl and bionic count in 64 bits everywhere.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+use libc::{fstat as sys_fstat, fstatat as sys_fstatat, lstat as sys_lstat, stat as Stat};
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+use libc::{fstat64 as sys_fstat, fstatat64 as sys_fstatat, lstat64 as sys_lstat, stat64 as Stat};
 
 pub(crate) const SUPPORTED: bool = true;
 
@@ -30,9 +42,56 @@ const SOCKET_FILE: &str = "instance.sock";
 /// Connections open at once; more are accepted and closed, and retry.
 const MAX_CONNECTIONS: usize = 64;
 
+/// One of the ids [`raw_id`] reads.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum Id {
+    Uid,
+    Euid,
+    Gid,
+    Egid,
+}
+
+/// One of this process's ids, as the kernel reports it in its own
+/// namespace: from its system call, not from the C library, which fakeroot
+/// replaces to report root.
+#[cfg(target_os = "linux")]
+fn raw_id(id: Id) -> u32 {
+    // In `Id`'s order. 32-bit x86, arm and sparc keep the 16-bit calls
+    // under the plain names. On m68k, libc's plain names are already the
+    // 32-bit calls.
+    #[cfg(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc"))]
+    let nrs = [
+        libc::SYS_getuid32,
+        libc::SYS_geteuid32,
+        libc::SYS_getgid32,
+        libc::SYS_getegid32,
+    ];
+    #[cfg(not(any(target_arch = "x86", target_arch = "arm", target_arch = "sparc")))]
+    let nrs = [
+        libc::SYS_getuid,
+        libc::SYS_geteuid,
+        libc::SYS_getgid,
+        libc::SYS_getegid,
+    ];
+    // SAFETY: getuid, geteuid, getgid and getegid take no arguments and
+    // can't fail.
+    unsafe { libc::syscall(nrs[id as usize]) as u32 }
+}
+
+/// The effective user id, as the kernel reports it in this process's own
+/// namespace. On Linux it comes from the system call, not from the C
+/// library's `geteuid`, which fakeroot replaces to report root.
 fn euid() -> libc::uid_t {
-    // SAFETY: geteuid has no preconditions and can't fail.
-    unsafe { libc::geteuid() }
+    #[cfg(target_os = "linux")]
+    {
+        raw_id(Id::Euid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: geteuid has no preconditions and can't fail.
+        unsafe { libc::geteuid() }
+    }
 }
 
 fn cvt(r: libc::c_int) -> io::Result<libc::c_int> {
@@ -68,6 +127,9 @@ pub(crate) enum Base {
     /// [`Builder::dir`](crate::Builder::dir): created when missing, and
     /// must be private.
     Create,
+    /// Root's own base: created when missing, though never its parent, and
+    /// must be a real folder, root's, and writable by nobody else.
+    System,
 }
 
 /// A runtime folder: a base, and the subfolders this crate makes in it.
@@ -140,6 +202,16 @@ pub(crate) fn linux_rule(env: &LinuxEnv, id: &AppId) -> Result<Place, Reason> {
             .ok_or(Reason::NoRuntimeDir {})?;
         return Ok(trusted(xdg.clone()));
     }
+    // Root has one folder, whether or not it is logged in, so every root
+    // launch meets one owner. /run/user/0 exists only while root has a
+    // session somewhere.
+    if env.euid == 0 {
+        return Ok(Place {
+            base: naming::ROOT_BASE_RUN.into(),
+            kind: Base::System,
+            subs: vec![id.as_str().into()],
+        });
+    }
     if env.systemd {
         return env
             .run_user
@@ -200,14 +272,33 @@ pub(crate) fn default_place(id: &AppId) -> Result<Place, Reason> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
+        let uid = euid();
+        if uid == 0 {
+            return Ok(Place {
+                base: naming::ROOT_BASE_VAR_RUN.into(),
+                kind: Base::System,
+                subs: vec![id.as_str().into()],
+            });
+        }
         Ok(Place {
             base: "/tmp".into(),
             kind: Base::Shared,
-            subs: vec![format!("{id}-{}", euid()).into()],
+            subs: vec![format!("{id}-{uid}").into()],
         })
     }
 }
 
+/// Root's own base, where it has one: on Linux, the BSDs and illumos.
+const ROOT_BASE: Option<&str> = if cfg!(target_os = "linux") {
+    Some(naming::ROOT_BASE_RUN)
+} else if cfg!(any(target_os = "android", target_os = "macos")) {
+    None
+} else {
+    Some(naming::ROOT_BASE_VAR_RUN)
+};
+
+/// The per-user temporary folder, with its links resolved: the path
+/// `confstr` gives goes through `/var`, a link to `/private/var`.
 #[cfg(target_os = "macos")]
 fn darwin_temp_dir() -> Option<PathBuf> {
     let mut buf = vec![0u8; libc::PATH_MAX as usize];
@@ -223,11 +314,237 @@ fn darwin_temp_dir() -> Option<PathBuf> {
         return None;
     }
     buf.truncate(n - 1);
-    Some(PathBuf::from(OsString::from_vec(buf)))
+    std::fs::canonicalize(OsString::from_vec(buf)).ok()
 }
 
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStringExt;
+
+/// `path` with its links resolved: `realpath`.
+pub(crate) fn final_path(path: &Path) -> io::Result<PathBuf> {
+    std::fs::canonicalize(path)
+}
+
+// ---------------------------------------------------------------------------
+// Who may own
+// ---------------------------------------------------------------------------
+
+/// What tells a raised launch, gathered apart from the rule so that the
+/// rule can be tested.
+#[derive(Debug)]
+pub(crate) struct RaisedEnv {
+    pub(crate) euid: u32,
+    /// `SUDO_UID`: the user who ran `sudo` or `run0`.
+    pub(crate) sudo_uid: Option<u32>,
+    /// `PKEXEC_UID`: the user who ran `pkexec`.
+    pub(crate) pkexec_uid: Option<u32>,
+    /// `DOAS_USER`, the name of the user who ran `doas`, as a user id.
+    pub(crate) doas_user: Option<u32>,
+    /// On Linux, `/proc/self/loginuid`: the user who logged in, which `su`
+    /// and `sudo` keep. `None` when it is unset (4294967295).
+    pub(crate) loginuid: Option<u32>,
+}
+
+/// Whether a launch's rights were raised from a login: it is root, and the
+/// person who logged in is known and isn't root. Root's own login, a
+/// service and a container's root name root or nobody. This only keeps
+/// launches from owning, so a person it can't see, as after `su` on macOS
+/// and the BSDs, leaves the launch free to own.
+pub(crate) fn raised_from(env: &RaisedEnv) -> bool {
+    env.euid == 0
+        && [env.sudo_uid, env.pkexec_uid, env.doas_user, env.loginuid]
+            .into_iter()
+            .flatten()
+            .any(|uid| uid != 0)
+}
+
+/// The id of the user named `name`, from the user database.
+fn uid_of(name: &OsStr) -> Option<u32> {
+    let c = cstr(name).ok()?;
+    let mut buf = vec![0u8; 1024];
+    loop {
+        // SAFETY: passwd is plain data; getpwnam_r fills it in.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `c` is a valid C string, `pwd` and `found` are valid for
+        // writes, and `buf` for writes of its length.
+        let r = unsafe {
+            libc::getpwnam_r(
+                c.as_ptr(),
+                &mut pwd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if r == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        return (r == 0 && !found.is_null()).then_some(pwd.pw_uid);
+    }
+}
+
+/// The user who logged in, as the kernel keeps it for this process. Only
+/// Linux keeps one.
+fn loginuid() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/self/loginuid").ok()?;
+        text.trim().parse().ok().filter(|&uid| uid != u32::MAX)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn raised_env() -> RaisedEnv {
+    let uid = |name: &str| -> Option<u32> { std::env::var(name).ok()?.parse().ok() };
+    RaisedEnv {
+        euid: euid(),
+        sudo_uid: uid("SUDO_UID"),
+        pkexec_uid: uid("PKEXEC_UID"),
+        doas_user: std::env::var_os("DOAS_USER").and_then(|name| uid_of(&name)),
+        loginuid: loginuid(),
+    }
+}
+
+/// Whether this launch's rights were raised from a login.
+pub(crate) fn raised() -> bool {
+    raised_from(&raised_env())
+}
+
+/// Whether this launch has more rights than a normal process: it is root.
+pub(crate) fn above_normal() -> bool {
+    euid() == 0
+}
+
+/// This process's integrity level: none, since only Windows has them.
+pub(crate) fn level() -> Option<crate::Level> {
+    None
+}
+
+/// A process's real and effective ids, gathered apart from the rule so
+/// that the rule can be tested.
+#[derive(Debug)]
+pub(crate) struct Ids {
+    pub(crate) uid: u32,
+    pub(crate) euid: u32,
+    pub(crate) gid: u32,
+    pub(crate) egid: u32,
+}
+
+/// Why a process with these ids may take no part, if it may not: its real
+/// and effective user ids differ, or its group ids do, as in a setuid or
+/// setgid program that runs with its rights. Only these ids are compared
+/// (call 7.2). The saved set-ids aren't, so a set-id program that has set
+/// its effective ids back to its real ones takes part, though it may take
+/// its rights back. Nor is Linux's `AT_SECURE`, which also marks a program
+/// given file capabilities. Root, and a process whose ids were all set
+/// alike, as by `su` or `sudo -u`, take part.
+pub(crate) fn excluded_from(ids: &Ids) -> Option<crate::Excluded> {
+    (ids.uid != ids.euid || ids.gid != ids.egid).then_some(crate::Excluded::SetId)
+}
+
+/// This process's real and effective ids, as the kernel reports them in
+/// its own namespace. On Linux each comes from its system call, as
+/// [`euid`]'s does: fakeroot reports root for all four through the C
+/// library, so one read there and one from the kernel would differ.
+fn ids() -> Ids {
+    #[cfg(target_os = "linux")]
+    let (uid, gid, egid) = (raw_id(Id::Uid), raw_id(Id::Gid), raw_id(Id::Egid));
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: getuid, getgid and getegid have no preconditions and can't
+    // fail.
+    let (uid, gid, egid) = unsafe { (libc::getuid(), libc::getgid(), libc::getegid()) };
+    Ids {
+        uid,
+        euid: euid(),
+        gid,
+        egid,
+    }
+}
+
+/// Why this process may take no part, if it may not.
+pub(crate) fn excluded() -> Option<crate::Excluded> {
+    excluded_from(&ids())
+}
+
+/// The display variables, gathered apart from the rule so that the rule
+/// can be tested.
+// macOS asks the login session instead, and Android can't tell.
+#[cfg_attr(any(target_os = "macos", target_os = "android"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct DisplayEnv {
+    /// `WAYLAND_DISPLAY`: the Wayland compositor's socket.
+    pub(crate) wayland_display: Option<OsString>,
+    /// `DISPLAY`: the X server.
+    pub(crate) display: Option<OsString>,
+}
+
+/// Whether a launch on Linux, the BSDs or illumos can show windows: a
+/// display variable is set and not empty. A stale `DISPLAY` says yes, and
+/// a compositor that a client would find without `WAYLAND_DISPLAY` says
+/// no.
+#[cfg_attr(any(target_os = "macos", target_os = "android"), allow(dead_code))]
+pub(crate) fn shows_windows_from(env: &DisplayEnv) -> bool {
+    [&env.wayland_display, &env.display]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_empty())
+}
+
+#[cfg_attr(any(target_os = "macos", target_os = "android"), allow(dead_code))]
+fn display_env() -> DisplayEnv {
+    DisplayEnv {
+        wayland_display: std::env::var_os("WAYLAND_DISPLAY"),
+        display: std::env::var_os("DISPLAY"),
+    }
+}
+
+/// Whether this launch can show windows, or `None` where that can't be
+/// told.
+pub(crate) fn can_show_windows() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        session_has_graphics()
+    }
+    #[cfg(target_os = "android")]
+    {
+        None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
+    {
+        Some(shows_windows_from(&display_env()))
+    }
+}
+
+/// Whether this process's login session may use the window server:
+/// `SessionGetInfo`'s graphic-access bit. A login over `ssh` and a daemon
+/// have none. `None` when the session can't be read.
+#[cfg(target_os = "macos")]
+fn session_has_graphics() -> Option<bool> {
+    // From <Security/AuthSession.h>: the caller's own session, and the
+    // bit.
+    const CALLER_SECURITY_SESSION: u32 = u32::MAX;
+    const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SessionGetInfo(session: u32, session_id: *mut u32, attributes: *mut u32) -> i32;
+    }
+    let mut attributes = 0u32;
+    // SAFETY: `attributes` is valid for writes. The session id may be
+    // null, and then isn't written.
+    let status = unsafe {
+        SessionGetInfo(
+            CALLER_SECURITY_SESSION,
+            std::ptr::null_mut(),
+            &mut attributes,
+        )
+    };
+    (status == 0).then_some(attributes & SESSION_HAS_GRAPHIC_ACCESS != 0)
+}
 
 // ---------------------------------------------------------------------------
 // The folder
@@ -255,9 +572,9 @@ fn open_dir(at: Option<BorrowedFd<'_>>, path: &Path, nofollow: bool) -> io::Resu
         match e.raw_os_error() {
             Some(libc::ELOOP | libc::ENOTDIR) => {
                 // SAFETY: stat is plain data; fstatat fills it in.
-                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let mut st: Stat = unsafe { std::mem::zeroed() };
                 let r =
-                    unsafe { libc::fstatat(dirfd, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+                    unsafe { sys_fstatat(dirfd, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
                 if r == 0 && st.st_mode & libc::S_IFMT == libc::S_IFLNK {
                     denied("a symlink, not a folder")
                 } else {
@@ -271,20 +588,110 @@ fn open_dir(at: Option<BorrowedFd<'_>>, path: &Path, nofollow: bool) -> io::Resu
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn fstat(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
+fn fstat(fd: BorrowedFd<'_>) -> io::Result<Stat> {
     // SAFETY: stat is plain data; fstat fills it in.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    cvt(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) })?;
+    let mut st: Stat = unsafe { std::mem::zeroed() };
+    cvt(unsafe { sys_fstat(fd.as_raw_fd(), &mut st) })?;
     Ok(st)
+}
+
+// The kernel writes all 256 bytes of its struct. A module-level constant,
+// so that `cargo check` and clippy evaluate it for every target, not only
+// a build.
+#[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+const _: () = assert!(std::mem::size_of::<libc::statx>() == 256);
+
+/// A file's owner and mode, as the kernel reports them. On Linux with glibc
+/// or musl they come from the `statx` system call, not from the C library's
+/// `fstat`, which fakeroot replaces to report root as the owner. Elsewhere,
+/// and where the kernel (before 4.11) or a seccomp filter refuses `statx`,
+/// they come from `fstat`.
+fn owner_mode(fd: BorrowedFd<'_>) -> io::Result<(libc::uid_t, libc::mode_t)> {
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    {
+        // The empty path with AT_EMPTY_PATH names `fd` itself.
+        if let Some(found) = statx_owner_mode(fd.as_raw_fd(), c"", libc::AT_EMPTY_PATH) {
+            return found;
+        }
+    }
+    let st = fstat(fd)?;
+    Ok((st.st_uid, st.st_mode))
+}
+
+/// The owner of the file at `path`, following links, read as [`owner_mode`]
+/// reads it. Unlike opening the file, this needs no right to read it.
+fn path_owner(path: &Path) -> io::Result<libc::uid_t> {
+    let c = cstr(path.as_os_str())?;
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    {
+        if let Some(found) = statx_owner_mode(libc::AT_FDCWD, &c, 0) {
+            return found.map(|(uid, _)| uid);
+        }
+    }
+    // SAFETY: stat is plain data; fstatat fills it in.
+    let mut st: Stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid C string, and `st` is valid for writes.
+    cvt(unsafe { sys_fstatat(libc::AT_FDCWD, c.as_ptr(), &mut st, 0) })?;
+    Ok(st.st_uid)
+}
+
+/// A file's owner and mode from the `statx` system call: `path` from
+/// `dirfd`, with `flags`. `None` where the kernel (before 4.11) or a
+/// seccomp filter refuses the call.
+#[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+fn statx_owner_mode(
+    dirfd: libc::c_int,
+    path: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> Option<io::Result<(libc::uid_t, libc::mode_t)>> {
+    const WANT: libc::c_uint = libc::STATX_UID | libc::STATX_MODE;
+    // SAFETY: statx is plain data; the kernel fills it in.
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a valid C string, and `stx` is valid for writes of
+    // the kernel's struct, checked above.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            dirfd,
+            path.as_ptr(),
+            flags,
+            WANT,
+            &mut stx as *mut libc::statx,
+        )
+    };
+    if r == 0 {
+        if stx.stx_mask & WANT != WANT {
+            return Some(Err(denied("its owner or mode is unknown")));
+        }
+        return Some(Ok((stx.stx_uid, stx.stx_mode.into())));
+    }
+    let e = io::Error::last_os_error();
+    if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) {
+        return None;
+    }
+    Some(Err(e))
+}
+
+/// Whether a launch whose effective user is `euid` may keep its state in a
+/// folder that `owner` owns: its own, or root's. Root trusts only its own,
+/// so root given the user's home finds it another user's.
+fn trusted_owner(owner: libc::uid_t, euid: libc::uid_t) -> bool {
+    owner == euid || owner == 0
+}
+
+/// Whether the file at `path` belongs to a user this process doesn't
+/// trust with its state (see [`trusted_owner`]).
+pub(crate) fn is_foreign(path: &Path) -> io::Result<bool> {
+    Ok(!trusted_owner(path_owner(path)?, euid()))
 }
 
 /// This user's, and writable by nobody else.
 fn check_trusted(fd: BorrowedFd<'_>) -> io::Result<()> {
-    let st = fstat(fd)?;
-    if st.st_uid != euid() {
+    let (uid, mode) = owner_mode(fd)?;
+    if uid != euid() {
         return Err(denied("owned by another user"));
     }
-    if st.st_mode & 0o022 != 0 {
+    if mode & 0o022 != 0 {
         return Err(denied("other users can write to it"));
     }
     Ok(())
@@ -293,14 +700,35 @@ fn check_trusted(fd: BorrowedFd<'_>) -> io::Result<()> {
 /// This user's alone: nobody else can read it either, or they could lock
 /// the lock file.
 fn check_private(fd: BorrowedFd<'_>) -> io::Result<()> {
-    let st = fstat(fd)?;
-    if st.st_uid != euid() {
+    let (uid, mode) = owner_mode(fd)?;
+    if uid != euid() {
         return Err(denied("owned by another user"));
     }
-    if st.st_mode & 0o077 != 0 {
+    if mode & 0o077 != 0 {
         return Err(denied("other users can open it"));
     }
     Ok(())
+}
+
+/// Makes one folder, private, unless something is there already. Its
+/// parent must exist.
+fn make_dir(path: &Path) -> io::Result<()> {
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Opens root's base, creating it when `create` is set. Only root uses it,
+/// so the user it must belong to is root.
+fn open_system(path: &Path, create: bool) -> io::Result<OwnedFd> {
+    if create {
+        make_dir(path)?;
+    }
+    let fd = open_dir(None, path, true)?;
+    check_trusted(fd.as_fd())?;
+    Ok(fd)
 }
 
 /// Opens the runtime folder, creating it when `create` is set. `None` when
@@ -320,8 +748,12 @@ pub(crate) fn open_folder(place: &Place, create: bool) -> Result<Option<Folder>,
             open_dir(None, &path, true).and_then(|fd| check_private(fd.as_fd()).map(|()| fd))
         }
         Base::Trusted => {
-            open_dir(None, &path, false).and_then(|fd| check_trusted(fd.as_fd()).map(|()| fd))
+            // On macOS the base's links were resolved, so a link there now
+            // is a swap.
+            let nofollow = cfg!(target_os = "macos");
+            open_dir(None, &path, nofollow).and_then(|fd| check_trusted(fd.as_fd()).map(|()| fd))
         }
+        Base::System => open_system(&path, create),
         Base::Shared => open_dir(None, &path, false),
     };
     let mut fd = match opened {
@@ -358,10 +790,12 @@ pub(crate) fn open_folder(place: &Place, create: bool) -> Result<Option<Folder>,
 #[derive(Debug)]
 pub(crate) struct Lock(OwnedFd);
 
-fn flock_nb(fd: BorrowedFd<'_>) -> io::Result<bool> {
+/// Takes an `flock` without waiting: `op` is `LOCK_EX` or `LOCK_SH`.
+/// `false` when another open file holds a lock that conflicts.
+fn flock_nb(fd: BorrowedFd<'_>, op: libc::c_int) -> io::Result<bool> {
     loop {
         // SAFETY: flock on an open descriptor.
-        match cvt(unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }) {
+        match cvt(unsafe { libc::flock(fd.as_raw_fd(), op | libc::LOCK_NB) }) {
             Ok(_) => return Ok(true),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -370,7 +804,7 @@ fn flock_nb(fd: BorrowedFd<'_>) -> io::Result<bool> {
     }
 }
 
-fn stat_key(st: &libc::stat) -> (u64, u64) {
+fn stat_key(st: &Stat) -> (u64, u64) {
     #[allow(clippy::unnecessary_cast)]
     (st.st_dev as u64, st.st_ino as u64)
 }
@@ -401,17 +835,23 @@ impl Folder {
     /// holds it.
     pub(crate) fn lock(&self) -> io::Result<Option<Lock>> {
         let fd = self.open_lock(true)?;
-        Ok(flock_nb(fd.as_fd())?.then_some(Lock(fd)))
+        Ok(flock_nb(fd.as_fd(), libc::LOCK_EX)?.then_some(Lock(fd)))
     }
 
     /// Whether another process holds the lock, without creating anything.
     /// The lock is taken and dropped at once to find out.
     pub(crate) fn lock_held(&self) -> io::Result<bool> {
         match self.open_lock(false) {
-            Ok(fd) => flock_nb(fd.as_fd()).map(|got| !got),
+            Ok(fd) => flock_nb(fd.as_fd(), libc::LOCK_EX).map(|got| !got),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    /// The level of the owner that holds the lock: always this launch's,
+    /// since Unix has no integrity levels.
+    pub(crate) fn owner_level(&self) -> io::Result<OwnerLevel> {
+        Ok(OwnerLevel::Same)
     }
 
     /// Whether the path still names the lock file `lock` holds.
@@ -420,8 +860,8 @@ impl Folder {
             return false;
         };
         // SAFETY: stat is plain data; lstat fills it in.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 {
+        let mut st: Stat = unsafe { std::mem::zeroed() };
+        if unsafe { sys_lstat(c.as_ptr(), &mut st) } != 0 {
             return false;
         }
         fstat(lock.0.as_fd()).is_ok_and(|ours| stat_key(&ours) == stat_key(&st))
@@ -493,13 +933,13 @@ impl Folder {
     /// Identifies the socket file at the address, if there is one.
     fn socket_key(&self) -> Option<SocketKey> {
         // SAFETY: stat is plain data, filled in by the calls below.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let mut st: Stat = unsafe { std::mem::zeroed() };
         let r = match self.address(false).ok()? {
             Address::InFolder(_) => {
                 let c = cstr(OsStr::new(SOCKET_FILE)).ok()?;
                 // SAFETY: `c` is a valid C string and `self.fd` an open folder.
                 unsafe {
-                    libc::fstatat(
+                    sys_fstatat(
                         self.fd.as_raw_fd(),
                         c.as_ptr(),
                         &mut st,
@@ -510,7 +950,7 @@ impl Folder {
             Address::Elsewhere(path) => {
                 let c = cstr(path.as_os_str()).ok()?;
                 // SAFETY: `c` is a valid C string.
-                unsafe { libc::lstat(c.as_ptr(), &mut st) }
+                unsafe { sys_lstat(c.as_ptr(), &mut st) }
             }
         };
         (r == 0).then(|| stat_key(&st))
@@ -526,8 +966,13 @@ impl Folder {
         Ok((listener, self.socket_key()))
     }
 
-    /// Connects to the owner's socket and checks it is this user's.
-    pub(crate) fn connect(&self, deadline: Option<Instant>) -> Result<Conn, Connect> {
+    /// Connects to the owner's socket and checks it is this user's. Unix
+    /// has no integrity levels, so `_level` is always `None`.
+    pub(crate) fn connect(
+        &self,
+        deadline: Option<Instant>,
+        _level: Option<crate::Level>,
+    ) -> Result<Conn, Connect> {
         let path = self.address(false).map_err(Connect::Retry)?.into_path();
         let stream = connect(&path, deadline)?;
         let (uid, pid) = peer_cred(stream.as_fd()).map_err(Connect::Retry)?;
@@ -597,21 +1042,23 @@ fn fits(path: &Path) -> bool {
     path.as_os_str().len() < sun_path_len()
 }
 
-/// A short private folder for sockets whose folder's path is too long:
-/// the per-user temporary folder on macOS, `/tmp/ih-<uid>` elsewhere. Only
-/// an owner binding its socket creates it.
+/// A short folder for sockets whose folder's path is too long: the
+/// per-user temporary folder on macOS, root's own base for root where it
+/// has one, and the private `/tmp/ih-<uid>` elsewhere. Only an owner
+/// binding its socket creates it.
 fn short_base(create: bool) -> io::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     if let Some(dir) = darwin_temp_dir() {
         return Ok(dir);
     }
-    let base = PathBuf::from(format!("/tmp/ih-{}", euid()));
+    let uid = euid();
+    if let Some(root) = ROOT_BASE.filter(|_| uid == 0) {
+        open_system(Path::new(root), create)?;
+        return Ok(root.into());
+    }
+    let base = PathBuf::from(format!("/tmp/ih-{uid}"));
     if create {
-        match std::fs::DirBuilder::new().mode(0o700).create(&base) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e),
-        }
+        make_dir(&base)?;
     }
     let fd = open_dir(None, &base, true)?;
     check_private(fd.as_fd())?;
@@ -862,6 +1309,417 @@ impl Conn {
 }
 
 // ---------------------------------------------------------------------------
+// The state folder and its guard
+// ---------------------------------------------------------------------------
+
+/// Creates the canonical `state` folder when nothing is at its path: the
+/// folders above it as `create_dir_all` makes them, and the last one
+/// private (0700). Whatever is there already is left as it is, for
+/// [`take_guard`] to open or refuse.
+pub(crate) fn make_state_dir(state: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(state) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = state.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            make_dir(state)
+        }
+        found => found.map(drop),
+    }
+}
+
+/// The held guard: an `flock` on `.instance-handoff.lock` in the state
+/// folder, exclusive or shared. Like [`Lock`], it is released when the
+/// last descriptor closes and never unlocked explicitly, so a forked child
+/// that keeps a copy keeps the guard.
+///
+/// The state folder is held open beside the file. An inode that is open
+/// stays in use, so no other folder or file gets the device and inode of
+/// either while they are held, and the owner's upkeep can tell from them
+/// whether the paths still name what it holds ([`Guard::look`]).
+#[derive(Debug)]
+pub(crate) struct Guard {
+    file: OwnedFd,
+    dir: OwnedFd,
+    /// The canonical state folder.
+    state: PathBuf,
+    shared: bool,
+}
+
+/// What the owner's upkeep found at the guard's paths.
+enum GuardFound {
+    /// The state folder and the guard file the owner holds.
+    InPlace,
+    /// The guard file was removed or replaced, and the owner now locks the
+    /// file at its path instead.
+    Retaken,
+    /// The state folder was removed or replaced, or another process holds
+    /// the guard file now at its path.
+    Lost,
+    /// The guard file was removed or replaced, and the one at its path
+    /// can't be made, opened or locked now; or a path, or what the guard
+    /// holds, can't be looked at. The owner keeps what it holds, and looks
+    /// again.
+    Unknown(io::Error),
+}
+
+/// `LOCK_SH` for a keyed owner's guard, and otherwise `LOCK_EX`.
+fn guard_op(shared: bool) -> libc::c_int {
+    if shared { libc::LOCK_SH } else { libc::LOCK_EX }
+}
+
+/// Takes the guard in the canonical `state` folder, which
+/// [`make_state_dir`] has made: `shared` (`LOCK_SH`) for a keyed owner, so
+/// keyed owners hold it side by side, and otherwise exclusive (`LOCK_EX`).
+/// Each owner opens the file afresh, so its lock is its own: a second
+/// `flock` on one open file would only convert the first.
+/// [`Reason::StateInUse`] when another owner holds it in a mode that
+/// conflicts. `None` on a network file system, or where the file system
+/// can't lock files: the owner goes unguarded.
+pub(crate) fn take_guard(state: &Path, shared: bool) -> Result<Option<Guard>, Reason> {
+    let path = state.join(naming::GUARD_FILE);
+    let (dir, file) = match open_guard(state) {
+        Ok(Some(opened)) => opened,
+        Ok(None) => {
+            log::debug!(
+                "instance-handoff: {} is on a network file system, so this owner holds no guard",
+                state.display()
+            );
+            return Ok(None);
+        }
+        Err(source) => return Err(Reason::Lock { path, source }),
+    };
+    match flock_nb(file.as_fd(), guard_op(shared)) {
+        Ok(true) => Ok(Some(Guard {
+            file,
+            dir,
+            state: state.to_owned(),
+            shared,
+        })),
+        Ok(false) => Err(Reason::StateInUse { path }),
+        Err(e) if locks_unsupported(&e) => {
+            log::warn!(
+                "instance-handoff: {} can't be locked, so this owner holds no guard: {e}",
+                path.display()
+            );
+            Ok(None)
+        }
+        Err(source) => Err(Reason::Lock { path, source }),
+    }
+}
+
+/// Opens the `state` folder, and the guard file in it ([`open_guard_in`]).
+/// `None`, with nothing made, when `state` is on a network file system.
+fn open_guard(state: &Path) -> io::Result<Option<(OwnedFd, OwnedFd)>> {
+    open_guard_with(state, is_network)
+}
+
+/// [`open_guard`], asking `network` whether the folder is on a network
+/// file system, so a test can say it is.
+fn open_guard_with(
+    state: &Path,
+    network: fn(BorrowedFd<'_>) -> bool,
+) -> io::Result<Option<(OwnedFd, OwnedFd)>> {
+    let dir = open_dir(None, state, true)?;
+    if network(dir.as_fd()) {
+        return Ok(None);
+    }
+    let file = open_guard_in(dir.as_fd())?;
+    Ok(Some((dir, file)))
+}
+
+/// Opens the guard file in the state folder open as `dir`, creating it.
+/// Read-only, since `flock` needs no more on a local disk, so a guard file
+/// that exists can be locked in a folder that is read-only. Non-blocking,
+/// so a FIFO in its place can't hold the launch up.
+fn open_guard_in(dir: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    let c = cstr(OsStr::new(naming::GUARD_FILE))?;
+    let flags =
+        libc::O_RDONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    let mode: libc::c_uint = 0o600;
+    // SAFETY: `c` is a valid C string and `dir` an open folder.
+    let fd = cvt(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, mode) })?;
+    // SAFETY: openat returned a new descriptor that nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if fstat(fd.as_fd())?.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+    }
+    if owner_mode(fd.as_fd())?.0 != euid() {
+        return Err(denied("owned by another user"));
+    }
+    Ok(fd)
+}
+
+/// Whether another process holds the guard in the canonical `state`
+/// folder in a mode that conflicts with `shared` ([`take_guard`]'s modes),
+/// for a launch with no runtime folder to look in. It makes nothing: it
+/// opens the guard file if there is one, takes an `flock` in that mode
+/// without waiting, and gives it back at once. `false` when the folder or
+/// the file is missing, a path through a file, on a network file system,
+/// or where the file system can't lock files, since no owner holds a guard
+/// there. Unlike [`take_guard`], it only looks, so it doesn't check whose
+/// the file is.
+pub(crate) fn guard_held(state: &Path, shared: bool) -> io::Result<bool> {
+    let dir = match open_dir(None, state, true) {
+        Ok(dir) => dir,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    if is_network(dir.as_fd()) {
+        return Ok(false);
+    }
+    let c = cstr(OsStr::new(naming::GUARD_FILE))?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // SAFETY: `c` is a valid C string and `dir` an open folder.
+    let fd = match cvt(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) }) {
+        // SAFETY: openat returned a new descriptor that nothing else owns.
+        Ok(fd) => unsafe { OwnedFd::from_raw_fd(fd) },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if fstat(fd.as_fd())?.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file"));
+    }
+    look_at_guard(fd.as_fd(), shared)
+}
+
+/// [`guard_held`] on the guard file open as `fd`: takes the guard in the
+/// mode `shared` names without waiting, and gives it back with `LOCK_UN`,
+/// not as `fd` closes, since a child forked meanwhile would keep a copy of
+/// it, and the lock with it.
+fn look_at_guard(fd: BorrowedFd<'_>, shared: bool) -> io::Result<bool> {
+    match flock_nb(fd, guard_op(shared)) {
+        Ok(true) => {
+            // SAFETY: flock on an open descriptor.
+            if let Err(e) = cvt(unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_UN) }) {
+                log::debug!("instance-handoff: giving back {}: {e}", naming::GUARD_FILE);
+            }
+            Ok(false)
+        }
+        Ok(false) => Ok(true),
+        Err(e) if locks_unsupported(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The device and inode of what is at `path`, from the folder open as
+/// `at` or else from the working directory, without following a link
+/// there.
+fn lstat_key(at: Option<BorrowedFd<'_>>, path: &Path) -> io::Result<(u64, u64)> {
+    let c = cstr(path.as_os_str())?;
+    let dirfd = at.map_or(libc::AT_FDCWD, |fd| fd.as_raw_fd());
+    // SAFETY: stat is plain data; fstatat fills it in.
+    let mut st: Stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid C string, and `st` is valid for writes.
+    cvt(unsafe { sys_fstatat(dirfd, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) })?;
+    Ok(stat_key(&st))
+}
+
+impl Guard {
+    /// The guard file's path.
+    fn path(&self) -> PathBuf {
+        self.state.join(naming::GUARD_FILE)
+    }
+
+    /// Whether the state folder's path, then the guard file's path in the
+    /// folder held, still name what this guard holds: the same device and
+    /// inode, and not a link. A guard file removed (its path names nothing)
+    /// or replaced (it names another file) in that folder is opened, made
+    /// if missing, and locked again in the same mode, unless another
+    /// process still holds the new one in a mode that conflicts after
+    /// [`RELOCK_RETRY`]. Any other error is [`GuardFound::Unknown`]: a
+    /// second lock on the file held, were it still in place, would conflict
+    /// with this guard's own.
+    fn look(&mut self) -> GuardFound {
+        let held = |fd: &OwnedFd| fstat(fd.as_fd()).map(|st| stat_key(&st));
+        match (lstat_key(None, &self.state), held(&self.dir)) {
+            (Ok(found), Ok(ours)) if found == ours => {}
+            (Ok(_), Ok(_)) => return GuardFound::Lost,
+            (Err(e), _)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return GuardFound::Lost;
+            }
+            (Err(e), _) | (_, Err(e)) => return GuardFound::Unknown(e),
+        }
+        let ours = match held(&self.file) {
+            Ok(ours) => ours,
+            Err(e) => return GuardFound::Unknown(e),
+        };
+        let name = Path::new(naming::GUARD_FILE);
+        match lstat_key(Some(self.dir.as_fd()), name) {
+            Ok(found) if found == ours => return GuardFound::InPlace,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return GuardFound::Unknown(e),
+        }
+        let file = match open_guard_in(self.dir.as_fd()) {
+            Ok(file) => file,
+            Err(e) => return GuardFound::Unknown(e),
+        };
+        // Put back since the look above: it is the file held.
+        match held(&file) {
+            Ok(found) if found == ours => return GuardFound::InPlace,
+            Ok(_) => {}
+            Err(e) => return GuardFound::Unknown(e),
+        }
+        let until = Instant::now() + RELOCK_RETRY;
+        loop {
+            match flock_nb(file.as_fd(), guard_op(self.shared)) {
+                Ok(true) => {
+                    // Closing the old file gives its lock up.
+                    self.file = file;
+                    return GuardFound::Retaken;
+                }
+                Ok(false) if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(false) => return GuardFound::Lost,
+                Err(e) => return GuardFound::Unknown(e),
+            }
+        }
+    }
+}
+
+/// An owner that locks a new guard file again ([`Guard::look`]) and finds
+/// it held looks again for this long, so a launch that takes the guard for
+/// a moment to look at it ([`guard_held`]) doesn't end the owner, even a
+/// launch slowed down on a busy machine. Longer than `start`'s 50 ms: the
+/// owner waits only after its guard file was replaced, and a wrong
+/// [`LostState`](crate::End::LostState) costs more than the wait.
+const RELOCK_RETRY: Duration = Duration::from_millis(250);
+
+/// Whether `e`, from `flock` on the guard file [`open_guard`] or
+/// [`guard_held`] just opened, says that the file system can't lock it.
+/// `ENOTSUP` is `EOPNOTSUPP` on Linux and FreeBSD, and a number of its own
+/// elsewhere. `EBADF`, on a descriptor just opened, is NFS: its client
+/// emulates `flock` with POSIX locks on the server, and an exclusive one
+/// needs a descriptor open for writing (flock(2)), which the guard's isn't.
+/// A shared one needs only reading, so a keyed owner there holds the guard.
+fn locks_unsupported(e: &io::Error) -> bool {
+    e.raw_os_error().is_some_and(|code| {
+        [libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOTSUP, libc::EBADF].contains(&code)
+    })
+}
+
+/// Whether the folder open as `fd` is on a network file system, which
+/// [`Guard::Local`](crate::Guard::Local) leaves unguarded. One whose file
+/// system can't be read counts as local, and the lock decides.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn is_network(fd: BorrowedFd<'_>) -> bool {
+    // On 32-bit targets glibc's fstatfs fails with EOVERFLOW when a volume
+    // has more than 2^32 blocks or files, as a large share can. Its
+    // fstatfs64 can't, and on 64-bit targets it is the same call. musl and
+    // bionic count in 64 bits everywhere.
+    #[cfg(not(target_env = "gnu"))]
+    use libc::{fstatfs, statfs};
+    #[cfg(target_env = "gnu")]
+    use libc::{fstatfs64 as fstatfs, statfs64 as statfs};
+    // SAFETY: statfs is plain data; fstatfs fills it in.
+    let mut st: statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open, and `st` is valid for writes.
+    if unsafe { fstatfs(fd.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    // Its type differs by architecture and C library (signed or unsigned,
+    // 32 or 64 bits), but the magic numbers are 32 bits.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = st.f_type as u32;
+    network_magic(magic)
+}
+
+/// macOS and these BSDs mark each local file system `MNT_LOCAL`. The
+/// flags' type, and the constant's, differ on each.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd"
+))]
+#[allow(clippy::unnecessary_cast)]
+fn is_network(fd: BorrowedFd<'_>) -> bool {
+    // SAFETY: statfs is plain data; fstatfs fills it in.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open, and `st` is valid for writes.
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    st.f_flags as u64 & libc::MNT_LOCAL as u64 == 0
+}
+
+/// NetBSD has no `fstatfs`, but its `fstatvfs` gives the mount flags.
+#[cfg(target_os = "netbsd")]
+fn is_network(fd: BorrowedFd<'_>) -> bool {
+    // SAFETY: statvfs is plain data; fstatvfs fills it in.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open, and `st` is valid for writes.
+    if unsafe { libc::fstatvfs(fd.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    st.f_flag & libc::MNT_LOCAL as libc::c_ulong == 0
+}
+
+/// illumos marks no file system local, so this goes by its type's name.
+/// Each NFS version is a file system type of its own there.
+#[cfg(target_os = "illumos")]
+fn is_network(fd: BorrowedFd<'_>) -> bool {
+    // SAFETY: statvfs is plain data; fstatvfs fills it in.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open, and `st` is valid for writes.
+    if unsafe { libc::fstatvfs(fd.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let name = st.f_basetype.map(|c| c as u8);
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    network_type_name(&name[..len])
+}
+
+/// Whether a file system type Linux reports from `statfs` is a network or
+/// cluster file system: one whose locks reach other hosts, or that another
+/// machine serves. FUSE counts as local, whatever serves it. The numbers
+/// are from linux/magic.h and the file systems' sources, written out here
+/// since libc lacks some and gives the rest a type that differs by
+/// architecture.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn network_magic(magic: u32) -> bool {
+    const NETWORK: [u32; 14] = [
+        0x6969,      // NFS
+        0x517b,      // SMB
+        0xfe53_4d42, // SMB2
+        0xff53_4d42, // CIFS
+        0x0102_1997, // 9P
+        0x5346_414f, // AFS
+        0x6b41_4653, // kAFS
+        0x00c3_6400, // Ceph
+        0x7375_7245, // Coda
+        0x564c,      // NCP
+        0x0bd0_0bd0, // Lustre
+        0x0116_1970, // GFS2
+        0x7461_636f, // OCFS2
+        0x786f_4256, // vboxsf
+    ];
+    NETWORK.contains(&magic)
+}
+
+/// Whether a file system type illumos names in `statvfs` is a network one:
+/// NFS, which names its version 3 and 4 mounts `nfs3` and `nfs4`, or SMB.
+#[cfg(any(target_os = "illumos", test))]
+fn network_type_name(name: &[u8]) -> bool {
+    matches!(name, b"nfs" | b"nfs3" | b"nfs4" | b"smbfs")
+}
+
+// ---------------------------------------------------------------------------
 // Peer credentials
 // ---------------------------------------------------------------------------
 
@@ -990,11 +1848,12 @@ impl Waker {
     }
 }
 
-/// The folder, the lock and the socket, as the owner holds them.
+/// The folder, the lock, the guard and the socket, as the owner holds them.
 #[derive(Debug)]
 pub(crate) struct Held {
     pub(crate) folder: Option<Folder>,
     pub(crate) lock: Option<Lock>,
+    pub(crate) guard: Option<Guard>,
     /// The socket file this process bound.
     socket: Option<SocketKey>,
 }
@@ -1005,6 +1864,7 @@ impl Held {
         Held {
             folder: None,
             lock: None,
+            guard: None,
             socket: None,
         }
     }
@@ -1018,19 +1878,25 @@ impl Held {
     }
 }
 
-/// What `start` hands over to a `Claim`: the folder, the lock, and the
-/// listening socket, bound by this process.
+/// What `start` hands over to a `Claim`: the folder, the lock, the guard
+/// if it took one, and the listening socket, bound by this process.
 #[derive(Debug)]
 pub(crate) struct Claimed {
     pub(crate) folder: Folder,
     pub(crate) lock: Lock,
+    guard: Option<Guard>,
     pub(crate) listener: io::Result<UnixListener>,
     socket: Option<SocketKey>,
     pid: u32,
 }
 
 impl Claimed {
-    pub(crate) fn new(folder: Folder, lock: Lock, _app_id: &AppId) -> Claimed {
+    pub(crate) fn new(
+        folder: Folder,
+        lock: Lock,
+        guard: Option<Guard>,
+        _app_id: &AppId,
+    ) -> Claimed {
         let (listener, socket) = match folder.listen() {
             Ok((l, key)) => (Ok(l), key),
             Err(e) => (Err(e), None),
@@ -1038,6 +1904,7 @@ impl Claimed {
         Claimed {
             folder,
             lock,
+            guard,
             listener,
             socket,
             pid: std::process::id(),
@@ -1048,6 +1915,10 @@ impl Claimed {
     /// called `start`.
     pub(crate) fn forked(&self) -> bool {
         self.pid != std::process::id()
+    }
+
+    pub(crate) fn guarded(&self) -> bool {
+        self.guard.is_some()
     }
 
     /// Ready to serve in this process. After a fork, the child binds a
@@ -1064,6 +1935,7 @@ impl Claimed {
         let held = Held {
             folder: Some(self.folder),
             lock: Some(self.lock),
+            guard: self.guard,
             socket,
         };
         match listener {
@@ -1073,17 +1945,22 @@ impl Claimed {
     }
 
     /// A forked copy that won't serve: close the socket and the folder, and
-    /// keep the lock's descriptor open until the process exits.
+    /// keep the lock's and the guard's descriptors open until the process
+    /// exits.
     pub(crate) fn abandon(self) {
+        std::mem::forget(self.guard);
         std::mem::forget(self.lock);
     }
 
-    /// Gives the lock up without serving. A forked copy only closes its
-    /// descriptors: the lock stays with the process that still holds it.
+    /// Gives the guard and the lock up without serving, the guard first, so
+    /// a launch that takes the freed lock finds the guard free too. A forked
+    /// copy only closes its descriptors: both stay with the process that
+    /// still holds them.
     pub(crate) fn release(self) {
         if !self.forked() {
             self.folder.remove_own_socket(&self.lock, self.socket);
         }
+        drop(self.guard);
         drop(self.lock);
     }
 }
@@ -1094,7 +1971,8 @@ struct Connection<T> {
     shut: bool,
 }
 
-/// Runs the owner's thread until the handle closes it or the lock is lost.
+/// Runs the owner's thread until the handle closes it, or the lock or the
+/// state folder is lost.
 pub(crate) fn serve<T: Payload>(
     mut core: Core<T>,
     mut listener: Option<UnixListener>,
@@ -1106,6 +1984,7 @@ pub(crate) fn serve<T: Payload>(
     let upkeep = core.ctx.upkeep;
     let mut next_check = Instant::now() + upkeep.check;
     let mut next_touch = Instant::now() + upkeep.touch;
+    let mut kept_out = None;
 
     while core.poll_control() {
         let now = Instant::now();
@@ -1215,9 +2094,10 @@ pub(crate) fn serve<T: Payload>(
             }
         }
         if now >= next_check {
-            next_check = now + upkeep.check;
-            if !check_lock(&mut core, &mut listener, &place) {
-                break;
+            match check_lock(&mut core, &mut listener, &place, &mut kept_out) {
+                Upkept::Kept => next_check = now + upkeep.check,
+                Upkept::Soon => next_check = now + upkeep.check.min(SOON),
+                Upkept::Ended => break,
             }
         }
     }
@@ -1225,21 +2105,96 @@ pub(crate) fn serve<T: Payload>(
     drop(listener);
 }
 
-/// Every minute: is the lock file still the one held? Re-creates the
-/// folder, the lock and the socket when something deleted them. `false`
-/// when another process took the lock meanwhile.
+/// How soon the owner looks again at a lock that a launch holds in its
+/// re-made folder: the launch finds the guard held, and lets go.
+const SOON: Duration = Duration::from_secs(1);
+
+/// How long another process may hold the lock in the re-made folder before
+/// the owner says so at warn. A launch lets go within about 50 ms of
+/// finding the guard held, so one that holds the lock this long is an
+/// owner, or an [exclusive](crate::Builder::exclusive) run, under
+/// [`Guard::Off`](crate::Guard::Off), and launches can't reach this owner
+/// meanwhile.
+const KEPT_OUT: Duration = Duration::from_secs(10);
+
+/// Since when another process has held the lock in the re-made folder,
+/// and whether the owner has said so at warn.
+struct KeptOut {
+    since: Instant,
+    told: bool,
+}
+
+/// What the owner's upkeep did, and when it looks next.
+enum Upkept {
+    /// All is in place, or in place again: look at the next check.
+    Kept,
+    /// Another process holds the lock in the re-made folder: look again
+    /// [`SOON`].
+    Soon,
+    /// The owner has ended.
+    Ended,
+}
+
+/// Every minute: are the state folder and its guard file, while the owner
+/// holds the guard, and the lock file still the ones held? Ends the owner
+/// with [`End::LostState`] when the state folder isn't, or another process
+/// holds the guard file now at its path. Re-creates the guard file when
+/// only it was removed, and the folder, the lock and the socket when
+/// something deleted them. Ends the owner with
+/// [`End::LostLock`] when another process took the lock meanwhile, unless
+/// the owner holds the guard alone: it then waits, and `kept_out` says
+/// since when.
+///
+/// [`End::LostState`]: crate::End::LostState
+/// [`End::LostLock`]: crate::End::LostLock
 fn check_lock<T: Payload>(
     core: &mut Core<T>,
     listener: &mut Option<UnixListener>,
     place: &Place,
-) -> bool {
+    kept_out: &mut Option<KeptOut>,
+) -> Upkept {
     let app_id = core.ctx.app_id.clone();
+    // Kept only while another process still holds the lock.
+    let kept = kept_out.take();
     let mut held = core.shared.held();
     if core.shared.close.load(Ordering::SeqCst) {
-        return true;
+        return Upkept::Kept;
+    }
+    if let Some(guard) = &mut held.guard {
+        match guard.look() {
+            GuardFound::InPlace => {}
+            GuardFound::Retaken => log::warn!(
+                "instance-handoff {app_id}: the guard file {} was removed or replaced; \
+                 locked it again",
+                guard.path().display()
+            ),
+            GuardFound::Unknown(e) => log::warn!(
+                "instance-handoff {app_id}: looking at the state folder {} and its guard \
+                 file: {e}",
+                guard.state.display()
+            ),
+            GuardFound::Lost => {
+                log::warn!(
+                    "instance-handoff {app_id}: the state folder {} was removed or replaced, \
+                     or another process holds its guard: this process is no longer the owner",
+                    guard.state.display()
+                );
+                // The socket and the lock go too, so the next launch can own
+                // the folder now at the path. The guard first, as `release`
+                // gives them up.
+                held.unlink_socket();
+                held.socket = None;
+                drop(held.guard.take());
+                drop(held.lock.take());
+                drop(held);
+                *listener = None;
+                core.end(crate::End::LostState);
+                return Upkept::Ended;
+            }
+        }
     }
     let (Some(folder), Some(lock)) = (&held.folder, &held.lock) else {
-        return true;
+        return Upkept::Kept;
     };
     if folder.holds(lock) {
         // Gone, or replaced by a socket that nobody answers on (a forked
@@ -1251,7 +2206,7 @@ fn check_lock<T: Payload>(
             current.is_some()
                 && current != held.socket
                 && folder
-                    .connect(Some(Instant::now() + Duration::from_millis(200)))
+                    .connect(Some(Instant::now() + Duration::from_millis(200)), None)
                     .is_ok()
         };
         if !ours && !live() {
@@ -1266,7 +2221,7 @@ fn check_lock<T: Payload>(
                 Err(e) => log::warn!("instance-handoff {app_id}: socket: {e}"),
             }
         }
-        return true;
+        return Upkept::Kept;
     }
     match open_folder(place, true) {
         Ok(Some(new)) => match new.lock() {
@@ -1288,30 +2243,62 @@ fn check_lock<T: Payload>(
                 }
                 held.folder = Some(new);
                 held.lock = Some(new_lock);
-                true
+                Upkept::Kept
+            }
+            // A launch that took the lock finds the guard this owner holds
+            // alone, and lets go again. An owner with a scope shares the
+            // guard, so a launch of its scope would own, and does.
+            Ok(None) if held.guard.as_ref().is_some_and(|g| !g.shared) => {
+                let now = Instant::now();
+                let mut kept = kept.unwrap_or(KeptOut {
+                    since: now,
+                    told: false,
+                });
+                let waited = now.duration_since(kept.since);
+                if !kept.told && waited >= KEPT_OUT {
+                    log::warn!(
+                        "instance-handoff {app_id}: another process has held the lock in the \
+                         re-made runtime folder {} for {} s, so launches can't reach this \
+                         owner; it takes the lock there once that process lets go",
+                        new.path().display(),
+                        waited.as_secs()
+                    );
+                    kept.told = true;
+                } else {
+                    log::debug!(
+                        "instance-handoff {app_id}: another process holds the lock in the \
+                         re-made runtime folder; looking again soon"
+                    );
+                }
+                *kept_out = Some(kept);
+                Upkept::Soon
             }
             Ok(None) => {
                 log::warn!(
                     "instance-handoff {app_id}: the runtime folder was removed, and another \
                      process now holds the lock: this process is no longer the owner"
                 );
+                // An owner told to stop writing the state gives its guard up
+                // too, so the launch that holds the lock, or the next one,
+                // can own the state folder.
+                drop(held.guard.take());
                 drop(held);
                 // The files at the path are the new owner's: remove nothing.
                 *listener = None;
                 core.end(crate::End::LostLock);
-                false
+                Upkept::Ended
             }
             Err(e) => {
                 log::warn!("instance-handoff {app_id}: re-creating the lock: {e}");
-                true
+                Upkept::Kept
             }
         },
         // The folder can't be made now (the session's runtime folder is
         // gone until the next login): keep the lock held, and look again.
-        Ok(None) => true,
+        Ok(None) => Upkept::Kept,
         Err(reason) => {
             log::debug!("instance-handoff {app_id}: re-creating the folder: {reason}");
-            true
+            Upkept::Kept
         }
     }
 }
@@ -1330,18 +2317,20 @@ fn accept<T: Payload>(
                     // The launch sees EOF before HELLO and tries again.
                     continue;
                 }
-                let pid = match peer_cred(stream.as_fd()) {
-                    Ok((uid, pid)) if uid == euid() => pid,
-                    Ok((uid, _)) => {
+                // A launch this owner won't serve is told so at once, in
+                // place of HELLO, rather than left to wait out its timeout.
+                let session = match peer_cred(stream.as_fd()) {
+                    Ok((uid, pid)) if uid == euid() => Session::new(core, Peer::new(pid), now),
+                    Ok((uid, pid)) => {
                         log::warn!(
                             "instance-handoff {}: refused a connection from user {uid}",
                             core.ctx.app_id
                         );
-                        continue;
+                        Session::refused(Peer::new(pid), refusal::PEER, now)
                     }
                     Err(e) => {
                         log::warn!("instance-handoff {}: peer check: {e}", core.ctx.app_id);
-                        continue;
+                        Session::refused(Peer::default(), refusal::PEER, now)
                     }
                 };
                 if let Err(e) = stream.set_nonblocking(true) {
@@ -1351,7 +2340,7 @@ fn accept<T: Payload>(
                 no_sigpipe(stream.as_fd());
                 let mut c = Connection {
                     stream,
-                    session: Session::new(core, pid, now),
+                    session,
                     shut: false,
                 };
                 flush(&mut c);
@@ -1419,7 +2408,7 @@ fn read<T: Payload>(c: &mut Connection<T>, core: &mut Core<T>, now: Instant) {
 mod tests {
     use super::*;
 
-    const ID: AppId = AppId::new("app.test");
+    const ID: AppId = AppId::headless("app.test");
 
     fn env() -> LinuxEnv {
         LinuxEnv {
@@ -1453,18 +2442,41 @@ mod tests {
             ))
         );
 
-        // sudo -E keeps the user's XDG_RUNTIME_DIR; it's never looked at.
-        let sudo = LinuxEnv {
-            xdg_runtime_dir: Some("/run/user/1000".into()),
-            run_user: Some("/run/user/0".into()),
+        // Outside a snap or Flatpak, root has one folder, logged in or not,
+        // whatever its environment says: sudo -E keeps the user's
+        // XDG_RUNTIME_DIR, and a stale one names a folder that is gone.
+        let root = LinuxEnv {
             systemd: true,
             euid: 0,
             ..env()
         };
-        assert_eq!(
-            base(linux_rule(&sudo, &ID)).unwrap().0,
-            PathBuf::from("/run/user/0")
-        );
+        let sudo = LinuxEnv {
+            xdg_runtime_dir: Some("/run/user/1000".into()),
+            ..root.clone()
+        };
+        let stale = LinuxEnv {
+            xdg_runtime_dir: Some("/run/user/0".into()),
+            ..root.clone()
+        };
+        let logged_in = LinuxEnv {
+            run_user: Some("/run/user/0".into()),
+            ..stale.clone()
+        };
+        let without_systemd = LinuxEnv {
+            systemd: false,
+            ..root.clone()
+        };
+        for launch in [root, sudo, stale, logged_in, without_systemd] {
+            assert_eq!(
+                base(linux_rule(&launch, &ID)),
+                Ok((
+                    "/run/instance-handoff".into(),
+                    Base::System,
+                    vec!["app.test".into()]
+                )),
+                "{launch:?}"
+            );
+        }
 
         // cron, @reboot, a system service: no session, no folder, no
         // fallback.
@@ -1522,6 +2534,242 @@ mod tests {
             base(linux_rule(&snap, &ID)).unwrap().0,
             PathBuf::from("/run/user/1000/snap.app")
         );
+
+        // The sandboxes set the runtime folder, for root too.
+        let root_snap = LinuxEnv {
+            xdg_runtime_dir: Some("/run/user/0/snap.app".into()),
+            euid: 0,
+            ..snap
+        };
+        assert_eq!(
+            base(linux_rule(&root_snap, &ID)).unwrap().0,
+            PathBuf::from("/run/user/0/snap.app")
+        );
+    }
+
+    // One row per way to reach root, or a launch that looks like one. Only
+    // root with a known person who isn't root is raised.
+    #[test]
+    fn raised_launches() {
+        let (user, root, none) = (Some(1000), Some(0), None);
+        // (launch, euid, SUDO_UID, PKEXEC_UID, DOAS_USER, loginuid, raised)
+        let rows = [
+            ("sudo, no login id", 0, user, none, none, none, true),
+            ("sudo -i on Linux", 0, user, none, none, user, true),
+            // run0's command runs as a service: no login id.
+            ("run0", 0, user, none, none, none, true),
+            ("su on Linux", 0, none, none, none, user, true),
+            ("sudo after su", 0, root, none, none, user, true),
+            ("doas", 0, none, none, user, none, true),
+            ("pkexec", 0, none, user, none, user, true),
+            ("root's own login", 0, none, none, none, root, false),
+            ("root login, sudo", 0, root, none, none, root, false),
+            // Started by the service manager: no login.
+            ("a systemd service", 0, none, none, none, none, false),
+            // The user who made the namespace is its root, and a login id
+            // the namespace doesn't map reads as unset.
+            ("rootless container", 0, none, none, none, root, false),
+            // No login id, and su sets no variable.
+            ("su on macOS, BSDs", 0, none, none, none, none, false),
+            // Not root: no raised rights, whatever the variables say.
+            ("a stale SUDO_UID", 1000, user, none, none, user, false),
+            ("sudo -u bob", 1001, user, none, none, user, false),
+        ];
+        for (launch, euid, sudo_uid, pkexec_uid, doas_user, loginuid, raised) in rows {
+            let env = RaisedEnv {
+                euid,
+                sudo_uid,
+                pkexec_uid,
+                doas_user,
+                loginuid,
+            };
+            assert_eq!(raised_from(&env), raised, "{launch}: {env:?}");
+        }
+    }
+
+    // A process whose real and effective user or group ids differ takes no
+    // part. Only those ids count, so root takes part, and so does a process
+    // whose ids were all set alike, or a set-id one that set its effective
+    // ids back.
+    #[test]
+    fn set_id_processes_are_excluded() {
+        // (process, uid, euid, gid, egid, excluded)
+        let rows = [
+            ("a user's launch", 1000, 1000, 1000, 1000, false),
+            ("a user in group users", 1000, 1000, 100, 100, false),
+            ("root, under sudo or not", 0, 0, 0, 0, false),
+            ("sudo -u bob", 1001, 1001, 1001, 1001, false),
+            // A setuid program whose saved id lets it take root back.
+            ("after seteuid(getuid())", 1000, 1000, 1000, 1000, false),
+            ("a setuid-root program", 1000, 0, 1000, 1000, true),
+            ("setuid to another user", 1000, 1001, 1000, 1000, true),
+            ("a setgid program", 1000, 1000, 1000, 60, true),
+            ("setuid and setgid", 1000, 0, 1000, 0, true),
+            ("root with another effective user", 0, 1000, 0, 0, true),
+            ("root with another effective group", 0, 0, 0, 1000, true),
+        ];
+        for (process, uid, euid, gid, egid, excluded) in rows {
+            let ids = Ids {
+                uid,
+                euid,
+                gid,
+                egid,
+            };
+            let expected = excluded.then_some(crate::Excluded::SetId);
+            assert_eq!(excluded_from(&ids), expected, "{process}: {ids:?}");
+        }
+        assert_eq!(super::excluded(), None, "{:?}", ids());
+    }
+
+    #[test]
+    fn doas_users_are_looked_up() {
+        assert_eq!(uid_of(OsStr::new("root")), Some(0));
+        assert_eq!(uid_of(OsStr::new("no-such-user-ih")), None);
+        assert_eq!(uid_of(OsStr::new("ro\0ot")), None);
+        let env = raised_env();
+        assert_eq!(env.euid, euid());
+        if env.euid != 0 {
+            assert!(!raised() && !above_normal());
+        }
+    }
+
+    // On Linux, the BSDs and illumos: a launch can show windows when a
+    // display variable names a display.
+    #[test]
+    fn who_can_show_windows() {
+        let (wayland, x, empty, none) = (Some("wayland-0"), Some(":0"), Some(""), None);
+        // (launch, WAYLAND_DISPLAY, DISPLAY, can show windows)
+        let rows = [
+            ("a Wayland session with Xwayland", wayland, x, true),
+            ("a Wayland session alone", wayland, none, true),
+            ("an X session", none, x, true),
+            ("ssh -X", none, Some("localhost:10.0"), true),
+            ("a console, ssh, cron or a service", none, none, false),
+            ("emptied variables", empty, empty, false),
+            ("an emptied WAYLAND_DISPLAY", empty, x, true),
+            ("an emptied DISPLAY", wayland, empty, true),
+        ];
+        for (launch, wayland_display, display, shows) in rows {
+            let env = DisplayEnv {
+                wayland_display: wayland_display.map(OsString::from),
+                display: display.map(OsString::from),
+            };
+            assert_eq!(shows_windows_from(&env), shows, "{launch}: {env:?}");
+        }
+    }
+
+    // A process can read its own login session.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_login_session_says_whether_it_has_graphics() {
+        assert!(session_has_graphics().is_some());
+    }
+
+    // Root's base: made only where its parent exists, and refused when it
+    // is a link or others can write to it. Any user can run this, since the
+    // owner it must have is this process's user.
+    #[test]
+    fn the_root_base_is_made_and_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let set_mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let system = |base: PathBuf| Place {
+            base,
+            kind: Base::System,
+            subs: vec!["app.test".into()],
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let err = open_folder(&system(tmp.path().join("no").join("base")), true).unwrap_err();
+        assert!(matches!(err, Reason::RuntimeDir { .. }), "{err}");
+
+        let base = tmp.path().join("base");
+        assert!(open_folder(&system(base.clone()), false).unwrap().is_none());
+        assert!(open_folder(&system(base.clone()), true).unwrap().is_some());
+        let mode = std::fs::metadata(&base).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        // Others may read it, but not write to it.
+        set_mode(&base, 0o755);
+        assert!(open_folder(&system(base.clone()), true).unwrap().is_some());
+        for mode in [0o775, 0o757] {
+            set_mode(&base, mode);
+            let err = open_folder(&system(base.clone()), true).unwrap_err();
+            assert!(matches!(err, Reason::RuntimeDir { .. }), "{mode:o}: {err}");
+        }
+
+        set_mode(&base, 0o700);
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        let err = open_folder(&system(link), true).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_base_is_resolved() {
+        let place = default_place(&ID).unwrap();
+        assert_eq!(std::fs::canonicalize(&place.base).unwrap(), place.base);
+        let base = Place {
+            subs: Vec::new(),
+            ..place
+        };
+        assert!(open_folder(&base, false).unwrap().is_some());
+    }
+
+    // Outside fakeroot, the system calls and the C library agree.
+    #[test]
+    fn the_kernel_and_the_c_library_agree() {
+        // SAFETY: geteuid has no preconditions and can't fail.
+        assert_eq!(euid(), unsafe { libc::geteuid() });
+        let ids = ids();
+        // SAFETY: getuid, getgid and getegid have no preconditions and
+        // can't fail.
+        let c_library = unsafe { (libc::getuid(), libc::getgid(), libc::getegid()) };
+        assert_eq!((ids.uid, ids.gid, ids.egid), c_library);
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = open_folder(&Place::dir(tmp.path().join("run")), true)
+            .unwrap()
+            .unwrap();
+        let lock = folder.lock().unwrap().unwrap();
+        for fd in [folder.fd.as_fd(), lock.0.as_fd()] {
+            let st = fstat(fd).unwrap();
+            assert_eq!(owner_mode(fd).unwrap(), (st.st_uid, st.st_mode));
+        }
+        let st = fstat(folder.fd.as_fd()).unwrap();
+        assert_eq!(path_owner(folder.path()).unwrap(), st.st_uid);
+    }
+
+    // Who may keep its state in whose folder: (owner, euid, trusted).
+    #[test]
+    fn the_state_owner_rule() {
+        let table = [
+            (1000, 1000, true),
+            // Root's folders, such as `/` above a missing state folder.
+            (0, 1000, true),
+            (1001, 1000, false),
+            // A user namespace shows owners it doesn't map as nobody.
+            (65534, 1000, false),
+            (0, 0, true),
+            // Root given the user's home: sudo -E, macOS sudo, su -m.
+            (1000, 0, false),
+            (65534, 0, false),
+        ];
+        for (owner, euid, trusted) in table {
+            assert_eq!(
+                trusted_owner(owner, euid),
+                trusted,
+                "owner {owner}, euid {euid}"
+            );
+        }
+    }
+
+    #[test]
+    fn this_users_folders_are_not_foreign() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_foreign(tmp.path()).unwrap());
+        let err = is_foreign(&tmp.path().join("missing")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -1547,10 +2795,10 @@ mod tests {
         let err = open_folder(&Place::dir(link), true).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
 
-        // A scope subfolder someone swapped for a symlink.
+        // An instance folder someone swapped for a symlink.
         let mut scoped = Place::dir(dir.clone());
-        scoped.push("s");
-        std::os::unix::fs::symlink("/tmp", dir.join("s")).unwrap();
+        scoped.push("i-0123456789abcdef");
+        std::os::unix::fs::symlink("/tmp", dir.join("i-0123456789abcdef")).unwrap();
         assert!(open_folder(&scoped, true).is_err());
     }
 
@@ -1589,6 +2837,397 @@ mod tests {
         assert!(!folder.lock_held().unwrap());
     }
 
+    // Frozen with the guard's name: a private file in a state folder made
+    // private where that is missing, never written, and an exclusive flock,
+    // which no other open file shares.
+    #[test]
+    fn the_guard_is_private_and_exclusive() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("missing").join("state");
+        make_state_dir(&state).unwrap();
+        let guard = take_guard(&state, false)
+            .unwrap()
+            .expect("a local folder locks");
+        let file = state.join(".instance-handoff.lock");
+        assert_eq!(mode(&state), 0o700);
+        assert_eq!(mode(&file), 0o600);
+        let other = std::fs::File::open(&file).unwrap();
+        // SAFETY: flock on an open file.
+        let shared = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        assert_eq!(shared, -1);
+        let err = take_guard(&state, false).unwrap_err();
+        assert!(
+            matches!(&err, Reason::StateInUse { path } if *path == file),
+            "{err}"
+        );
+        drop(guard);
+        assert!(take_guard(&state, false).unwrap().is_some());
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), 0);
+    }
+
+    // Frozen with the guard's modes: a keyed owner's flock is shared, so
+    // other keyed owners and any other shared flock hold beside it, but no
+    // exclusive one. An exclusive guard keeps keyed owners out in turn.
+    #[test]
+    fn a_keyed_guard_is_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        let file = state.join(".instance-handoff.lock");
+        let a = take_guard(state, true).unwrap();
+        let b = take_guard(state, true).unwrap();
+        assert!(a.is_some() && b.is_some(), "a local folder locks");
+        let other = std::fs::File::open(&file).unwrap();
+        // SAFETY: flock on an open file.
+        let flock = |op| unsafe { libc::flock(other.as_raw_fd(), op | libc::LOCK_NB) };
+        assert_eq!(flock(libc::LOCK_EX), -1);
+        assert_eq!(flock(libc::LOCK_SH), 0);
+        drop(other);
+        let err = take_guard(state, false).unwrap_err();
+        assert!(
+            matches!(&err, Reason::StateInUse { path } if *path == file),
+            "{err}"
+        );
+        drop(a);
+        assert!(take_guard(state, false).is_err());
+        drop(b);
+        let unkeyed = take_guard(state, false).unwrap().unwrap();
+        let err = take_guard(state, true).unwrap_err();
+        assert!(matches!(err, Reason::StateInUse { .. }), "{err}");
+        drop(unkeyed);
+        assert!(take_guard(state, true).unwrap().is_some());
+    }
+
+    // A launch with no runtime folder looks at the guard in the mode start
+    // would take it: alone, it finds the guard held in either mode, and
+    // shared, only held alone, since keyed owners hold it side by side.
+    // Looking makes nothing, and leaves the guard free. A missing folder, a
+    // path through a file, or a folder with no guard file, is free.
+    #[test]
+    fn a_launch_finds_the_guard_held_as_start_would() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let file = state.join(".instance-handoff.lock");
+        let through = tmp.path().join("file");
+        std::fs::write(&through, b"").unwrap();
+        for look in [false, true] {
+            assert!(!guard_held(&state, look).unwrap());
+            assert!(!guard_held(&through.join("state"), look).unwrap());
+        }
+        make_state_dir(&state).unwrap();
+        for look in [false, true] {
+            assert!(!guard_held(&state, look).unwrap());
+        }
+        assert!(!file.exists());
+        for (held, look) in [(false, false), (false, true), (true, false), (true, true)] {
+            let guard = take_guard(&state, held).unwrap().unwrap();
+            let found = guard_held(&state, look).unwrap();
+            assert_eq!(found, !(held && look), "{held} {look}");
+            drop(guard);
+            assert!(!guard_held(&state, look).unwrap(), "{held} {look}");
+        }
+        assert!(take_guard(&state, false).unwrap().is_some());
+    }
+
+    // The look gives the guard back with LOCK_UN, not as its descriptor
+    // closes: kept open here, as a copy that a child forked meanwhile would
+    // keep, it holds no lock after.
+    #[test]
+    fn a_look_gives_the_guard_back_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        drop(take_guard(state, false).unwrap().unwrap());
+        let file = std::fs::File::open(state.join(".instance-handoff.lock")).unwrap();
+        for shared in [false, true] {
+            assert!(!look_at_guard(file.as_fd(), shared).unwrap(), "{shared}");
+            assert!(take_guard(state, false).unwrap().is_some(), "{shared}");
+        }
+    }
+
+    /// What the owner's upkeep finds at `guard`'s paths, by name.
+    fn look(guard: &mut Guard) -> &'static str {
+        match guard.look() {
+            GuardFound::InPlace => "in place",
+            GuardFound::Retaken => "retaken",
+            GuardFound::Lost => "lost",
+            GuardFound::Unknown(e) => panic!("{e}"),
+        }
+    }
+
+    // A guard file removed or replaced in the state folder the owner holds
+    // is made, or opened, and locked again in the owner's mode, so a launch
+    // finds it held as before. Keyed owners lock the new one side by side.
+    #[test]
+    fn a_guard_file_removed_from_its_folder_is_locked_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        make_state_dir(&state).unwrap();
+        let file = state.join(".instance-handoff.lock");
+        let mut guard = take_guard(&state, false).unwrap().unwrap();
+        assert_eq!(look(&mut guard), "in place");
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(look(&mut guard), "retaken");
+        assert!(file.is_file());
+        assert_eq!(look(&mut guard), "in place");
+        let err = take_guard(&state, true).unwrap_err();
+        assert!(matches!(err, Reason::StateInUse { .. }), "{err}");
+        let new = tmp.path().join("new");
+        std::fs::write(&new, b"").unwrap();
+        std::fs::rename(&new, &file).unwrap();
+        assert_eq!(look(&mut guard), "retaken");
+        let err = take_guard(&state, false).unwrap_err();
+        assert!(matches!(err, Reason::StateInUse { .. }), "{err}");
+        drop(guard);
+
+        let mut a = take_guard(&state, true).unwrap().unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let b = take_guard(&state, true).unwrap().unwrap();
+        assert_eq!(look(&mut a), "retaken");
+        let err = take_guard(&state, false).unwrap_err();
+        assert!(matches!(err, Reason::StateInUse { .. }), "{err}");
+        drop((a, b));
+    }
+
+    // A launch with no runtime folder that looks at the new guard file
+    // holds it for a moment: the owner looks again for a while, and locks
+    // it once the launch gives it back, rather than end.
+    #[test]
+    fn a_new_guard_file_a_launch_looks_at_is_locked_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        let file = state.join(".instance-handoff.lock");
+        for ours in [false, true] {
+            let mut guard = take_guard(state, ours).unwrap().unwrap();
+            std::fs::remove_file(&file).unwrap();
+            let looking = std::fs::File::create(&file).unwrap();
+            assert!(flock_nb(looking.as_fd(), libc::LOCK_EX).unwrap());
+            let gives_back = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                drop(looking);
+            });
+            assert_eq!(look(&mut guard), "retaken", "{ours}");
+            gives_back.join().unwrap();
+            drop(guard);
+        }
+    }
+
+    // Another owner that locks the new guard file first, in a mode that
+    // conflicts, owns the state folder now.
+    #[test]
+    fn a_new_guard_file_held_by_another_owner_is_lost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        let file = state.join(".instance-handoff.lock");
+        for (ours, theirs) in [(false, false), (false, true), (true, false)] {
+            let mut guard = take_guard(state, ours).unwrap().unwrap();
+            std::fs::remove_file(&file).unwrap();
+            let other = take_guard(state, theirs).unwrap().unwrap();
+            assert_eq!(look(&mut guard), "lost", "{ours} {theirs}");
+            drop((guard, other));
+        }
+    }
+
+    // The state folder is looked at by its path, not followed through a
+    // link: renamed aside, made anew, or a link to the old one, it isn't
+    // the folder the guard is in. Put back, it is again.
+    #[test]
+    fn a_replaced_state_folder_is_lost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let old = tmp.path().join("old");
+        make_state_dir(&state).unwrap();
+        let mut guard = take_guard(&state, false).unwrap().unwrap();
+        std::fs::rename(&state, &old).unwrap();
+        assert_eq!(look(&mut guard), "lost");
+        make_state_dir(&state).unwrap();
+        assert_eq!(look(&mut guard), "lost");
+        std::fs::remove_dir(&state).unwrap();
+        std::os::unix::fs::symlink(&old, &state).unwrap();
+        assert_eq!(look(&mut guard), "lost");
+        std::fs::remove_file(&state).unwrap();
+        std::fs::rename(&old, &state).unwrap();
+        assert_eq!(look(&mut guard), "in place");
+    }
+
+    // A lock needs no write, so a guard file that exists is locked in a
+    // folder this user can't write to, but one that doesn't can't be made
+    // there. Root may write anywhere, so this needs another user.
+    #[test]
+    fn a_read_only_state_folder_locks_only_a_guard_that_exists() {
+        use std::os::unix::fs::PermissionsExt;
+        if euid() == 0 {
+            return;
+        }
+        let set_mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        set_mode(&state, 0o500);
+        let err = take_guard(&state, false).unwrap_err();
+        assert!(matches!(err, Reason::Lock { .. }), "{err}");
+        set_mode(&state, 0o700);
+        drop(take_guard(&state, false).unwrap().unwrap());
+        set_mode(&state, 0o500);
+        assert!(take_guard(&state, false).unwrap().is_some());
+        set_mode(&state, 0o700);
+    }
+
+    // Opened without blocking, a FIFO in the guard's place is refused at
+    // once rather than waited on, by an owner and by a launch that only
+    // looks.
+    #[test]
+    fn a_guard_that_isnt_a_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = cstr(tmp.path().join(".instance-handoff.lock").as_os_str()).unwrap();
+        // SAFETY: `fifo` is a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let err = take_guard(tmp.path(), false).unwrap_err();
+        assert!(
+            matches!(err, Reason::Lock { .. }) && err.to_string().contains("not a file"),
+            "{err}"
+        );
+        for shared in [false, true] {
+            let err = guard_held(tmp.path(), shared).unwrap_err();
+            assert!(err.to_string().contains("not a file"), "{err}");
+        }
+    }
+
+    // A state folder that exists keeps its mode, and whatever is at the
+    // path is left for the guard to refuse.
+    #[test]
+    fn only_a_missing_state_folder_is_made() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        make_state_dir(&state).unwrap();
+        assert_eq!(mode(&state), 0o755);
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        make_state_dir(&file).unwrap();
+        assert!(file.is_file());
+        assert!(matches!(take_guard(&file, false), Err(Reason::Lock { .. })));
+        assert!(make_state_dir(&file.join("state")).is_err());
+    }
+
+    // EBADF is NFS refusing an exclusive lock on a descriptor that isn't
+    // open for writing.
+    #[test]
+    fn file_systems_without_locks_leave_the_owner_unguarded() {
+        let error = io::Error::from_raw_os_error;
+        for code in [libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOTSUP, libc::EBADF] {
+            assert!(locks_unsupported(&error(code)), "{code}");
+        }
+        for code in [libc::EACCES, libc::EROFS, libc::EIO] {
+            assert!(!locks_unsupported(&error(code)), "{code}");
+        }
+    }
+
+    // A state folder on a network file system gets no guard, and no guard
+    // file is made in it.
+    #[test]
+    fn network_file_systems_go_unguarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join(".instance-handoff.lock");
+        assert!(open_guard_with(tmp.path(), |_| true).unwrap().is_none());
+        assert!(!file.exists());
+        assert!(open_guard_with(tmp.path(), |_| false).unwrap().is_some());
+        assert!(file.exists());
+    }
+
+    // The guard tests need a temporary folder to count as local. This asks
+    // directly, so macOS checks MNT_LOCAL itself.
+    #[test]
+    fn a_temporary_folder_is_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = open_dir(None, tmp.path(), true).unwrap();
+        assert!(!is_network(dir.as_fd()));
+    }
+
+    // The numbers Linux reports for network and cluster file systems, from
+    // linux/magic.h, and some local ones. FUSE is local, whatever serves
+    // it. WSL 2 mounts the Windows drives as 9p.
+    #[test]
+    fn network_file_systems_are_known_by_magic_number() {
+        let network = [
+            ("nfs", 0x6969),
+            ("smb", 0x517b),
+            ("smb2", 0xfe53_4d42),
+            ("cifs", 0xff53_4d42),
+            ("9p", 0x0102_1997),
+            ("afs", 0x5346_414f),
+            ("kafs", 0x6b41_4653),
+            ("ceph", 0x00c3_6400),
+            ("coda", 0x7375_7245),
+            ("ncp", 0x564c),
+            ("lustre", 0x0bd0_0bd0),
+            ("gfs2", 0x0116_1970),
+            ("ocfs2", 0x7461_636f),
+            ("vboxsf", 0x786f_4256),
+        ];
+        for (name, magic) in network {
+            assert!(network_magic(magic), "{name}");
+        }
+        let local = [
+            ("ext4", 0xef53),
+            ("btrfs", 0x9123_683e),
+            ("xfs", 0x5846_5342),
+            ("tmpfs", 0x0102_1994),
+            ("overlay", 0x794c_7630),
+            ("zfs", 0x2fc1_2fc1),
+            ("fuse", 0x6573_5546),
+        ];
+        for (name, magic) in local {
+            assert!(!network_magic(magic), "{name}");
+        }
+    }
+
+    // The same numbers as libc has them, where it has them, so a typo
+    // copied into both lists above can't pass.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn the_magic_numbers_match_libc() {
+        let network = [
+            libc::NFS_SUPER_MAGIC,
+            libc::SMB_SUPER_MAGIC,
+            libc::AFS_SUPER_MAGIC,
+            libc::CODA_SUPER_MAGIC,
+            libc::NCP_SUPER_MAGIC,
+            libc::OCFS2_SUPER_MAGIC,
+        ];
+        for magic in network {
+            assert!(network_magic(magic as u32), "{magic:#x}");
+        }
+        let local = [
+            libc::EXT4_SUPER_MAGIC,
+            libc::BTRFS_SUPER_MAGIC,
+            libc::XFS_SUPER_MAGIC,
+            libc::TMPFS_MAGIC,
+            libc::OVERLAYFS_SUPER_MAGIC,
+            libc::FUSE_SUPER_MAGIC,
+        ];
+        for magic in local {
+            assert!(!network_magic(magic as u32), "{magic:#x}");
+        }
+    }
+
+    // illumos names its network file systems, NFS once for each version.
+    #[test]
+    fn illumos_network_file_systems_are_known_by_name() {
+        for name in ["nfs", "nfs3", "nfs4", "smbfs"] {
+            assert!(network_type_name(name.as_bytes()), "{name}");
+        }
+        for name in ["zfs", "ufs", "tmpfs", "lofs", ""] {
+            assert!(!network_type_name(name.as_bytes()), "{name}");
+        }
+    }
+
     #[test]
     fn long_folders_still_get_a_socket() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1596,7 +3235,7 @@ mod tests {
         let folder = open_folder(&Place::dir(dir), true).unwrap().unwrap();
         let _lock = folder.lock().unwrap().unwrap();
         let listener = folder.listen().unwrap();
-        let conn = folder.connect(None).ok().expect("connects");
+        let conn = folder.connect(None, None).ok().expect("connects");
         assert_eq!(conn.peer_pid(), Some(std::process::id()));
         drop(listener);
     }

@@ -9,14 +9,15 @@
 
 use std::ffi::{OsStr, OsString};
 
-use crate::BoxError;
+use crate::{BoxError, Kind, Level, Rights};
 
 pub(crate) const MAGIC: [u8; 4] = *b"IHND";
 pub(crate) const HEADER: usize = 9;
 /// The wire versions this build speaks.
 pub(crate) const WIRE_MIN: u16 = 1;
 pub(crate) const WIRE_MAX: u16 = 1;
-/// The largest HELLO, READY, COMMIT or REPLY body.
+/// The largest READY, COMMIT or REPLY body, and the room in HELLO beside
+/// its STATE record: see [`hello_limit`].
 pub(crate) const SMALL: usize = 4096;
 /// The largest REQUEST an owner takes.
 pub(crate) const MAX_REQUEST: u32 = 4 << 20;
@@ -31,6 +32,14 @@ pub(crate) const REPLY: u8 = 5;
 
 const CRITICAL: u8 = 0x80;
 
+/// The largest HELLO body a launch reads, given its own STATE. An owner of
+/// the same state folder and scope sends the same STATE, so its HELLO
+/// fits. A longer one isn't from this launch's owner, and reads as not
+/// this protocol.
+pub(crate) fn hello_limit(state: &[u8]) -> usize {
+    SMALL.saturating_add(state.len())
+}
+
 /// HELLO record tags.
 mod hello {
     pub const WIRE: u8 = 1;
@@ -38,14 +47,33 @@ mod hello {
     pub const NONCE: u8 = 3;
     pub const PAYLOAD_VERSION: u8 = 4;
     pub const MAX_REQUEST: u8 = 5;
-    pub const STATE: u8 = 6;
+    pub const SERVING: u8 = 6;
+    pub const LEVEL: u8 = 7;
+    // 8 and 10 are kept for records that come later.
+    pub const STATE: u8 = 9;
+    pub const FEATURES: u8 = 11;
 }
 
-/// The owner's state, in HELLO.
-pub(crate) mod state {
+/// Whether the owner serves, in HELLO's SERVING record.
+pub(crate) mod serving {
     pub const TAKING: u8 = 0;
     pub const BUSY: u8 = 1;
     pub const DECLINING: u8 = 2;
+}
+
+/// An app's [`Kind`], as the first byte of HELLO's APP record.
+pub(crate) fn app_kind(kind: Kind) -> u8 {
+    match kind {
+        Kind::Windowed => 0,
+        Kind::Headless => 1,
+    }
+}
+
+/// The owner's features, in HELLO: what it does that older owners didn't.
+pub(crate) mod features {
+    /// It answers every launch it refuses with REPLY REFUSED and the cause,
+    /// and never just closes the connection.
+    pub const REFUSALS: u32 = 1;
 }
 
 /// REQUEST record tags.
@@ -56,6 +84,17 @@ mod request {
     pub const XDG_TOKEN: u8 = 4;
     pub const STARTUP_ID: u8 = 5;
     pub const PAYLOAD: u8 = 6;
+    // 7, 8 and 9, and 0x8B, are kept for records that come later.
+    /// Critical: the launch hands its request down to an owner that lacks
+    /// its rights. An owner that doesn't know it refuses the request.
+    pub const HAND_DOWN: u8 = 0x8A;
+}
+
+/// Which [`Rights`] a HAND_DOWN record names, in its first byte.
+mod rights {
+    /// Integrity levels: then the launch's RID and the owner's, each a u32
+    /// LE.
+    pub const LEVEL: u8 = 0;
 }
 
 /// REPLY record tags.
@@ -64,6 +103,7 @@ mod reply {
     pub const STATUS: u8 = 2;
     pub const REFUSAL: u8 = 3;
     pub const PAYLOAD_VERSION: u8 = 4;
+    pub const LEVEL: u8 = 5;
 }
 
 /// REPLY statuses. A launch decides on `delivered` first; a status it
@@ -77,7 +117,7 @@ pub(crate) mod status {
     pub const GAVE_UP: u8 = 4;
 }
 
-/// Why an owner refused a REQUEST.
+/// Why an owner refused a launch.
 pub(crate) mod refusal {
     pub const WIRE: u8 = 1;
     pub const APP: u8 = 2;
@@ -86,6 +126,12 @@ pub(crate) mod refusal {
     pub const TOO_LARGE: u8 = 5;
     pub const MALFORMED: u8 = 6;
     pub const UNSUPPORTED: u8 = 7;
+    /// The launch runs at another integrity level than the owner, which
+    /// sends its own level with the refusal.
+    pub const PRIVILEGE: u8 = 8;
+    // 9 SCREEN, 11 STATE and 12 PERSON are kept for later.
+    /// The launch failed the owner's same-user check.
+    pub const PEER: u8 = 10;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,12 +264,27 @@ pub(crate) struct Hello {
     pub(crate) wire_min: u16,
     pub(crate) wire_max: u16,
     pub(crate) app_id: String,
+    /// The app's kind, as [`app_kind`] writes it. A launch compares it as
+    /// it does the id.
+    pub(crate) app_kind: u8,
     /// Random for each owner, so a launch can tell a new owner from the one
     /// it committed to.
     pub(crate) nonce: u64,
     pub(crate) payload_version: u32,
     pub(crate) max_request: u32,
-    pub(crate) state: u8,
+    /// A [`serving`] value.
+    pub(crate) serving: u8,
+    /// The RID of the owner's integrity level, sent only where it has one:
+    /// by owners on Windows.
+    pub(crate) level: Option<u32>,
+    /// The state folder and scope the owner's instance folder is named
+    /// from, as [`naming::instance_key`] frames them. A launch compares it
+    /// with its own, so two whose hashes collide never hand off.
+    ///
+    /// [`naming::instance_key`]: crate::naming::instance_key
+    pub(crate) state: Vec<u8>,
+    /// [`features`] bits; none from an owner that predates them.
+    pub(crate) features: u32,
 }
 
 impl Hello {
@@ -231,13 +292,20 @@ impl Hello {
         let mut wire = [0; 4];
         wire[..2].copy_from_slice(&self.wire_min.to_le_bytes());
         wire[2..].copy_from_slice(&self.wire_max.to_le_bytes());
-        Writer::new(HELLO)
+        // The app kind byte, then the id.
+        let app = [&[self.app_kind], self.app_id.as_bytes()].concat();
+        let mut w = Writer::new(HELLO)
             .bytes(hello::WIRE, &wire)
-            .bytes(hello::APP, self.app_id.as_bytes())
+            .bytes(hello::APP, &app)
             .bytes(hello::NONCE, &self.nonce.to_le_bytes())
             .bytes(hello::PAYLOAD_VERSION, &self.payload_version.to_le_bytes())
             .bytes(hello::MAX_REQUEST, &self.max_request.to_le_bytes())
-            .bytes(hello::STATE, &[self.state])
+            .bytes(hello::SERVING, &[self.serving]);
+        if let Some(level) = self.level {
+            w = w.bytes(hello::LEVEL, &level.to_le_bytes());
+        }
+        w.bytes(hello::STATE, &self.state)
+            .bytes(hello::FEATURES, &self.features.to_le_bytes())
             .finish()
     }
 
@@ -245,20 +313,39 @@ impl Hello {
         use hello::*;
         let r = Records::parse(
             body,
-            &[WIRE, APP, NONCE, PAYLOAD_VERSION, MAX_REQUEST, STATE],
+            &[
+                WIRE,
+                APP,
+                NONCE,
+                PAYLOAD_VERSION,
+                MAX_REQUEST,
+                SERVING,
+                LEVEL,
+                STATE,
+                FEATURES,
+            ],
         )?;
         let wire: [u8; 4] = r.required(WIRE)?;
-        let app_id = std::str::from_utf8(r.get(APP).ok_or(Error::Malformed)?)
+        // The app kind byte, then the id.
+        let (&app_kind, app_id) = r
+            .get(APP)
+            .and_then(<[u8]>::split_first)
+            .ok_or(Error::Malformed)?;
+        let app_id = std::str::from_utf8(app_id)
             .map_err(|_| Error::Malformed)?
             .to_owned();
         Ok(Hello {
             wire_min: u16::from_le_bytes([wire[0], wire[1]]),
             wire_max: u16::from_le_bytes([wire[2], wire[3]]),
             app_id,
+            app_kind,
             nonce: u64::from_le_bytes(r.required(NONCE)?),
             payload_version: u32::from_le_bytes(r.required(PAYLOAD_VERSION)?),
             max_request: u32::from_le_bytes(r.required(MAX_REQUEST)?),
-            state: r.fixed::<1>(STATE)?.map_or(state::TAKING, |[s]| s),
+            serving: r.fixed::<1>(SERVING)?.map_or(serving::TAKING, |[s]| s),
+            level: r.fixed(LEVEL)?.map(u32::from_le_bytes),
+            state: r.get(STATE).ok_or(Error::Malformed)?.to_vec(),
+            features: r.fixed(FEATURES)?.map_or(0, u32::from_le_bytes),
         })
     }
 }
@@ -273,6 +360,10 @@ pub(crate) struct Request {
     pub(crate) xdg_activation_token: Option<String>,
     pub(crate) startup_id: Option<String>,
     pub(crate) payload: Vec<u8>,
+    /// The rights the launch gives up, in HAND_DOWN: its consent to hand
+    /// the request down. An owner reads the rights themselves from the
+    /// launch's token, never from this.
+    pub(crate) hand_down: Option<Rights>,
 }
 
 impl Request {
@@ -294,14 +385,26 @@ impl Request {
                 w = w.bytes(tag, v.as_bytes());
             }
         }
-        w.bytes(request::PAYLOAD, &self.payload).finish()
+        w = w.bytes(request::PAYLOAD, &self.payload);
+        if let Some(rights) = &self.hand_down {
+            w = w.bytes(request::HAND_DOWN, &hand_down_record(rights));
+        }
+        w.finish()
     }
 
     pub(crate) fn decode(body: &[u8]) -> Result<Request, Error> {
         use request::*;
         let r = Records::parse(
             body,
-            &[WIRE, PAYLOAD_VERSION, CWD, XDG_TOKEN, STARTUP_ID, PAYLOAD],
+            &[
+                WIRE,
+                PAYLOAD_VERSION,
+                CWD,
+                XDG_TOKEN,
+                STARTUP_ID,
+                PAYLOAD,
+                HAND_DOWN,
+            ],
         )?;
         // Activation values are hints: a bad one is dropped, not refused.
         let token = |tag| {
@@ -317,7 +420,49 @@ impl Request {
             xdg_activation_token: token(XDG_TOKEN),
             startup_id: token(STARTUP_ID),
             payload: r.get(PAYLOAD).ok_or(Error::Malformed)?.to_vec(),
+            hand_down: r.get(HAND_DOWN).map(hand_down_rights).transpose()?,
         })
+    }
+}
+
+/// `bytes`, a REQUEST as [`Request::encode`] makes it without HAND_DOWN,
+/// with the HAND_DOWN record for `given` added last, as `encode` adds it.
+/// A launch decides to hand its request down only once HELLO names the
+/// owner's level.
+pub(crate) fn hand_down(bytes: &[u8], given: &Rights) -> Vec<u8> {
+    Writer {
+        buf: bytes.to_vec(),
+    }
+    .bytes(request::HAND_DOWN, &hand_down_record(given))
+    .finish()
+}
+
+/// A HAND_DOWN record's bytes: which rights, then what they are.
+fn hand_down_record(given: &Rights) -> Vec<u8> {
+    match given {
+        Rights::Level { launch, owner } => [
+            &[rights::LEVEL][..],
+            &launch.rid().to_le_bytes(),
+            &owner.rid().to_le_bytes(),
+        ]
+        .concat(),
+    }
+}
+
+/// The rights a HAND_DOWN record names. Rights from a later release are
+/// unsupported, as an unknown critical record is: the owner couldn't say
+/// what was given up.
+fn hand_down_rights(record: &[u8]) -> Result<Rights, Error> {
+    match record.split_first() {
+        Some((&rights::LEVEL, rids)) => {
+            let [a, b, c, d, e, f, g, h] = rids.try_into().map_err(|_| Error::Malformed)?;
+            Ok(Rights::Level {
+                launch: Level::from_rid(u32::from_le_bytes([a, b, c, d])),
+                owner: Level::from_rid(u32::from_le_bytes([e, f, g, h])),
+            })
+        }
+        Some(_) => Err(Error::Unsupported),
+        None => Err(Error::Malformed),
     }
 }
 
@@ -340,6 +485,9 @@ pub(crate) struct Reply {
     pub(crate) refusal: Option<u8>,
     /// The owner's payload version, sent with a payload-version refusal.
     pub(crate) payload_version: Option<u32>,
+    /// The RID of the owner's integrity level, sent with a privilege
+    /// refusal: by owners on Windows.
+    pub(crate) level: Option<u32>,
 }
 
 impl Reply {
@@ -349,6 +497,7 @@ impl Reply {
             status,
             refusal: None,
             payload_version: None,
+            level: None,
         }
     }
 
@@ -369,12 +518,15 @@ impl Reply {
         if let Some(v) = self.payload_version {
             w = w.bytes(reply::PAYLOAD_VERSION, &v.to_le_bytes());
         }
+        if let Some(level) = self.level {
+            w = w.bytes(reply::LEVEL, &level.to_le_bytes());
+        }
         w.finish()
     }
 
     pub(crate) fn decode(body: &[u8]) -> Result<Reply, Error> {
         use reply::*;
-        let r = Records::parse(body, &[DELIVERED, STATUS, REFUSAL, PAYLOAD_VERSION])?;
+        let r = Records::parse(body, &[DELIVERED, STATUS, REFUSAL, PAYLOAD_VERSION, LEVEL])?;
         let [delivered] = r.required::<1>(DELIVERED)?;
         let [status] = r.required::<1>(STATUS)?;
         Ok(Reply {
@@ -382,6 +534,7 @@ impl Reply {
             status,
             refusal: r.fixed::<1>(REFUSAL)?.map(|[b]| b),
             payload_version: r.fixed(PAYLOAD_VERSION)?.map(u32::from_le_bytes),
+            level: r.fixed(LEVEL)?.map(u32::from_le_bytes),
         })
     }
 }
@@ -431,35 +584,302 @@ pub(crate) fn os_from_bytes(b: &[u8]) -> Result<OsString, BoxError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+    use crate::{Level, naming};
 
     // The exact bytes of each message are the contract between builds that
-    // use different releases of this crate.
+    // use different releases of this crate. These tests write them out as
+    // numbers, kinds and codes included, so a changed constant fails too.
     #[test]
     fn hello_bytes_are_frozen() {
-        let hello = Hello {
+        // As an owner on Unix sends it, with no level.
+        let unix = Hello {
             wire_min: 1,
             wire_max: 1,
             app_id: "a".into(),
+            app_kind: app_kind(Kind::Headless),
             nonce: 0x0102_0304_0506_0708,
             payload_version: 7,
             max_request: MAX_REQUEST,
-            state: state::BUSY,
+            serving: serving::BUSY,
+            level: None,
+            state: naming::instance_key(Some(Path::new("/s")), Some(OsStr::new("k"))),
+            features: features::REFUSALS,
         };
-        let bytes = hello.encode();
         #[rustfmt::skip]
-        assert_eq!(bytes, [
-            b'I', b'H', b'N', b'D', HELLO, 52, 0, 0, 0,
+        let unix_bytes = [
+            b'I', b'H', b'N', b'D', 1, 80, 0, 0, 0,
             1, 4, 0, 0, 0, 1, 0, 1, 0,
-            2, 1, 0, 0, 0, b'a',
+            2, 2, 0, 0, 0, 1, b'a',
             3, 8, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1,
             4, 4, 0, 0, 0, 7, 0, 0, 0,
             5, 4, 0, 0, 0, 0, 0, 0x40, 0,
             6, 1, 0, 0, 0, 1,
-        ]);
-        let (kind, body, used) = split(&bytes, SMALL).unwrap().unwrap();
+            9, 13, 0, 0, 0, 1, 2, 0, 0, 0, b'/', b's', 2, 1, 0, 0, 0, b'k',
+            11, 4, 0, 0, 0, 1, 0, 0, 0,
+        ];
+        // As an owner on Windows sends it, with its level after SERVING:
+        // high here.
+        let windows = Hello {
+            level: Some(Level::HIGH.rid()),
+            ..unix.clone()
+        };
+        #[rustfmt::skip]
+        let windows_bytes = [
+            b'I', b'H', b'N', b'D', 1, 89, 0, 0, 0,
+            1, 4, 0, 0, 0, 1, 0, 1, 0,
+            2, 2, 0, 0, 0, 1, b'a',
+            3, 8, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1,
+            4, 4, 0, 0, 0, 7, 0, 0, 0,
+            5, 4, 0, 0, 0, 0, 0, 0x40, 0,
+            6, 1, 0, 0, 0, 1,
+            7, 4, 0, 0, 0, 0, 0x30, 0, 0,
+            9, 13, 0, 0, 0, 1, 2, 0, 0, 0, b'/', b's', 2, 1, 0, 0, 0, b'k',
+            11, 4, 0, 0, 0, 1, 0, 0, 0,
+        ];
+        for (hello, bytes) in [(unix, &unix_bytes[..]), (windows, &windows_bytes[..])] {
+            assert_eq!(hello.encode(), bytes);
+            let (kind, body, used) = split(bytes, SMALL).unwrap().unwrap();
+            assert_eq!((kind, used), (HELLO, bytes.len()));
+            assert_eq!(Hello::decode(body).unwrap(), hello);
+            // An owner from before FEATURES has none.
+            let old = Hello::decode(&body[..body.len() - 9]).unwrap();
+            assert_eq!(old.features, 0);
+        }
+        // The other app kind and serving values, which the bytes above
+        // don't show.
+        assert_eq!(app_kind(Kind::Windowed), 0);
+        assert_eq!((serving::TAKING, serving::DECLINING), (0, 2));
+    }
+
+    // A launch reads a HELLO of up to SMALL bytes beside its own STATE, so
+    // an owner of the same state is read however long the state is. With
+    // the room for an empty STATE alone, the same HELLO is too large.
+    #[test]
+    fn a_hello_fits_beside_the_launchs_own_state() {
+        let hello = Hello {
+            wire_min: 1,
+            wire_max: 1,
+            app_id: "a".into(),
+            app_kind: app_kind(Kind::Headless),
+            nonce: 1,
+            payload_version: 0,
+            max_request: MAX_REQUEST,
+            serving: serving::TAKING,
+            level: None,
+            state: vec![b'x'; 5000],
+            features: features::REFUSALS,
+        };
+        let bytes = hello.encode();
+        let len = bytes.len() - HEADER;
+        assert!(len > SMALL, "{len}");
+        let (kind, body, used) = split(&bytes, hello_limit(&hello.state)).unwrap().unwrap();
         assert_eq!((kind, used), (HELLO, bytes.len()));
         assert_eq!(Hello::decode(body).unwrap(), hello);
+        assert_eq!(
+            split(&bytes, hello_limit(&[])),
+            Err(Error::TooLarge {
+                size: len,
+                limit: SMALL
+            })
+        );
+    }
+
+    #[test]
+    fn request_bytes_are_frozen() {
+        let full = Request {
+            wire: 1,
+            payload_version: 3,
+            cwd: Some(b"/w".to_vec()),
+            xdg_activation_token: Some("tok".into()),
+            startup_id: Some("id".into()),
+            payload: vec![0, 159, 146, 150],
+            hand_down: None,
+        };
+        #[rustfmt::skip]
+        let full_bytes = [
+            b'I', b'H', b'N', b'D', 2, 47, 0, 0, 0,
+            1, 2, 0, 0, 0, 1, 0,
+            2, 4, 0, 0, 0, 3, 0, 0, 0,
+            3, 2, 0, 0, 0, b'/', b'w',
+            4, 3, 0, 0, 0, b't', b'o', b'k',
+            5, 2, 0, 0, 0, b'i', b'd',
+            6, 4, 0, 0, 0, 0, 159, 146, 150,
+        ];
+        // Without the optional records. The payload goes even when empty.
+        let bare = Request {
+            wire: 1,
+            payload_version: 3,
+            ..Request::default()
+        };
+        #[rustfmt::skip]
+        let bare_bytes = [
+            b'I', b'H', b'N', b'D', 2, 21, 0, 0, 0,
+            1, 2, 0, 0, 0, 1, 0,
+            2, 4, 0, 0, 0, 3, 0, 0, 0,
+            6, 0, 0, 0, 0,
+        ];
+        // Handed down from high to medium: the critical HAND_DOWN record,
+        // last. Its first byte names integrity levels, then the RIDs.
+        let rights = Rights::Level {
+            launch: Level::HIGH,
+            owner: Level::MEDIUM,
+        };
+        let down = Request {
+            hand_down: Some(rights.clone()),
+            ..bare.clone()
+        };
+        #[rustfmt::skip]
+        let down_bytes = [
+            b'I', b'H', b'N', b'D', 2, 35, 0, 0, 0,
+            1, 2, 0, 0, 0, 1, 0,
+            2, 4, 0, 0, 0, 3, 0, 0, 0,
+            6, 0, 0, 0, 0,
+            0x8a, 9, 0, 0, 0, 0, 0, 0x30, 0, 0, 0, 0x20, 0, 0,
+        ];
+        // A launch adds it to the request it encoded before HELLO.
+        assert_eq!(hand_down(&bare.encode(), &rights), down_bytes);
+        assert_eq!(hand_down(&full.encode(), &rights), {
+            let mut full = full.clone();
+            full.hand_down = Some(rights.clone());
+            full.encode()
+        });
+        for (req, bytes) in [
+            (full, &full_bytes[..]),
+            (bare, &bare_bytes[..]),
+            (down, &down_bytes[..]),
+        ] {
+            assert_eq!(req.encode(), bytes);
+            let (kind, body, used) = split(bytes, MAX_REQUEST as usize).unwrap().unwrap();
+            assert_eq!((kind, used), (REQUEST, bytes.len()));
+            assert_eq!(Request::decode(body).unwrap(), req);
+        }
+    }
+
+    // HAND_DOWN is critical, and so is what it names: rights this build
+    // doesn't know are unsupported, as an unknown critical record is,
+    // since the owner couldn't say what was given up. So is a critical
+    // record from a later release, such as WAIT (0x8B).
+    #[test]
+    fn a_request_with_rights_or_records_this_build_doesnt_know_is_unsupported() {
+        let req = |tag: u8, bytes: &[u8]| {
+            let msg = Writer::new(REQUEST)
+                .bytes(request::WIRE, &[1, 0])
+                .bytes(request::PAYLOAD_VERSION, &[0; 4])
+                .bytes(request::PAYLOAD, &[])
+                .bytes(tag, bytes)
+                .finish();
+            Request::decode(&msg[HEADER..]).map(|r| r.hand_down)
+        };
+        let rids = [0, 0x30, 0, 0, 0, 0x20, 0, 0];
+        assert_eq!(
+            req(0x8a, &[&[0][..], &rids].concat()),
+            Ok(Some(Rights::Level {
+                launch: Level::HIGH,
+                owner: Level::MEDIUM
+            }))
+        );
+        assert_eq!(
+            req(0x8a, &[&[1][..], &rids].concat()),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(req(0x8b, &[]), Err(Error::Unsupported));
+        // A record too short or too long for its rights, or empty.
+        assert_eq!(
+            req(0x8a, &[&[0][..], &rids[1..]].concat()),
+            Err(Error::Malformed)
+        );
+        assert_eq!(
+            req(0x8a, &[&[0][..], &rids, &[0]].concat()),
+            Err(Error::Malformed)
+        );
+        assert_eq!(req(0x8a, &[]), Err(Error::Malformed));
+        // A record from a later release that isn't critical is skipped.
+        assert_eq!(req(0x0b, b"later"), Ok(None));
+    }
+
+    #[test]
+    fn ready_and_commit_bytes_are_frozen() {
+        for (kind, bytes) in [
+            (READY, [b'I', b'H', b'N', b'D', 3, 0, 0, 0, 0]),
+            (COMMIT, [b'I', b'H', b'N', b'D', 4, 0, 0, 0, 0]),
+        ] {
+            assert_eq!(empty(kind), bytes);
+            let (k, body, used) = split(&bytes, SMALL).unwrap().unwrap();
+            assert_eq!((k, used), (kind, bytes.len()));
+            assert_eq!(check_empty(body), Ok(()));
+        }
+    }
+
+    #[test]
+    fn reply_bytes_are_frozen() {
+        let check = |reply: Reply, bytes: &[u8]| {
+            assert_eq!(reply.encode(), bytes, "{reply:?}");
+            let (kind, body, used) = split(bytes, SMALL).unwrap().unwrap();
+            assert_eq!((kind, used), (REPLY, bytes.len()));
+            assert_eq!(Reply::decode(body).unwrap(), reply);
+        };
+        for (reply, delivered, code) in [
+            (Reply::new(true, status::TAKEN), 1, 0),
+            (Reply::new(false, status::BUSY), 0, 1),
+            (Reply::new(false, status::DECLINED), 0, 2),
+            (Reply::new(false, status::GAVE_UP), 0, 4),
+        ] {
+            #[rustfmt::skip]
+            let bytes = [
+                b'I', b'H', b'N', b'D', 5, 12, 0, 0, 0,
+                1, 1, 0, 0, 0, delivered,
+                2, 1, 0, 0, 0, code,
+            ];
+            check(reply, &bytes);
+        }
+        for (why, code) in [
+            (refusal::WIRE, 1),
+            (refusal::APP, 2),
+            (refusal::PAYLOAD_VERSION, 3),
+            (refusal::UNDECODABLE, 4),
+            (refusal::TOO_LARGE, 5),
+            (refusal::MALFORMED, 6),
+            (refusal::UNSUPPORTED, 7),
+            (refusal::PRIVILEGE, 8),
+            (refusal::PEER, 10),
+        ] {
+            #[rustfmt::skip]
+            let bytes = [
+                b'I', b'H', b'N', b'D', 5, 18, 0, 0, 0,
+                1, 1, 0, 0, 0, 0,
+                2, 1, 0, 0, 0, 3,
+                3, 1, 0, 0, 0, code,
+            ];
+            check(Reply::refused(why), &bytes);
+        }
+        // A payload-version refusal carries the owner's version.
+        let mut reply = Reply::refused(refusal::PAYLOAD_VERSION);
+        reply.payload_version = Some(4);
+        #[rustfmt::skip]
+        let bytes = [
+            b'I', b'H', b'N', b'D', 5, 27, 0, 0, 0,
+            1, 1, 0, 0, 0, 0,
+            2, 1, 0, 0, 0, 3,
+            3, 1, 0, 0, 0, 3,
+            4, 4, 0, 0, 0, 4, 0, 0, 0,
+        ];
+        check(reply, &bytes);
+        // A privilege refusal from an owner on Windows carries the owner's
+        // level: medium here.
+        let mut reply = Reply::refused(refusal::PRIVILEGE);
+        reply.level = Some(Level::MEDIUM.rid());
+        #[rustfmt::skip]
+        let bytes = [
+            b'I', b'H', b'N', b'D', 5, 27, 0, 0, 0,
+            1, 1, 0, 0, 0, 0,
+            2, 1, 0, 0, 0, 3,
+            3, 1, 0, 0, 0, 8,
+            5, 4, 0, 0, 0, 0, 0x20, 0, 0,
+        ];
+        check(reply, &bytes);
     }
 
     #[test]
@@ -471,6 +891,7 @@ mod tests {
             xdg_activation_token: Some("tok".into()),
             startup_id: None,
             payload: vec![0, 159, 146, 150],
+            hand_down: None,
         };
         let bytes = req.encode();
         let (kind, body, _) = split(&bytes, MAX_REQUEST as usize).unwrap().unwrap();
@@ -480,13 +901,6 @@ mod tests {
         let mut reply = Reply::refused(refusal::PAYLOAD_VERSION);
         reply.payload_version = Some(4);
         let bytes = reply.encode();
-        assert_eq!(
-            bytes,
-            [
-                b'I', b'H', b'N', b'D', REPLY, 27, 0, 0, 0, 1, 1, 0, 0, 0, 0, 2, 1, 0, 0, 0, 3, 3,
-                1, 0, 0, 0, 3, 4, 4, 0, 0, 0, 4, 0, 0, 0,
-            ]
-        );
         let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
         assert_eq!(Reply::decode(body).unwrap(), reply);
     }
@@ -516,6 +930,56 @@ mod tests {
         let bytes = Writer::new(REPLY).bytes(1, &[1]).bytes(1, &[0]).finish();
         let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
         assert_eq!(Reply::decode(body), Err(Error::Malformed));
+        // A REPLY whose LEVEL isn't a u32.
+        let bytes = Writer::new(REPLY)
+            .bytes(reply::DELIVERED, &[0])
+            .bytes(reply::STATUS, &[status::REFUSED])
+            .bytes(reply::REFUSAL, &[refusal::PRIVILEGE])
+            .bytes(reply::LEVEL, &[0, 0x20])
+            .finish();
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(Reply::decode(body), Err(Error::Malformed));
+        // A HELLO with every record it must have but STATE, and one with an
+        // empty STATE too: State::none() and no scope.
+        let bare = |app: &[u8]| {
+            Writer::new(HELLO)
+                .bytes(hello::WIRE, &[1, 0, 1, 0])
+                .bytes(hello::APP, app)
+                .bytes(hello::NONCE, &[0; 8])
+                .bytes(hello::PAYLOAD_VERSION, &[0; 4])
+                .bytes(hello::MAX_REQUEST, &[0; 4])
+        };
+        let with_app = |app: &[u8]| bare(app).bytes(hello::STATE, &[]).finish();
+        // Without STATE: an owner that doesn't say what it holds.
+        let bytes = bare(&[0]).finish();
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(Hello::decode(body), Err(Error::Malformed));
+        // A LEVEL that isn't a u32.
+        let bytes = bare(&[0])
+            .bytes(hello::LEVEL, &[0, 0x30])
+            .bytes(hello::STATE, &[])
+            .finish();
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(Hello::decode(body), Err(Error::Malformed));
+        // A HELLO whose APP record has no kind byte.
+        let bytes = with_app(&[]);
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(Hello::decode(body), Err(Error::Malformed));
+        // With the kind byte alone, it decodes, with an empty id.
+        let bytes = with_app(&[0]);
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(
+            Hello::decode(body).map(|h| (h.app_kind, h.app_id)),
+            Ok((0, "".into()))
+        );
+        // A kind from a later release decodes; the launch reads it as
+        // another app.
+        let bytes = with_app(&[2, b'a']);
+        let (_, body, _) = split(&bytes, SMALL).unwrap().unwrap();
+        assert_eq!(
+            Hello::decode(body).map(|h| (h.app_kind, h.app_id)),
+            Ok((2, "a".into()))
+        );
         // A record running past the body.
         assert_eq!(
             Records::parse(&[1, 9, 0, 0, 0, 1], &[1]).err(),

@@ -1,17 +1,30 @@
 //! The launch's side of the exchange: take the lock, or hand the request
 //! to whoever holds it.
 
+use std::borrow::Cow;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::wire::{self, Hello, Reply, refusal, state, status};
-use crate::{Activation, Builder, Claim, Mode, OwnerInfo, Payload, Reason, Started, sys};
+use crate::level::OwnerLevel;
+use crate::outcome::Holding;
+use crate::wire::{self, Hello, Reply, refusal, serving, status};
+use crate::{
+    Activation, AppId, Builder, Claim, ElevatedOwner, Exclusive, Guard, Ineligible, Kind, Level,
+    OwnerInfo, Payload, Reason, Rights, Started, naming, sys,
+};
 
 /// Between attempts while the owner starts, is busy or quits.
 const RETRY: Duration = Duration::from_millis(50);
-/// A `Separate` launch that finds the lock held looks again for this long,
-/// so a `hand_off` or `probe` testing the lock isn't taken for an owner.
-const SEPARATE_RETRY: Duration = Duration::from_millis(50);
+/// An exclusive run that takes no guard, and finds the lock held, looks
+/// again for this long, so a `hand_off` or `probe` testing the lock isn't
+/// taken for an owner.
+const LOCK_RETRY: Duration = Duration::from_millis(50);
+/// A launch that holds the lock and finds the guard held looks again for
+/// this long. An owner that exits lets go of its lock a moment before its
+/// guard, and a launch that takes the lock in between must not take the
+/// guard for a live owner's.
+const GUARD_RETRY: Duration = Duration::from_millis(50);
 /// The least a committed launch waits for the owner's reply.
 const MIN_POST_COMMIT: Duration = Duration::from_secs(1);
 /// The least time a handoff to a healthy owner needs: shorter timeouts are
@@ -42,9 +55,118 @@ impl Waiting {
     }
 }
 
+/// What a launch that found the lock held does about its owner.
+#[derive(Debug)]
+enum Meet {
+    /// Connect, and talk to the owner: on Windows through the address
+    /// folder of this level, and its pipe must be labelled at this level.
+    /// `None` where there are no levels; on Windows, no folder or label
+    /// matches it.
+    Talk(Option<Level>),
+    /// Look again until the deadline: the owner is still starting.
+    Wait,
+    /// Return this at once, without connecting.
+    Report(Result<OwnerInfo, Reason>),
+}
+
+/// What a launch at level `own` does about an owner at `owner`, as its
+/// marker shows it, before it connects: see [`rights`]. `probe`: the
+/// launch is a probe. `hand_down`: it may hand its request down to an
+/// owner below it ([`Builder::hand_down`]).
+fn meet(own: Option<Level>, owner: OwnerLevel, probe: bool, hand_down: bool) -> Meet {
+    match owner {
+        OwnerLevel::Same => Meet::Talk(own),
+        OwnerLevel::Starting => Meet::Wait,
+        OwnerLevel::Other(owner) => match own.map(|own| rights(own, owner, probe, hand_down)) {
+            Some(Some(answer)) => Meet::Report(answer),
+            // The launch's own level, or one below it that the launch hands
+            // its request down to: it talks to the owner through the
+            // address folder of the owner's level, where the pipe must be
+            // labelled at that level too. `rights` never lets a launch go
+            // on to an owner above it.
+            Some(None) => Meet::Talk(Some(owner)),
+            // Windows reads the launch's own level to look for the marker,
+            // so here it is known. Were it not, `Talk(None)` matches no
+            // address folder or pipe's label, so nothing is sent to an
+            // owner at another level.
+            None => Meet::Talk(None),
+        },
+    }
+}
+
+/// What a launch at level `own` is told about an owner at `owner`, without
+/// sending anything more: when the levels differ, the owner above has
+/// rights the launch lacks, or the owner below lacks the launch's. A probe
+/// is told the owner runs instead. The answer names the owner's level, but
+/// no pid, and is unconfirmed (call 6.3), however the launch learnt the
+/// level: from the owner's marker ([`meet`]), its HELLO ([`exchange`]) or
+/// its PRIVILEGE refusal ([`refused`]). `None` when the levels are the
+/// same, or when the owner is below and the launch may `hand_down` its
+/// request ([`Builder::hand_down`]): then it goes on, and gives up the
+/// rights the owner lacks.
+fn rights(
+    own: Level,
+    owner: Level,
+    probe: bool,
+    hand_down: bool,
+) -> Option<Result<OwnerInfo, Reason>> {
+    if owner == own || (owner < own && hand_down && !probe) {
+        return None;
+    }
+    let info = OwnerInfo {
+        pid: None,
+        confirmed: false,
+        level: Some(owner),
+        handed_down: None,
+    };
+    if probe {
+        return Some(Ok(info));
+    }
+    let rights = Rights::Level { launch: own, owner };
+    Some(Err(if owner > own {
+        Reason::OwnerHasMoreRights {
+            owner: info,
+            rights,
+        }
+    } else {
+        Reason::MoreRights {
+            owner: info,
+            rights,
+        }
+    }))
+}
+
+/// [`meet`], for a launch whose owner died after it committed: it talks
+/// to an owner it may talk to, one below it too when it hands its request
+/// down, and looks again for one still starting until it is `past` its
+/// wait. Anything else, an owner at another level that it doesn't talk
+/// to, one that never finished starting or a marker that can't be read,
+/// gives `None`: the request is handed off, unconfirmed, since the dead
+/// owner may have had it.
+fn meet_after_commit(met: Meet, past: bool) -> Option<Meet> {
+    match met {
+        Meet::Talk(_) => Some(met),
+        Meet::Wait if !past => Some(met),
+        Meet::Wait | Meet::Report(_) => None,
+    }
+}
+
+/// [`meet`], for a launch at level `own` and the owner of the lock in
+/// `folder`. A marker that can't be read gives [`Reason::Lock`].
+fn meet_owner(folder: &sys::Folder, own: Option<Level>, probe: bool, hand_down: bool) -> Meet {
+    match folder.owner_level() {
+        Ok(owner) => meet(own, owner, probe, hand_down),
+        Err(source) => Meet::Report(Err(Reason::Lock {
+            path: folder.lock_path(),
+            source,
+        })),
+    }
+}
+
 /// How one connection to the owner ended.
 enum Exchange {
-    /// The owner's handler took the request (or, for a probe, it serves).
+    /// The owner's handler took the request. For a probe: the owner serves,
+    /// or runs at another level, unconfirmed.
     Taken(OwnerInfo),
     /// Committed, and the owner went silent: delivered late or never.
     Unconfirmed(OwnerInfo),
@@ -77,16 +199,19 @@ fn post_commit_wait(timeout: Duration) -> Duration {
 }
 
 /// When a launch must stop trying, and when it must return whatever
-/// happened: the timeout, then at most one post-commit wait more.
+/// happened: the timeout, then at most one post-commit wait more. With the
+/// launch's integrity level, which bounds whom it hands off to.
 #[derive(Debug, Clone, Copy)]
 struct Limits {
     deadline: Option<Instant>,
     hard: Option<Instant>,
     timeout: Duration,
+    /// This launch's level: [`sys::level`], or one a test sets.
+    level: Option<Level>,
 }
 
 impl Limits {
-    fn new(began: Instant, timeout: Duration) -> Limits {
+    fn new(began: Instant, timeout: Duration, level: Option<Level>) -> Limits {
         let timeout = timeout.max(MIN_TIMEOUT);
         Limits {
             deadline: began.checked_add(timeout),
@@ -94,6 +219,7 @@ impl Limits {
                 .checked_add(post_commit_wait(timeout))
                 .and_then(|t| began.checked_add(t)),
             timeout,
+            level,
         }
     }
 
@@ -136,18 +262,97 @@ fn encode_request<T: Payload>(b: &Builder, payload: &T) -> Result<Vec<u8>, Reaso
         xdg_activation_token: activation.xdg_activation_token().map(str::to_owned),
         startup_id: activation.startup_id().map(str::to_owned),
         payload,
+        // Added once HELLO shows the owner below this launch: see
+        // `exchange`.
+        hand_down: None,
     }
     .encode())
 }
 
-pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
-    if !sys::SUPPORTED {
-        return Started::Alone(Reason::Unsupported {});
+/// Why a launch of an app of `kind` may not own under `policy`, if it may
+/// not. `windows`: whether it can show windows, where that is known.
+/// `raised`: its rights were raised from a login. `above_normal`: it has
+/// more rights than a normal process.
+fn ineligible(
+    kind: Kind,
+    windows: Option<bool>,
+    policy: ElevatedOwner,
+    raised: bool,
+    above_normal: bool,
+) -> Option<Ineligible> {
+    // First, since no policy lets it own.
+    if kind == Kind::Windowed && windows == Some(false) {
+        return Some(Ineligible::NoWindows);
     }
-    let place = match b.place() {
+    ineligible_rights(policy, raised, above_normal)
+}
+
+/// [`ineligible`] for its rights alone: why a launch may not own, or hold
+/// the state with `exclusive`, under `policy`, if it may not. An exclusive
+/// run serves no launches, so it needs no windows.
+fn ineligible_rights(
+    policy: ElevatedOwner,
+    raised: bool,
+    above_normal: bool,
+) -> Option<Ineligible> {
+    match policy {
+        ElevatedOwner::Allow => None,
+        _ if raised => Some(Ineligible::Raised),
+        ElevatedOwner::NotAboveNormal if above_normal => Some(Ineligible::AboveNormal),
+        _ => None,
+    }
+}
+
+/// Whether this process may take part at all: not where nothing can own
+/// ([`Reason::Unsupported`]), nor when it is excluded
+/// ([`Reason::Excluded`]). `start`, `hand_off`, `probe` and `exclusive` ask
+/// first, before they look for an owner or make anything.
+fn take_part() -> Result<(), Reason> {
+    if !sys::SUPPORTED {
+        return Err(Reason::Unsupported {});
+    }
+    match sys::excluded() {
+        Some(why) => Err(Reason::Excluded { why }),
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
+    if let Err(reason) = take_part() {
+        return Started::Alone(reason);
+    }
+    let may_not_own = ineligible(
+        b.app_id.kind(),
+        sys::can_show_windows(),
+        b.elevated_owner,
+        sys::raised(),
+        sys::above_normal(),
+    );
+    start_as(b, payload, may_not_own)
+}
+
+/// `start` for a launch that may own, or that may not, and why.
+fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible>) -> Started<T> {
+    if let Some(why) = may_not_own {
+        // It never takes the lock, nor creates the folder: it hands off as
+        // `hand_off` does, or runs alone at once.
+        return match hand_off(b, Some(payload)) {
+            Ok(info) => Started::HandedOff(info),
+            Err(Reason::NoOwner {}) => Started::Alone(Reason::MayNotOwn { why }),
+            Err(reason) => Started::Alone(reason),
+        };
+    }
+    let state = b.canonical_state();
+    // Before anything is created: a launch never makes or owns state in
+    // another user's folder. `hand_off` and `probe` write nothing there.
+    if let Some(path) = state.as_deref().and_then(crate::state::foreign) {
+        return Started::Alone(Reason::ForeignState { path });
+    }
+    let place = match b.place(state.as_deref()) {
         Ok(place) => place,
         Err(reason) => return Started::Alone(reason),
     };
+    let key = b.instance_key(state.as_deref());
     let open = |place| match sys::open_folder(place, true) {
         Ok(Some(folder)) => Ok(folder),
         Ok(None) => Err(Reason::NoRuntimeDir {}),
@@ -158,13 +363,13 @@ pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
         Err(reason) => return Started::Alone(reason),
     };
     let began = Instant::now();
-    let limits = Limits::new(began, b.timeout);
+    let limits = Limits::new(began, b.timeout, sys::level());
     let deadline = limits.deadline;
     let mut request: Option<Vec<u8>> = None;
     let mut waiting: Option<Waiting> = None;
     loop {
         match folder.lock() {
-            Ok(Some(lock)) => return Started::Owner(Claim::new(b, place, folder, lock)),
+            Ok(Some(lock)) => return own(b, place, folder, lock, state, key),
             Ok(None) => {}
             // The folder was deleted under this launch (a cleaner, `rm`):
             // open it afresh and keep going.
@@ -187,18 +392,16 @@ pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
         if let Some(w) = waiting.filter(|_| past(deadline)) {
             return Started::Alone(w.reason(began.elapsed()));
         }
-        if b.mode == Mode::Separate {
-            let until = Instant::now() + SEPARATE_RETRY;
-            while Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(5));
-                match try_own(&folder) {
-                    Ok(Some(lock)) => return Started::Owner(Claim::new(b, place, folder, lock)),
-                    Ok(None) => {}
-                    Err(reason) => return Started::Alone(reason),
-                }
+        let at = match meet_owner(&folder, limits.level, false, b.hand_down) {
+            Meet::Talk(at) => at,
+            Meet::Wait => {
+                waiting = Some(Waiting::Unresponsive.after(waiting, deadline));
+                pause(deadline);
+                continue;
             }
-            return Started::Alone(Reason::OwnerRunning {});
-        }
+            Meet::Report(Err(reason)) => return Started::Alone(reason),
+            Meet::Report(Ok(_)) => unreachable!("only a probe is told an owner runs"),
+        };
         // Encoded only once a handoff is needed, and before connecting, so a
         // payload that can't be encoded never reaches the owner.
         let bytes = match &mut request {
@@ -208,14 +411,25 @@ pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
                 Err(reason) => return Started::Alone(reason),
             },
         };
-        match exchange(&folder, b, Some(bytes), &limits, None) {
+        match exchange(&folder, b, &key, Some(bytes), &limits, None, at) {
             Exchange::Taken(info) | Exchange::Unconfirmed(info) => return Started::HandedOff(info),
             Exchange::Fail(reason) => return Started::Alone(reason),
             Exchange::Retry(w) => waiting = Some(w.after(waiting, deadline)),
             Exchange::SameOwner => unreachable!("no commit to compare with"),
             Exchange::Lost(nonce) => {
-                return match after_commit(&folder, b, bytes, nonce, true, &limits) {
-                    AfterCommit::Own(lock) => Started::Owner(Claim::new(b, place, folder, lock)),
+                let after = after_commit(
+                    &folder,
+                    b,
+                    &key,
+                    bytes,
+                    nonce,
+                    Some(state.as_deref()),
+                    &limits,
+                );
+                return match after {
+                    AfterCommit::Own(lock, guard) => {
+                        Started::Owner(Claim::new(b, place, folder, lock, guard, state, key))
+                    }
                     AfterCommit::Info(info) => Started::HandedOff(info),
                 };
             }
@@ -224,25 +438,162 @@ pub(crate) fn start<T: Payload>(b: &Builder, payload: &T) -> Started<T> {
     }
 }
 
-fn try_own(folder: &sys::Folder) -> Result<Option<sys::Lock>, Reason> {
-    folder.lock().map_err(|source| Reason::Lock {
-        path: folder.lock_path(),
+/// This launch took the `lock`: it owns, once it has the state folder and
+/// holds its guard too. If another process holds the guard, the lock is
+/// dropped here, before any socket is bound, and the launch runs alone.
+fn own<T>(
+    b: &Builder,
+    place: sys::Place,
+    folder: sys::Folder,
+    lock: sys::Lock,
+    state: Option<PathBuf>,
+    key: Vec<u8>,
+) -> Started<T> {
+    match take_state(b, state.as_deref()) {
+        Ok(guard) => Started::Owner(Claim::new(b, place, folder, lock, guard, state, key)),
+        Err(reason) => Started::Alone(reason),
+    }
+}
+
+/// For a launch that holds the lock: creates the canonical `state` folder
+/// when it is missing, whatever the guard, then takes its guard, shared
+/// for a keyed owner, so keyed owners of one state folder hold it side by
+/// side, and otherwise alone. `None` when no guard is taken: see [`Guard`].
+fn take_state(b: &Builder, state: Option<&Path>) -> Result<Option<sys::Guard>, Reason> {
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    make_state(state)?;
+    if b.guard != Guard::Local {
+        return Ok(None);
+    }
+    take_guard(state, b.scope.is_some())
+}
+
+/// Creates the canonical `state` folder when it is missing. One that can't
+/// be made gives [`Reason::Lock`], naming it.
+fn make_state(state: &Path) -> Result<(), Reason> {
+    sys::make_state_dir(state).map_err(|source| Reason::Lock {
+        path: state.to_owned(),
         source,
     })
 }
 
+/// Takes the guard of the canonical `state` folder, which exists: `shared`
+/// or alone. `None` where the guard is skipped: see [`Guard::Local`].
+/// Still held after [`GUARD_RETRY`], it gives [`Reason::StateInUse`].
+fn take_guard(state: &Path, shared: bool) -> Result<Option<sys::Guard>, Reason> {
+    let until = Instant::now() + GUARD_RETRY;
+    loop {
+        match sys::take_guard(state, shared) {
+            Err(Reason::StateInUse { .. }) if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            taken => return taken,
+        }
+    }
+}
+
+pub(crate) fn exclusive(b: &Builder) -> Result<Exclusive, Reason> {
+    take_part()?;
+    let may_not_own = ineligible_rights(b.elevated_owner, sys::raised(), sys::above_normal());
+    exclusive_as(b, may_not_own)
+}
+
+/// `exclusive` for a launch that may hold the state, or that may not, and
+/// why. It takes the guard alone, whatever the scope, and nothing else. It
+/// takes the lock in the runtime folder instead, with nothing listening,
+/// where it takes no guard: for no state folder, under [`Guard::Off`], or
+/// where [`Guard::Local`] skips it.
+fn exclusive_as(b: &Builder, may_not_own: Option<Ineligible>) -> Result<Exclusive, Reason> {
+    if let Some(why) = may_not_own {
+        return Err(Reason::MayNotOwn { why });
+    }
+    let state = b.canonical_state();
+    // Before anything is created, as for `start`.
+    if let Some(path) = state.as_deref().and_then(crate::state::foreign) {
+        return Err(Reason::ForeignState { path });
+    }
+    if let Some(dir) = state.as_deref().filter(|_| b.guard == Guard::Local) {
+        make_state(dir)?;
+        if let Some(guard) = take_guard(dir, false)? {
+            return Ok(Exclusive::new(state, Holding::Guard(guard)));
+        }
+    }
+    let place = b.place(state.as_deref())?;
+    let (folder, lock) = lock_alone(&place)?;
+    // As `start` makes it once it holds the lock. Where the guard was
+    // skipped, it is made already, and left as it is.
+    if let Some(dir) = state.as_deref() {
+        make_state(dir)?;
+    }
+    Ok(Exclusive::new(state, Holding::Lock(folder, lock)))
+}
+
+/// Opens the runtime folder at `place`, making it if it is missing, and
+/// takes its lock for an exclusive run, looking again for [`LOCK_RETRY`].
+/// Still held, it gives [`Reason::StateInUse`], naming the lock file.
+fn lock_alone(place: &sys::Place) -> Result<(sys::Folder, sys::Lock), Reason> {
+    let open = || sys::open_folder(place, true)?.ok_or(Reason::NoRuntimeDir {});
+    let mut folder = open()?;
+    let until = Instant::now() + LOCK_RETRY;
+    loop {
+        match folder.lock() {
+            Ok(Some(lock)) => return Ok((folder, lock)),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                return Err(Reason::StateInUse {
+                    path: folder.lock_path(),
+                });
+            }
+            // The folder was deleted under this run (a cleaner, `rm`): open
+            // it afresh and keep going, as `start` does.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => folder = open()?,
+            Err(source) => {
+                return Err(Reason::Lock {
+                    path: folder.lock_path(),
+                    source,
+                });
+            }
+        }
+    }
+}
+
 /// `hand_off` with a payload, `probe` without one.
 pub(crate) fn hand_off<T: Payload>(b: &Builder, payload: Option<&T>) -> Result<OwnerInfo, Reason> {
-    if !sys::SUPPORTED {
-        return Err(Reason::Unsupported {});
-    }
-    let place = b.place()?;
-    let Some(folder) = sys::open_folder(&place, false)? else {
-        return Err(Reason::NoOwner {});
+    hand_off_at(b, payload, sys::level())
+}
+
+/// `hand_off` for a launch at integrity level `own`.
+fn hand_off_at<T: Payload>(
+    b: &Builder,
+    payload: Option<&T>,
+    own: Option<Level>,
+) -> Result<OwnerInfo, Reason> {
+    take_part()?;
+    let state = b.canonical_state();
+    let place = match b.place(state.as_deref()) {
+        Ok(place) => place,
+        Err(Reason::NoSession {} | Reason::NoRuntimeDir {}) => {
+            return Err(no_folder(b, state.as_deref()));
+        }
+        Err(reason) => return Err(reason),
+    };
+    let key = b.instance_key(state.as_deref());
+    let folder = match sys::open_folder(&place, false)? {
+        Some(folder) => folder,
+        None => match no_folder(b, state.as_deref()) {
+            // An owner that made the folder since holds the guard too: look
+            // again, so this launch reaches it.
+            Reason::StateInUse { path } => {
+                sys::open_folder(&place, false)?.ok_or(Reason::StateInUse { path })?
+            }
+            reason => return Err(reason),
+        },
     };
     let request = payload.map(|p| encode_request(b, p)).transpose()?;
     let began = Instant::now();
-    let limits = Limits::new(began, b.timeout);
+    let limits = Limits::new(began, b.timeout, own);
     let deadline = limits.deadline;
     let mut waiting: Option<Waiting> = None;
     loop {
@@ -259,16 +610,25 @@ pub(crate) fn hand_off<T: Payload>(b: &Builder, payload: Option<&T>) -> Result<O
         if let Some(w) = waiting.filter(|_| past(deadline)) {
             return Err(w.reason(began.elapsed()));
         }
-        match exchange(&folder, b, request.as_deref(), &limits, None) {
+        let at = match meet_owner(&folder, own, request.is_none(), b.hand_down) {
+            Meet::Talk(at) => at,
+            Meet::Wait => {
+                waiting = Some(Waiting::Unresponsive.after(waiting, deadline));
+                pause(deadline);
+                continue;
+            }
+            Meet::Report(answer) => return answer,
+        };
+        match exchange(&folder, b, &key, request.as_deref(), &limits, None, at) {
             Exchange::Taken(info) | Exchange::Unconfirmed(info) => return Ok(info),
             Exchange::Fail(reason) => return Err(reason),
             Exchange::Retry(w) => waiting = Some(w.after(waiting, deadline)),
             Exchange::SameOwner => unreachable!("no commit to compare with"),
             Exchange::Lost(nonce) => {
                 let bytes = request.as_deref().expect("only a request commits");
-                return match after_commit(&folder, b, bytes, nonce, false, &limits) {
+                return match after_commit(&folder, b, &key, bytes, nonce, None, &limits) {
                     AfterCommit::Info(info) => Ok(info),
-                    AfterCommit::Own(_) => unreachable!("a handoff never owns"),
+                    AfterCommit::Own(..) => unreachable!("a handoff never owns"),
                 };
             }
         }
@@ -276,23 +636,50 @@ pub(crate) fn hand_off<T: Payload>(b: &Builder, payload: Option<&T>) -> Result<O
     }
 }
 
+/// What `hand_off` and `probe` report with no runtime folder to look in,
+/// where they can reach nobody. They look at the guard of the canonical
+/// `state` folder in the mode `start` would take it ([`take_state`]:
+/// shared for a keyed launch, and otherwise alone): [`Reason::StateInUse`]
+/// while another process holds it in a mode that conflicts, as an
+/// exclusive run or an owner in another runtime folder may, and otherwise
+/// [`Reason::NoOwner`]. So a keyed launch finds it in use beside an
+/// unkeyed owner or an exclusive run, but not beside keyed owners, which
+/// `start` would own beside. They look only where `start` would take it:
+/// not for no state folder, nor under [`Guard::Off`].
+fn no_folder(b: &Builder, state: Option<&Path>) -> Reason {
+    let Some(state) = state.filter(|_| b.guard == Guard::Local) else {
+        return Reason::NoOwner {};
+    };
+    let path = state.join(naming::GUARD_FILE);
+    match sys::guard_held(state, b.scope.is_some()) {
+        Ok(true) => Reason::StateInUse { path },
+        Ok(false) => Reason::NoOwner {},
+        Err(source) => Reason::Lock { path, source },
+    }
+}
+
 enum AfterCommit {
-    Own(sys::Lock),
+    Own(sys::Lock, Option<sys::Guard>),
     Info(OwnerInfo),
 }
 
 /// The connection closed after this launch committed, with no reply. The
 /// owner may have died with the request or without it; this launch must
-/// not run alone on it. It takes the lock if nobody holds it (`may_own`),
-/// or hands the request to the next owner, one with another nonce.
-/// Otherwise (no owner in time, or one that won't take it) it is handed
-/// off, unconfirmed: the dead owner may have had it.
+/// not run alone on it. It takes the lock, and the canonical state folder
+/// and its guard, if nobody holds them and it may own (`owns` is
+/// `Some(state)`; `None` for `hand_off`), or hands the request to
+/// the next owner, one with another nonce, below it too when it hands its
+/// request down. Otherwise (no owner in time, one that won't take it or is
+/// at another level that it doesn't hand down to, or a state folder it
+/// can't make or whose guard another process holds) it is handed off,
+/// unconfirmed: the dead owner may have had it.
 fn after_commit(
     folder: &sys::Folder,
     b: &Builder,
+    key: &[u8],
     bytes: &[u8],
     mut nonce: u64,
-    may_own: bool,
+    owns: Option<Option<&Path>>,
     limits: &Limits,
 ) -> AfterCommit {
     let until = limits.after_commit();
@@ -303,18 +690,35 @@ fn after_commit(
     let unconfirmed = OwnerInfo {
         pid: None,
         confirmed: false,
+        level: None,
+        handed_down: None,
     };
     loop {
-        if may_own {
+        if let Some(state) = owns {
             match folder.lock() {
-                Ok(Some(lock)) => return AfterCommit::Own(lock),
+                // With a guard it can't take, the lock is dropped here.
+                Ok(Some(lock)) => {
+                    return match take_state(b, state) {
+                        Ok(guard) => AfterCommit::Own(lock, guard),
+                        Err(_) => AfterCommit::Info(unconfirmed),
+                    };
+                }
                 Ok(None) => {}
                 Err(_) => return AfterCommit::Info(unconfirmed),
             }
         } else if !folder.lock_held().unwrap_or(true) {
             return AfterCommit::Info(unconfirmed);
         }
-        match exchange(folder, b, Some(bytes), &inner, Some(nonce)) {
+        let met = meet_owner(folder, limits.level, false, b.hand_down);
+        let at = match meet_after_commit(met, past(until)) {
+            Some(Meet::Talk(at)) => at,
+            Some(Meet::Wait) => {
+                pause(until);
+                continue;
+            }
+            Some(Meet::Report(_)) | None => return AfterCommit::Info(unconfirmed),
+        };
+        match exchange(folder, b, key, Some(bytes), &inner, Some(nonce), at) {
             Exchange::Taken(info) | Exchange::Unconfirmed(info) => return AfterCommit::Info(info),
             Exchange::SameOwner | Exchange::Fail(_) => return AfterCommit::Info(unconfirmed),
             Exchange::Lost(n) => nonce = n,
@@ -327,18 +731,35 @@ fn after_commit(
     }
 }
 
+/// Whether `hello` comes from an owner of `app_id` and of this launch's
+/// state folder and scope (`key`, as [`Builder::instance_key`] makes it):
+/// the same id, kind and STATE. The two kinds of an id share its folder,
+/// and so do two keys whose hashes collide, so such an owner is another
+/// app.
+fn same_app(hello: &Hello, app_id: &AppId, key: &[u8]) -> bool {
+    hello.app_id == app_id.as_str()
+        && hello.app_kind == wire::app_kind(app_id.kind())
+        && hello.state == key
+}
+
 /// One connection: HELLO, checks, REQUEST, READY, COMMIT, REPLY. Without a
-/// request (a probe), it ends after HELLO. `committed_to` is the nonce of
-/// an owner this launch already committed to.
+/// request (a probe), it ends after HELLO. `key` is this launch's instance
+/// key, which HELLO's STATE must match. `committed_to` is the nonce of an
+/// owner this launch already committed to. `at` is the level the owner's
+/// pipe must be labelled at: see [`Meet::Talk`]. Below this launch's own
+/// level, HELLO must name it too.
 fn exchange(
     folder: &sys::Folder,
     b: &Builder,
+    key: &[u8],
     request: Option<&[u8]>,
     limits: &Limits,
     committed_to: Option<u64>,
+    at: Option<Level>,
 ) -> Exchange {
     let deadline = limits.deadline;
-    let mut conn = match folder.connect(deadline) {
+    let own = limits.level;
+    let mut conn = match folder.connect(deadline, at) {
         Ok(conn) => conn,
         Err(sys::Connect::Retry(e)) => {
             log::trace!(
@@ -352,17 +773,27 @@ fn exchange(
     let mut reader = Reader::default();
     // The owner speaks first, and only once it serves: until then this
     // waits in its backlog.
-    let hello = match reader.frame(&mut conn, wire::SMALL, deadline) {
+    let hello = match reader.frame(&mut conn, wire::hello_limit(key), deadline) {
         Ok((wire::HELLO, body)) => match Hello::decode(&body) {
             Ok(hello) => hello,
             Err(_) => return Exchange::Fail(not_ours()),
         },
+        // Refused in place of HELLO: a Unix owner that won't serve this
+        // launch's user.
+        Ok((wire::REPLY, body)) => {
+            return Exchange::Fail(match Reply::decode(&body) {
+                Ok(r) if !r.delivered && r.status == status::REFUSED => {
+                    refused(&r, None, b, &[], own)
+                }
+                _ => not_ours(),
+            });
+        }
         Ok(_) | Err(ReadError::Bad) => return Exchange::Fail(not_ours()),
         Err(ReadError::Closed | ReadError::TimedOut) => {
             return Exchange::Retry(Waiting::Unresponsive);
         }
     };
-    if hello.app_id != b.app_id.as_str() {
+    if !same_app(&hello, &b.app_id, key) {
         return Exchange::Fail(Reason::OtherApp {});
     }
     if hello.wire_max < wire::WIRE_MIN || hello.wire_min > wire::WIRE_MAX {
@@ -377,13 +808,36 @@ fn exchange(
             theirs: hello.payload_version,
         });
     }
+    // Sent below its own level to hand down, this launch found the pipe
+    // labelled at the level the owner's marker shows. A HELLO that names
+    // another level, or none, isn't that owner's: it is sent nothing, so
+    // the launch never misreports what it gave up.
+    let theirs = hello.level.map(Level::from_rid);
+    if own.zip(at).is_some_and(|(own, at)| at < own) && theirs != at {
+        return Exchange::Fail(not_ours());
+    }
+    // A request never goes up, and goes down only with `hand_down`. So at
+    // another level this launch decides at once, whether or not the owner
+    // serves, and sends nothing, unless it hands its request down. Where
+    // either level is unknown, as on Unix, it goes on.
+    let levels = own.zip(theirs);
+    let probe = request.is_none();
+    match levels.and_then(|(own, theirs)| rights(own, theirs, probe, b.hand_down)) {
+        Some(Ok(info)) => return Exchange::Taken(info),
+        Some(Err(reason)) => return Exchange::Fail(reason),
+        None => {}
+    }
+    // Still here at another level, this launch hands its request down.
+    let handed_down = levels
+        .filter(|(own, theirs)| own != theirs)
+        .map(|(launch, owner)| Rights::Level { launch, owner });
     if committed_to == Some(hello.nonce) {
         return Exchange::SameOwner;
     }
-    match hello.state {
-        state::TAKING => {}
-        state::DECLINING => return Exchange::Fail(Reason::Declined {}),
-        // Busy, and states this build doesn't know: a later release that
+    match hello.serving {
+        serving::TAKING => {}
+        serving::DECLINING => return Exchange::Fail(Reason::Declined {}),
+        // Busy, and values this build doesn't know: a later release that
         // wants old launches to send their request advertises TAKING and
         // lets its REPLY decide.
         _ => return Exchange::Retry(Waiting::Busy),
@@ -391,11 +845,20 @@ fn exchange(
     let info = OwnerInfo {
         pid: conn.peer_pid(),
         confirmed: true,
+        level: theirs,
+        handed_down,
     };
     let Some(request) = request else {
         // A probe: the owner serves. Leave without sending anything.
         return Exchange::Taken(info);
     };
+    // The owner admits a launch above it only with HAND_DOWN, its consent
+    // to hand the request down.
+    let request = match &info.handed_down {
+        Some(given) => Cow::Owned(wire::hand_down(request, given)),
+        None => Cow::Borrowed(request),
+    };
+    let request = &*request;
     let limit = hello.max_request as usize;
     if request.len() - wire::HEADER > limit {
         return Exchange::Fail(Reason::TooLarge {
@@ -409,7 +872,7 @@ fn exchange(
     }
     match reader.frame(&mut conn, wire::SMALL, deadline) {
         Ok((wire::READY, body)) if wire::check_empty(&body).is_ok() => {}
-        Ok((wire::REPLY, body)) => return reply(&body, &hello, b, request, info, false),
+        Ok((wire::REPLY, body)) => return reply(&body, &hello, b, request, own, info, false),
         Ok(_) | Err(ReadError::Bad) => return Exchange::Fail(not_ours()),
         Err(ReadError::Closed | ReadError::TimedOut) => {
             return Exchange::Retry(Waiting::Unresponsive);
@@ -432,17 +895,19 @@ fn exchange(
         ..info.clone()
     };
     match reader.frame(&mut conn, wire::SMALL, until) {
-        Ok((wire::REPLY, body)) => reply(&body, &hello, b, request, info, true),
+        Ok((wire::REPLY, body)) => reply(&body, &hello, b, request, own, info, true),
         Err(ReadError::Closed) => Exchange::Lost(hello.nonce),
         Ok(_) | Err(ReadError::Bad | ReadError::TimedOut) => Exchange::Unconfirmed(unconfirmed),
     }
 }
 
+/// The owner's REPLY to `request`. `own` is this launch's level.
 fn reply(
     body: &[u8],
     hello: &Hello,
     b: &Builder,
     request: &[u8],
+    own: Option<Level>,
     info: OwnerInfo,
     committed: bool,
 ) -> Exchange {
@@ -461,29 +926,59 @@ fn reply(
     }
     match r.status {
         status::DECLINED => Exchange::Fail(Reason::Declined {}),
-        status::REFUSED => Exchange::Fail(refused(&r, hello, b, request)),
+        status::REFUSED => Exchange::Fail(refused(&r, Some(hello), b, request, own)),
         status::GAVE_UP => Exchange::Retry(Waiting::Unresponsive),
         // Busy, and statuses this build doesn't know: not delivered.
         _ => Exchange::Retry(Waiting::Busy),
     }
 }
 
-fn refused(r: &Reply, hello: &Hello, b: &Builder, request: &[u8]) -> Reason {
-    match r.refusal {
-        Some(refusal::APP) => Reason::OtherApp {},
-        Some(refusal::PAYLOAD_VERSION) => Reason::PayloadVersion {
+/// Why the owner refused this launch. `hello` is `None` when the refusal
+/// came in place of HELLO, before this launch sent anything. `own` is this
+/// launch's level.
+fn refused(
+    r: &Reply,
+    hello: Option<&Hello>,
+    b: &Builder,
+    request: &[u8],
+    own: Option<Level>,
+) -> Reason {
+    let wire_version = Reason::WireVersion {
+        ours: u32::from(wire::WIRE_MAX),
+        theirs: hello.map_or(0, |h| u32::from(h.wire_max)),
+    };
+    match (r.refusal, hello) {
+        (Some(refusal::PEER), _) => Reason::Peer {
+            source: io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the owner refused this launch: another user, or a check that failed",
+            ),
+        },
+        (Some(refusal::APP), _) => Reason::OtherApp {},
+        // The owner names its level with the refusal. Without one, or
+        // with this launch's own, the rights can't be named: a cause this
+        // build doesn't know. A launch refused what it handed down kept its
+        // rights, so `hand_down` is `false` here.
+        (Some(refusal::PRIVILEGE), _) => own
+            .zip(r.level.map(Level::from_rid))
+            .and_then(|(own, theirs)| rights(own, theirs, false, false)?.err())
+            .unwrap_or(Reason::Declined {}),
+        (Some(refusal::PAYLOAD_VERSION), Some(hello)) => Reason::PayloadVersion {
             ours: b.payload_version,
             theirs: r.payload_version.unwrap_or(hello.payload_version),
         },
-        Some(refusal::UNDECODABLE) => Reason::Undecodable {},
-        Some(refusal::TOO_LARGE) => Reason::TooLarge {
+        (Some(refusal::UNDECODABLE), Some(_)) => Reason::Undecodable {},
+        (Some(refusal::TOO_LARGE), Some(hello)) => Reason::TooLarge {
             size: request.len(),
             limit: hello.max_request as usize,
         },
-        _ => Reason::WireVersion {
-            ours: u32::from(wire::WIRE_MAX),
-            theirs: u32::from(hello.wire_max),
-        },
+        // Before HELLO, those three answer a request that was never sent.
+        (Some(refusal::PAYLOAD_VERSION | refusal::UNDECODABLE | refusal::TOO_LARGE), None)
+        | (None | Some(refusal::WIRE | refusal::MALFORMED | refusal::UNSUPPORTED), _) => {
+            wire_version
+        }
+        // A cause from a later release.
+        (Some(_), _) => Reason::Declined {},
     }
 }
 
@@ -523,6 +1018,1079 @@ impl Reader {
                 Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err(ReadError::TimedOut),
                 Err(_) => return Err(ReadError::Closed),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use refusal::*;
+
+    const KNOWN: [u8; 9] = [
+        WIRE,
+        APP,
+        PAYLOAD_VERSION,
+        UNDECODABLE,
+        TOO_LARGE,
+        MALFORMED,
+        UNSUPPORTED,
+        PRIVILEGE,
+        PEER,
+    ];
+
+    fn hello() -> Hello {
+        Hello {
+            wire_min: 1,
+            wire_max: 1,
+            app_id: "test".into(),
+            app_kind: wire::app_kind(Kind::Headless),
+            nonce: 7,
+            payload_version: 2,
+            max_request: 100,
+            serving: serving::TAKING,
+            level: None,
+            state: Vec::new(),
+            features: wire::features::REFUSALS,
+        }
+    }
+
+    /// What this launch makes of REPLY REFUSED with `code`, after `hello`
+    /// or in place of it.
+    fn refused_with(code: Option<u8>, hello: Option<&Hello>) -> Reason {
+        let b = Builder::new(AppId::headless("test"), crate::State::none()).payload_version(3);
+        let reply = Reply {
+            refusal: code,
+            ..Reply::new(false, status::REFUSED)
+        };
+        refused(&reply, hello, &b, &[0; 200], None)
+    }
+
+    /// How a launch fares with an owner, by their levels: it has more
+    /// rights, the owner has, or neither is known to.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Apart {
+        Neither,
+        More,
+        Fewer,
+    }
+
+    /// A launch's level, its owner's, and how the launch fares.
+    type Row = (Option<Level>, Option<Level>, Apart);
+
+    const LEVELS: [Row; 9] = [
+        (None, None, Apart::Neither),
+        (None, Some(Level::HIGH), Apart::Neither),
+        (Some(Level::MEDIUM), None, Apart::Neither),
+        (Some(Level::MEDIUM), Some(Level::MEDIUM), Apart::Neither),
+        (Some(Level::HIGH), Some(Level::HIGH), Apart::Neither),
+        (Some(Level::HIGH), Some(Level::MEDIUM), Apart::More),
+        (Some(Level::MEDIUM), Some(Level::LOW), Apart::More),
+        (Some(Level::MEDIUM), Some(Level::HIGH), Apart::Fewer),
+        (Some(Level::LOW), Some(Level::UI_ACCESS), Apart::Fewer),
+    ];
+
+    /// Whether `reason` is what a launch gets as `row` says, naming the
+    /// owner by its level alone, unconfirmed and with no pid.
+    fn fares(reason: &Reason, (own, theirs, apart): Row) -> bool {
+        let named = |owner: &OwnerInfo, rights: &Rights| {
+            let levels = own
+                .zip(theirs)
+                .map(|(launch, owner)| Rights::Level { launch, owner });
+            (owner.pid, owner.confirmed, owner.level) == (None, false, theirs)
+                && levels.as_ref() == Some(rights)
+        };
+        match (reason, apart) {
+            (Reason::MoreRights { owner, rights }, Apart::More)
+            | (Reason::OwnerHasMoreRights { owner, rights }, Apart::Fewer) => named(owner, rights),
+            _ => false,
+        }
+    }
+
+    // At another level, a launch decides from HELLO with `rights`, as it
+    // does from the marker, and sends nothing. With the higher level it
+    // has rights the owner lacks, unless it may hand its request down, and
+    // then it goes on. With the lower, the owner has rights it lacks,
+    // whether or not it may. A probe finds the owner, unconfirmed: it
+    // won't serve this launch. Where a level is unknown, as on Unix, the
+    // launch goes on.
+    #[test]
+    fn a_launch_at_another_level_decides_from_hello() {
+        for (row, hand_down) in LEVELS
+            .into_iter()
+            .flat_map(|row| [(row, false), (row, true)])
+        {
+            let (own, theirs, apart) = row;
+            // As `exchange` reads HELLO's LEVEL.
+            let decide = |probe| {
+                own.zip(theirs)
+                    .and_then(|(own, theirs)| rights(own, theirs, probe, hand_down))
+            };
+            let handoff = decide(false);
+            let probe = decide(true);
+            if apart == Apart::Neither {
+                assert!(handoff.is_none() && probe.is_none(), "{row:?}");
+                continue;
+            }
+            let goes_on = apart == Apart::More && hand_down;
+            match handoff {
+                None if goes_on => {}
+                Some(Err(reason)) if !goes_on => {
+                    assert!(fares(&reason, row), "{row:?} {hand_down}: {reason:?}");
+                }
+                other => panic!("{row:?} {hand_down}: {other:?}"),
+            }
+            match probe {
+                Some(Ok(found)) => assert_eq!(
+                    (found.pid, found.confirmed, found.level),
+                    (None, false, theirs)
+                ),
+                other => panic!("{row:?} {hand_down}: {other:?}"),
+            }
+        }
+    }
+
+    // PRIVILEGE comes with the owner's level, which the launch compares
+    // with its own, after HELLO or in place of it. Without a level to
+    // compare, or with its own, it can't name the rights, and reads the
+    // cause as one it doesn't know. A launch that may hand down reads it
+    // the same way: the owner refused what it handed down, as one that
+    // reads the launch's token at another level than the launch does.
+    #[test]
+    fn a_privilege_refusal_names_the_rights_from_the_owners_level() {
+        let hello = hello();
+        let b = Builder::new(AppId::headless("test"), crate::State::none());
+        let down = b.clone().hand_down(true);
+        for row in LEVELS {
+            let (own, theirs, apart) = row;
+            let reply = Reply {
+                refusal: Some(PRIVILEGE),
+                level: theirs.map(Level::rid),
+                ..Reply::new(false, status::REFUSED)
+            };
+            for hello in [Some(&hello), None] {
+                for b in [&b, &down] {
+                    let reason = refused(&reply, hello, b, &[], own);
+                    let case = (row, b.hand_down);
+                    if apart == Apart::Neither {
+                        assert!(matches!(reason, Reason::Declined {}), "{case:?}: {reason}");
+                    } else {
+                        assert!(fares(&reason, row), "{case:?}: {reason:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    // A busy owner that names a level in HELLO, to launches at other
+    // levels: each decides from HELLO alone, before it looks at whether the
+    // owner serves, and sends nothing. `hand_off` fails at once, and a
+    // probe finds the owner, unconfirmed, with no pid, though the
+    // connection gives one. Owners on Unix name no level and launches there
+    // have none, so the test plays a high owner and sets the launch's level.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_at_another_level_sends_nothing_whether_or_not_the_owner_serves() {
+        use std::io::{Read, Write};
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Builder::new(AppId::headless("test.levels"), crate::State::none())
+            .dir(tmp.path().join("run"))
+            .timeout(Duration::from_secs(3));
+        let folder = sys::open_folder(&b.place(None).unwrap(), true)
+            .unwrap()
+            .unwrap();
+        let _lock = folder.lock().unwrap().unwrap();
+        let socket = b.runtime_dir().unwrap().join("instance.sock");
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let hello = Hello {
+            app_id: "test.levels".into(),
+            payload_version: b.payload_version,
+            serving: serving::BUSY,
+            level: Some(Level::HIGH.rid()),
+            state: b.instance_key(None),
+            ..hello()
+        }
+        .encode();
+        let owner = std::thread::spawn(move || {
+            for stream in listener.incoming().take(3) {
+                let mut stream = stream.unwrap();
+                stream.write_all(&hello).unwrap();
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).unwrap();
+                assert!(got.is_empty(), "the launch sent {got:?}");
+            }
+        });
+        let payload = crate::Args::new(["x"]);
+        let at = |launch, owner| Rights::Level { launch, owner };
+        let t = Instant::now();
+        match hand_off_at(&b, Some(&payload), Some(Level::MEDIUM)) {
+            Err(Reason::OwnerHasMoreRights { owner, rights }) => {
+                assert_eq!(rights, at(Level::MEDIUM, Level::HIGH));
+                assert_eq!(owner.to_string(), "pid unknown, high");
+                assert!(!owner.confirmed());
+            }
+            other => panic!("{other:?}"),
+        }
+        match hand_off_at(&b, Some(&payload), Some(Level::SYSTEM)) {
+            Err(Reason::MoreRights { rights, .. }) => {
+                assert_eq!(rights, at(Level::SYSTEM, Level::HIGH));
+            }
+            other => panic!("{other:?}"),
+        }
+        let found = hand_off_at::<()>(&b, None, Some(Level::MEDIUM)).unwrap();
+        assert_eq!(
+            (found.pid(), found.confirmed(), found.level()),
+            (None, false, Some(Level::HIGH))
+        );
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        owner.join().unwrap();
+    }
+
+    // An owner below the launch, as its HELLO names it, takes a request the
+    // launch hands down, and nothing else from it. The owner here is a
+    // session at medium that reads each launch's level, as an owner on
+    // Windows reads it from the launch's token. Owners and launches on Unix
+    // have no levels, so the test sets both.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_above_the_owner_hands_down_only_when_asked() {
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+
+        use crate::server::{Core, Ctx, Peer, Session, Shared, Upkeep};
+        use crate::{Answer, Args, Request};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Builder::new(AppId::headless("test.down"), crate::State::none())
+            .dir(tmp.path().join("run"))
+            .timeout(Duration::from_secs(3));
+        let folder = sys::open_folder(&b.place(None).unwrap(), true)
+            .unwrap()
+            .unwrap();
+        let _lock = folder.lock().unwrap().unwrap();
+        let socket = b.runtime_dir().unwrap().join("instance.sock");
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let ctx = Ctx {
+            app_id: b.app_id.clone(),
+            instance_key: b.instance_key(None),
+            level: Some(Level::MEDIUM),
+            payload_version: b.payload_version,
+            nonce: 1,
+            upkeep: Upkeep::default(),
+        };
+        // Each launch's level, as the owner reads it.
+        let levels = [
+            Level::HIGH,
+            Level::HIGH,
+            Level::LOW,
+            Level::HIGH,
+            Level::MEDIUM,
+            Level::LOW,
+        ];
+        // For two owners played by hand, which answer COMMIT with what
+        // isn't a REPLY the launch can read: a READY, and a REPLY with no
+        // records.
+        let hello = Hello {
+            app_id: "test.down".into(),
+            payload_version: b.payload_version,
+            max_request: wire::MAX_REQUEST,
+            level: Some(Level::MEDIUM.rid()),
+            state: b.instance_key(None),
+            ..hello()
+        }
+        .encode();
+        let (tx, taken) = std::sync::mpsc::channel::<Request<Args>>();
+        let owner = std::thread::spawn(move || {
+            let shared = Shared::new(sys::Held::detached());
+            let handler = Box::new(move |r| {
+                tx.send(r).unwrap();
+                Answer::Take
+            });
+            let mut core = Core::new(Some(handler), None, shared, ctx);
+            // What each launch sent.
+            let mut sent = Vec::new();
+            for (level, stream) in levels.into_iter().zip(listener.incoming()) {
+                let mut stream = stream.unwrap();
+                let now = Instant::now();
+                let mut s = Session::new(&core, Peer::default(), now);
+                s.attested(level);
+                let mut got = Vec::new();
+                let mut buf = [0; 4096];
+                while !s.is_done() {
+                    let out = s.outgoing().to_vec();
+                    stream.write_all(&out).unwrap();
+                    s.wrote(out.len());
+                    if s.should_shut_write() {
+                        let _ = stream.shutdown(Shutdown::Write);
+                    }
+                    match stream.read(&mut buf).unwrap() {
+                        0 => s.eof(&core.ctx.app_id),
+                        n => {
+                            got.extend_from_slice(&buf[..n]);
+                            if let Some(request) = s.read(&buf[..n], &core, now) {
+                                let answer = core.deliver(request).unwrap();
+                                s.answer(answer, now);
+                            }
+                        }
+                    }
+                }
+                sent.push(got);
+            }
+            // One whole message from the launch.
+            let frame = |stream: &mut std::os::unix::net::UnixStream| {
+                let mut got = Vec::new();
+                let mut buf = [0; 4096];
+                while wire::split(&got, wire::MAX_REQUEST as usize)
+                    .unwrap()
+                    .is_none()
+                {
+                    let n = stream.read(&mut buf).unwrap();
+                    assert_ne!(n, 0, "the launch left early");
+                    got.extend_from_slice(&buf[..n]);
+                }
+                got
+            };
+            for answer in [wire::empty(wire::READY), wire::empty(wire::REPLY)] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.write_all(&hello).unwrap();
+                let request = frame(&mut stream);
+                stream.write_all(&wire::empty(wire::READY)).unwrap();
+                assert_eq!(frame(&mut stream), wire::empty(wire::COMMIT));
+                stream.write_all(&answer).unwrap();
+                sent.push(request);
+            }
+            sent
+        });
+        let payload = Args::new(["x"]);
+        let down = b.clone().hand_down(true);
+        let given = Rights::Level {
+            launch: Level::HIGH,
+            owner: Level::MEDIUM,
+        };
+        let wait = Duration::from_secs(1);
+
+        // High, handing down: the owner takes the request, and both ends
+        // are told what was given up.
+        let info = hand_off_at(&down, Some(&payload), Some(Level::HIGH)).unwrap();
+        assert_eq!(
+            (info.confirmed(), info.level(), info.handed_down()),
+            (true, Some(Level::MEDIUM), Some(&given))
+        );
+        let request = taken.recv_timeout(wait).unwrap();
+        assert_eq!(request.payload(), &payload);
+        assert_eq!(request.handed_down(), Some(&given));
+        // High, keeping its rights: MoreRights, with nothing sent.
+        match hand_off_at(&b, Some(&payload), Some(Level::HIGH)) {
+            Err(Reason::MoreRights { rights, .. }) => assert_eq!(rights, given),
+            other => panic!("{other:?}"),
+        }
+        // Never up, whatever the launch allows.
+        match hand_off_at(&down, Some(&payload), Some(Level::LOW)) {
+            Err(Reason::OwnerHasMoreRights { .. }) => {}
+            other => panic!("{other:?}"),
+        }
+        // A probe hands nothing over, so nothing down.
+        let found = hand_off_at::<()>(&down, None, Some(Level::HIGH)).unwrap();
+        assert_eq!((found.confirmed(), found.handed_down()), (false, None));
+        // At the owner's level there is nothing to give up.
+        let info = hand_off_at(&down, Some(&payload), Some(Level::MEDIUM)).unwrap();
+        assert!(info.confirmed() && info.handed_down().is_none());
+        assert!(taken.recv_timeout(wait).unwrap().handed_down().is_none());
+        // High as the launch reads its token, low as the owner does: the
+        // owner refuses what it hands down with PRIVILEGE and its level,
+        // and the launch has more rights, as if it had kept them.
+        match hand_off_at(&down, Some(&payload), Some(Level::HIGH)) {
+            Err(Reason::MoreRights { rights, .. }) => assert_eq!(rights, given),
+            other => panic!("{other:?}"),
+        }
+        // Committed, but with no REPLY it can read: unconfirmed, and still
+        // handed down.
+        for _ in 0..2 {
+            let info = hand_off_at(&down, Some(&payload), Some(Level::HIGH)).unwrap();
+            assert_eq!(
+                (info.confirmed(), info.level(), info.handed_down()),
+                (false, Some(Level::MEDIUM), Some(&given))
+            );
+        }
+
+        // Each launch that handed down said so, and only those. The three
+        // that didn't hand off sent nothing.
+        let sent = owner.join().unwrap();
+        let hand_down = |sent: &[u8]| {
+            let (kind, body, _) = wire::split(sent, wire::MAX_REQUEST as usize)
+                .unwrap()
+                .unwrap();
+            assert_eq!(kind, wire::REQUEST);
+            wire::Request::decode(body).unwrap().hand_down
+        };
+        assert_eq!(hand_down(&sent[0]), Some(given.clone()));
+        assert!(sent[1..4].iter().all(Vec::is_empty), "{sent:?}");
+        assert_eq!(hand_down(&sent[4]), None);
+        for sent in &sent[5..] {
+            assert_eq!(hand_down(sent), Some(given.clone()));
+        }
+        assert!(taken.try_recv().is_err());
+    }
+
+    // Sent below its own level to hand down, a launch takes HELLO only from
+    // the owner the marker showed: one that names another level, its own
+    // or none, isn't that owner, and gets nothing. At the marker's level
+    // it goes on, here to a busy owner. Only Windows connects below the
+    // launch's level, where the pipe's label shows the owner's, so the
+    // test sets the launch's level and calls `exchange` with the marker's,
+    // as `meet` gives it.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_that_hands_down_takes_hello_only_at_the_markers_level() {
+        use std::io::{Read, Write};
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Builder::new(AppId::headless("test.down"), crate::State::none())
+            .dir(tmp.path().join("run"))
+            .timeout(Duration::from_secs(3))
+            .hand_down(true);
+        let folder = sys::open_folder(&b.place(None).unwrap(), true)
+            .unwrap()
+            .unwrap();
+        let _lock = folder.lock().unwrap().unwrap();
+        let socket = b.runtime_dir().unwrap().join("instance.sock");
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let key = b.instance_key(None);
+        // What each owner names in HELLO; the marker shows medium.
+        let named = [
+            None,
+            Some(Level::HIGH),
+            Some(Level::LOW),
+            Some(Level::MEDIUM),
+        ];
+        let hellos = named.map(|level| {
+            Hello {
+                app_id: "test.down".into(),
+                payload_version: b.payload_version,
+                serving: serving::BUSY,
+                level: level.map(Level::rid),
+                state: key.clone(),
+                ..hello()
+            }
+            .encode()
+        });
+        let owner = std::thread::spawn(move || {
+            for (hello, stream) in hellos.iter().zip(listener.incoming()) {
+                let mut stream = stream.unwrap();
+                stream.write_all(hello).unwrap();
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).unwrap();
+                assert!(got.is_empty(), "the launch sent {got:?}");
+            }
+        });
+        let request = encode_request(&b, &crate::Args::new(["x"])).unwrap();
+        let limits = Limits::new(Instant::now(), b.timeout, Some(Level::HIGH));
+        let marker = Some(Level::MEDIUM);
+        let talk = || exchange(&folder, &b, &key, Some(&request), &limits, None, marker);
+        for level in &named[..3] {
+            match talk() {
+                Exchange::Fail(Reason::WireVersion { theirs: 0, .. }) => {}
+                Exchange::Fail(reason) => panic!("{level:?}: {reason}"),
+                _ => panic!("{level:?}: went on"),
+            }
+        }
+        assert!(matches!(talk(), Exchange::Retry(Waiting::Busy)));
+        owner.join().unwrap();
+    }
+
+    // Both ways, and a kind from a later release: the two kinds of an id
+    // refuse each other.
+    #[test]
+    fn an_owner_of_the_other_kind_is_another_app() {
+        let app = |kind| AppId::parse("test", kind).unwrap();
+        let mut owner = hello();
+        for (kind, other) in [
+            (Kind::Windowed, Kind::Headless),
+            (Kind::Headless, Kind::Windowed),
+        ] {
+            owner.app_kind = wire::app_kind(kind);
+            assert!(same_app(&owner, &app(kind), &[]), "{kind:?}");
+            assert!(!same_app(&owner, &app(other), &[]), "{kind:?}");
+        }
+        owner.app_kind = 2;
+        assert!(!same_app(&owner, &app(Kind::Windowed), &[]));
+        assert!(!same_app(&owner, &app(Kind::Headless), &[]));
+        assert!(!same_app(&hello(), &AppId::headless("other"), &[]));
+    }
+
+    // Two state folders or scopes whose instance folders share a name, as
+    // a hash collision would make them: the owner of one is another app to
+    // a launch of the other. STATE is compared byte for byte.
+    #[test]
+    fn an_owner_of_another_state_is_another_app() {
+        use std::path::Path;
+        let app = AppId::headless("test");
+        let b = Builder::new(app.clone(), crate::State::none());
+        let key = b.instance_key(Some(Path::new("/a")));
+        let owner = Hello {
+            state: key.clone(),
+            ..hello()
+        };
+        assert!(same_app(&owner, &app, &key));
+        for other in [
+            b.instance_key(None),
+            b.instance_key(Some(Path::new("/b"))),
+            b.instance_key(Some(Path::new("/a/"))),
+            b.clone().scope("").instance_key(Some(Path::new("/a"))),
+            b.clone().scope("/a").instance_key(None),
+            key[..key.len() - 1].to_vec(),
+            [&key[..], b"\0"].concat(),
+        ] {
+            assert!(!same_app(&owner, &app, &other), "{other:?}");
+        }
+    }
+
+    // Raised: rights raised from a login. Above normal: root on Unix, and
+    // above medium, except UIAccess, on Windows.
+    #[test]
+    fn who_may_own() {
+        use ElevatedOwner::*;
+        use Ineligible::*;
+        use Kind::*;
+        let rows = [
+            // (policy, raised, above normal): why it may not own, where
+            // windows don't stop it.
+            ((NotRaised, false, false), None),
+            ((NotRaised, false, true), None),
+            ((NotRaised, true, false), Some(Raised)),
+            ((NotRaised, true, true), Some(Raised)),
+            ((NotAboveNormal, false, false), None),
+            ((NotAboveNormal, false, true), Some(AboveNormal)),
+            ((NotAboveNormal, true, false), Some(Raised)),
+            ((NotAboveNormal, true, true), Some(Raised)),
+            ((Allow, false, false), None),
+            ((Allow, false, true), None),
+            ((Allow, true, false), None),
+            ((Allow, true, true), None),
+        ];
+        // A headless app's launch, whatever its windows, and a windowed
+        // app's that can show them or might: only its rights count.
+        let free = [
+            (Headless, Some(false)),
+            (Headless, None),
+            (Headless, Some(true)),
+            (Windowed, None),
+            (Windowed, Some(true)),
+        ];
+        for (kind, windows) in free {
+            for ((policy, raised, above), why) in rows {
+                assert_eq!(
+                    ineligible(kind, windows, policy, raised, above),
+                    why,
+                    "{kind:?} {windows:?} {policy:?} {raised} {above}"
+                );
+            }
+        }
+        // A windowed app's launch that can't show windows never owns,
+        // whatever its rights and the policy.
+        for ((policy, raised, above), _) in rows {
+            assert_eq!(
+                ineligible(Windowed, Some(false), policy, raised, above),
+                Some(NoWindows),
+                "{policy:?} {raised} {above}"
+            );
+        }
+        // An exclusive run serves no launches, so only its rights count,
+        // whatever the app's kind and its windows.
+        for ((policy, raised, above), why) in rows {
+            assert_eq!(
+                ineligible_rights(policy, raised, above),
+                why,
+                "{policy:?} {raised} {above}"
+            );
+        }
+    }
+
+    // What a launch does about the owner, by the level the owner's marker
+    // shows, before it connects. A launch answers an owner at another
+    // level at once, from its marker: start and hand_off are refused, a
+    // probe is told it runs, unconfirmed, and a committed launch whose
+    // owner died is handed off, unconfirmed. Nothing is sent. The one
+    // exception is an owner below a launch that hands its request down:
+    // start, hand_off and a committed launch talk to it, at its level. On
+    // Windows, an_owner_at_another_level_is_answered_at_once tries each
+    // call against owners forged below and above, and
+    // a_launch_that_hands_down_looks_in_the_owners_address_folder tries
+    // to hand down to them.
+    #[test]
+    fn a_launch_meets_the_owner_by_its_marker() {
+        use OwnerLevel::*;
+        /// What a meeting comes to. An answer at once names the owner's
+        /// level, from its marker.
+        #[derive(Debug, Clone, PartialEq)]
+        enum Is {
+            Talk(Option<Level>),
+            Wait,
+            Runs(Option<Level>),
+            MoreRights(Option<Level>, Rights),
+            OwnerHasMoreRights(Option<Level>, Rights),
+            /// After a commit: handed off, unconfirmed.
+            Unconfirmed,
+        }
+        let is = |met: Meet| {
+            let (info, is) = match met {
+                Meet::Talk(at) => return Is::Talk(at),
+                Meet::Wait => return Is::Wait,
+                Meet::Report(Ok(info)) => (info.clone(), Is::Runs(info.level())),
+                Meet::Report(Err(Reason::MoreRights { owner, rights })) => {
+                    let is = Is::MoreRights(owner.level(), rights);
+                    (owner, is)
+                }
+                Meet::Report(Err(Reason::OwnerHasMoreRights { owner, rights })) => {
+                    let is = Is::OwnerHasMoreRights(owner.level(), rights);
+                    (owner, is)
+                }
+                Meet::Report(Err(other)) => panic!("{other}"),
+            };
+            // Nobody talked to the owner.
+            assert_eq!((info.pid(), info.confirmed()), (None, false));
+            assert!(info.handed_down().is_none());
+            is
+        };
+        let (low, medium, high) = (Some(Level::LOW), Some(Level::MEDIUM), Some(Level::HIGH));
+        let rights = |owner: Option<Level>| Rights::Level {
+            launch: Level::MEDIUM,
+            owner: owner.unwrap(),
+        };
+        let talk = |at| [Is::Talk(at), Is::Talk(at), Is::Talk(at), Is::Talk(at)];
+        let wait = || [Is::Wait, Is::Wait, Is::Wait, Is::Unconfirmed];
+        let rows = [
+            // (launch, owner): start and hand_off, probe, then a committed
+            // launch whose owner died, before its wait is past and after;
+            // then the same with hand_down, where that differs.
+            ((medium, Same), talk(medium), None),
+            ((None, Same), talk(None), None),
+            // Never found: owner_level gives Same for the launch's own
+            // level's marker.
+            ((medium, Other(Level::MEDIUM)), talk(medium), None),
+            // A request is never handed up.
+            (
+                (medium, Other(Level::HIGH)),
+                [
+                    Is::OwnerHasMoreRights(high, rights(high)),
+                    Is::Runs(high),
+                    Is::Unconfirmed,
+                    Is::Unconfirmed,
+                ],
+                None,
+            ),
+            // With hand_down, the launch talks to the owner below it, at
+            // the owner's level, before a commit and after. A probe hands
+            // nothing down.
+            (
+                (medium, Other(Level::LOW)),
+                [
+                    Is::MoreRights(low, rights(low)),
+                    Is::Runs(low),
+                    Is::Unconfirmed,
+                    Is::Unconfirmed,
+                ],
+                Some([Is::Talk(low), Is::Runs(low), Is::Talk(low), Is::Talk(low)]),
+            ),
+            ((medium, Starting), wait(), None),
+            ((None, Starting), wait(), None),
+            // A launch that doesn't know its own level can't compare, so
+            // it fails closed, handing down or not: `None` matches no
+            // pipe's label.
+            ((None, Other(Level::HIGH)), talk(None), None),
+            ((None, Other(Level::LOW)), talk(None), None),
+        ];
+        for ((own, owner), without, with) in rows {
+            let with = with.unwrap_or_else(|| without.clone());
+            let cases = [(false, without), (true, with)];
+            for (hand_down, [hand_off, probe, committed, past]) in cases {
+                let after = |is_past| {
+                    meet_after_commit(meet(own, owner, false, hand_down), is_past)
+                        .map_or(Is::Unconfirmed, is)
+                };
+                let case = format!("{own:?} {owner:?} {hand_down}");
+                assert_eq!(is(meet(own, owner, false, hand_down)), hand_off, "{case}");
+                assert_eq!(is(meet(own, owner, true, hand_down)), probe, "{case}");
+                assert_eq!(after(false), committed, "{case}");
+                assert_eq!(after(true), past, "{case}");
+            }
+        }
+    }
+
+    // A launch told it may not own never takes the lock or makes the
+    // folder. It hands off to an owner that is running, and otherwise runs
+    // alone. An exclusive run told so fails at once, beside an owner or
+    // not, and makes nothing either.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_launch_that_may_not_own_hands_off_or_runs_alone() {
+        use crate::Args;
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        let b = Builder::new(AppId::headless("test.gate"), crate::State::none())
+            .dir(&run)
+            .timeout(Duration::from_secs(3));
+        let raised = Some(Ineligible::Raised);
+        let may_not_own = |started: Started<Args>| match started {
+            Started::Alone(Reason::MayNotOwn { why }) => why,
+            other => panic!("expected MayNotOwn: {other:?}"),
+        };
+        let own = |started: Started<Args>| match started {
+            Started::Owner(claim) => claim,
+            other => panic!("expected the owner: {other:?}"),
+        };
+
+        let why = may_not_own(start_as(&b, &Args::default(), raised));
+        assert_eq!(why, Ineligible::Raised);
+        let state = tmp.path().join("state");
+        let held = Builder::new(AppId::headless("test.gate"), state.as_path()).dir(&run);
+        for b in [&b, &held] {
+            match exclusive_as(b, raised) {
+                Err(Reason::MayNotOwn { why }) => assert_eq!(why, Ineligible::Raised),
+                other => panic!("expected MayNotOwn: {other:?}"),
+            }
+        }
+        assert!(!run.exists() && !state.exists());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let owner = own(start_as(&b, &Args::default(), None)).serve(move |r| tx.send(r).is_ok());
+        let sent = Args::new(["raised"]);
+        match start_as(&b, &sent, raised) {
+            Started::HandedOff(info) => assert!(info.confirmed()),
+            other => panic!("expected to hand off: {other:?}"),
+        }
+        let got = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(got.payload(), &sent);
+        // An exclusive run never hands off.
+        assert!(matches!(
+            exclusive_as(&b, raised),
+            Err(Reason::MayNotOwn { .. })
+        ));
+
+        // The folder stays, with nobody holding its lock.
+        owner.release();
+        may_not_own(start_as(&b, &Args::default(), raised));
+        own(start_as(&b, &Args::default(), None)).release();
+    }
+
+    // With no runtime folder to look in, a launch that may not own looks
+    // at the guard as hand_off does, in the mode start would take it: held
+    // so that it couldn't own, here by keyed owners for an unkeyed launch,
+    // or by an unkeyed one for a keyed launch, it runs alone with
+    // StateInUse, and otherwise with MayNotOwn. It makes nothing.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_launch_that_may_not_own_and_has_no_folder_looks_at_the_guard() {
+        use crate::Args;
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        let unkeyed =
+            Builder::new(AppId::headless("test.gate"), tmp.path().join("state")).dir(&run);
+        let keyed = unkeyed.clone().scope("a");
+        let state = unkeyed.canonical_state().unwrap();
+        let raised = Some(Ineligible::Raised);
+        let alone = |b: &Builder| match start_as(b, &Args::default(), raised) {
+            Started::Alone(Reason::StateInUse { path }) => {
+                assert_eq!(path, state.join(naming::GUARD_FILE));
+                "in use"
+            }
+            Started::Alone(Reason::MayNotOwn { why }) => {
+                assert_eq!(why, Ineligible::Raised);
+                "may not own"
+            }
+            other => panic!("expected StateInUse or MayNotOwn: {other:?}"),
+        };
+        make_state(&state).unwrap();
+        let guard = take_guard(&state, true).unwrap();
+        assert!(guard.is_some(), "a local folder locks");
+        assert_eq!(alone(&unkeyed), "in use");
+        assert_eq!(alone(&keyed), "may not own");
+        drop(guard);
+        let guard = take_guard(&state, false).unwrap();
+        assert_eq!(alone(&unkeyed), "in use");
+        assert_eq!(alone(&keyed), "in use");
+        drop(guard);
+        assert_eq!(alone(&unkeyed), "may not own");
+        assert_eq!(alone(&keyed), "may not own");
+        assert!(!run.exists());
+    }
+
+    // The owner this launch committed to died, and another process holds
+    // the guard: the dead owner may have had the request, so the launch
+    // reports it handed off, never alone, and lets go of the lock it took
+    // (0004). With the guard free, it owns.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_committed_launch_that_finds_the_guard_held_is_handed_off_unconfirmed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Builder::new(AppId::headless("test.guard"), tmp.path().join("state"))
+            .dir(tmp.path().join("run"));
+        let state = b.canonical_state();
+        let place = b.place(state.as_deref()).unwrap();
+        let folder = sys::open_folder(&place, true).unwrap().unwrap();
+        let limits = Limits::new(Instant::now(), Duration::from_secs(1), None);
+        let key = b.instance_key(state.as_deref());
+        let after = || after_commit(&folder, &b, &key, &[], 1, Some(state.as_deref()), &limits);
+
+        let other = take_state(&b, state.as_deref()).unwrap();
+        assert!(other.is_some());
+        match after() {
+            AfterCommit::Info(info) => assert!(!info.confirmed()),
+            AfterCommit::Own(..) => panic!("owned beside a guard another process holds"),
+        }
+        assert!(!folder.lock_held().unwrap());
+
+        drop(other);
+        match after() {
+            AfterCommit::Own(_, guard) => assert!(guard.is_some()),
+            AfterCommit::Info(info) => panic!("handed off to {info}"),
+        }
+    }
+
+    // An owner at another level, as its marker shows it, is answered at
+    // once: start and hand_off are refused, a probe is told it runs,
+    // unconfirmed, and a committed launch whose owner died is handed off
+    // unconfirmed, never alone (0004). CI runs only at high and medium, so
+    // the owner is forged: a handle that holds byte 0 and the marker of a
+    // level below or above both. tests/levels.rs meets real owners at the
+    // other level.
+    #[cfg(windows)]
+    #[test]
+    fn an_owner_at_another_level_is_answered_at_once() {
+        use crate::Args;
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Builder::new(AppId::headless("test.marker"), crate::State::none())
+            .dir(tmp.path().join("run"))
+            .timeout(Duration::from_secs(5));
+        let folder = sys::open_folder(&b.place(None).unwrap(), true)
+            .unwrap()
+            .unwrap();
+        let key = b.instance_key(None);
+        let own = sys::level().unwrap();
+        // Below and above high and medium, where the tests run.
+        for owner in [Level::LOW, Level::SYSTEM] {
+            let _held = folder.lock_at(owner.rid()).unwrap().unwrap();
+            let began = Instant::now();
+            let rights = Rights::Level { launch: own, owner };
+            let refused = |reason: Reason| match reason {
+                Reason::MoreRights {
+                    owner: info,
+                    rights: r,
+                } if owner < own => (info, r),
+                Reason::OwnerHasMoreRights {
+                    owner: info,
+                    rights: r,
+                } if owner > own => (info, r),
+                other => panic!("{owner}: {other}"),
+            };
+            let unconfirmed = |info: &OwnerInfo| {
+                assert_eq!(info.pid(), None, "{owner}");
+                assert_eq!(info.level(), Some(owner), "{owner}");
+                assert!(!info.confirmed(), "{owner}");
+            };
+
+            let started = match start_as(&b, &Args::default(), None) {
+                Started::Alone(reason) => reason,
+                other => panic!("{owner}: {other:?}"),
+            };
+            for reason in [started, b.hand_off(&Args::default()).unwrap_err()] {
+                let (info, r) = refused(reason);
+                assert_eq!(r, rights);
+                unconfirmed(&info);
+            }
+            unconfirmed(&b.probe().unwrap());
+            let limits = Limits::new(Instant::now(), b.timeout, Some(own));
+            match after_commit(&folder, &b, &key, &[], 1, Some(None), &limits) {
+                AfterCommit::Info(info) => assert!(!info.confirmed()),
+                AfterCommit::Own(..) => panic!("owned beside an owner at {owner}"),
+            }
+            assert!(began.elapsed() < Duration::from_secs(1), "{owner}");
+        }
+    }
+
+    // With hand_down, a launch above the owner talks to it through the
+    // address folder of the owner's level, as its marker shows it, and
+    // checks that folder first. The owner here is forged below both levels
+    // the tests run at, and publishes nothing. With no folder, start and
+    // hand_off look again until their deadline, as for an owner not
+    // listening yet, and a committed launch whose owner died until its
+    // wait after the commit is past. With a folder there that isn't
+    // labelled at the owner's level, start and hand_off fail at once with
+    // Peer, sending nothing. A probe hands nothing down, and is told the
+    // owner runs. An owner above is still answered at once.
+    // tests/levels.rs hands down to a real owner.
+    #[cfg(windows)]
+    #[test]
+    fn a_launch_that_hands_down_looks_in_the_owners_address_folder() {
+        use crate::Args;
+        let tmp = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_millis(100);
+        let b = Builder::new(AppId::headless("test.down"), crate::State::none())
+            .dir(tmp.path().join("run"))
+            .timeout(timeout)
+            .hand_down(true);
+        let folder = sys::open_folder(&b.place(None).unwrap(), true)
+            .unwrap()
+            .unwrap();
+        let start = || match start_as(&b, &Args::default(), None) {
+            Started::Alone(reason) => reason,
+            other => panic!("{other:?}"),
+        };
+        let hand_off = || b.hand_off(&Args::default()).unwrap_err();
+
+        let below = folder.lock_at(Level::LOW.rid()).unwrap().unwrap();
+        for reason in [start(), hand_off()] {
+            match reason {
+                Reason::Unresponsive { waited } => assert!(waited >= timeout, "{waited:?}"),
+                other => panic!("{other}"),
+            }
+        }
+        let found = b.probe().unwrap();
+        assert_eq!(
+            (found.pid(), found.level(), found.confirmed()),
+            (None, Some(Level::LOW), false)
+        );
+        // A committed launch whose owner died hands down to the next owner
+        // too: it looks for this one's address until its wait after the
+        // commit is past, where without hand_down it is handed off at once
+        // (an_owner_at_another_level_is_answered_at_once).
+        let began = Instant::now();
+        let limits = Limits::new(began, timeout, sys::level());
+        let key = b.instance_key(None);
+        match after_commit(&folder, &b, &key, &[], 1, Some(None), &limits) {
+            AfterCommit::Info(info) => assert!(!info.confirmed()),
+            AfterCommit::Own(..) => panic!("owned beside an owner below"),
+        }
+        let waited = began.elapsed();
+        assert!(waited >= Duration::from_millis(900), "{waited:?}");
+        // Made as Windows makes any folder, it isn't labelled low.
+        let address = crate::naming::level_folder(Level::LOW.rid());
+        std::fs::create_dir(b.runtime_dir().unwrap().join(address)).unwrap();
+        for reason in [start(), hand_off()] {
+            assert!(matches!(reason, Reason::Peer { .. }), "{reason}");
+        }
+        drop(below);
+
+        let _above = folder.lock_at(Level::SYSTEM.rid()).unwrap().unwrap();
+        let began = Instant::now();
+        let rights = Rights::Level {
+            launch: sys::level().unwrap(),
+            owner: Level::SYSTEM,
+        };
+        for reason in [start(), hand_off()] {
+            match reason {
+                Reason::OwnerHasMoreRights { rights: r, .. } => assert_eq!(r, rights),
+                other => panic!("{other}"),
+            }
+        }
+        assert!(began.elapsed() < Duration::from_secs(1));
+    }
+
+    // Byte 0 held with no marker is an owner still starting. Each call
+    // looks again until its deadline and then gives Unresponsive, and a
+    // committed launch whose owner died is handed off unconfirmed, never
+    // alone (0004).
+    #[cfg(windows)]
+    #[test]
+    fn an_owner_still_starting_is_waited_for_until_the_deadline() {
+        use crate::Args;
+        let tmp = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_millis(100);
+        let b = Builder::new(AppId::headless("test.starting"), crate::State::none())
+            .dir(tmp.path().join("run"))
+            .timeout(timeout);
+        let folder = sys::open_folder(&b.place(None).unwrap(), true)
+            .unwrap()
+            .unwrap();
+        let key = b.instance_key(None);
+        let _held = folder.lock_starting().unwrap().unwrap();
+        let unresponsive = |reason: Reason| match reason {
+            Reason::Unresponsive { waited } => assert!(waited >= timeout, "{waited:?}"),
+            other => panic!("{other}"),
+        };
+
+        match start_as(&b, &Args::default(), None) {
+            Started::Alone(reason) => unresponsive(reason),
+            other => panic!("{other:?}"),
+        }
+        unresponsive(b.hand_off(&Args::default()).unwrap_err());
+        unresponsive(b.probe().unwrap_err());
+        let limits = Limits::new(Instant::now(), timeout, sys::level());
+        match after_commit(&folder, &b, &key, &[], 1, Some(None), &limits) {
+            AfterCommit::Info(info) => assert_eq!(
+                (info.pid(), info.level(), info.confirmed()),
+                (None, None, false)
+            ),
+            AfterCommit::Own(..) => panic!("owned beside an owner still starting"),
+        }
+    }
+
+    #[test]
+    fn each_known_cause_has_its_reason() {
+        let hello = hello();
+        let at = |code| refused_with(Some(code), Some(&hello));
+        for code in [None, Some(WIRE), Some(MALFORMED), Some(UNSUPPORTED)] {
+            let reason = refused_with(code, Some(&hello));
+            assert!(
+                matches!(reason, Reason::WireVersion { ours: 1, theirs: 1 }),
+                "{code:?}: {reason}"
+            );
+        }
+        let reason = at(APP);
+        assert!(matches!(reason, Reason::OtherApp {}), "{reason}");
+        let reason = at(PAYLOAD_VERSION);
+        assert!(
+            matches!(reason, Reason::PayloadVersion { ours: 3, theirs: 2 }),
+            "{reason}"
+        );
+        let reason = at(UNDECODABLE);
+        assert!(matches!(reason, Reason::Undecodable {}), "{reason}");
+        let reason = at(TOO_LARGE);
+        assert!(
+            matches!(
+                reason,
+                Reason::TooLarge {
+                    size: 200,
+                    limit: 100
+                }
+            ),
+            "{reason}"
+        );
+        let reason = at(PEER);
+        assert!(matches!(reason, Reason::Peer { .. }), "{reason}");
+    }
+
+    #[test]
+    fn a_cause_this_build_doesnt_know_reads_as_declined() {
+        let hello = hello();
+        for code in (0..=255).filter(|c| !KNOWN.contains(c)) {
+            for hello in [Some(&hello), None] {
+                let reason = refused_with(Some(code), hello);
+                assert!(matches!(reason, Reason::Declined {}), "{code}: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_refusal_in_place_of_hello_is_about_the_launch() {
+        let reason = refused_with(Some(PEER), None);
+        assert!(matches!(reason, Reason::Peer { .. }), "{reason}");
+        let reason = refused_with(Some(APP), None);
+        assert!(matches!(reason, Reason::OtherApp {}), "{reason}");
+        // This launch hasn't sent a request: an answer to one isn't this
+        // protocol.
+        for code in [
+            WIRE,
+            PAYLOAD_VERSION,
+            UNDECODABLE,
+            TOO_LARGE,
+            MALFORMED,
+            UNSUPPORTED,
+        ] {
+            let reason = refused_with(Some(code), None);
+            assert!(
+                matches!(reason, Reason::WireVersion { ours: 1, theirs: 0 }),
+                "{code}: {reason}"
+            );
         }
     }
 }

@@ -25,12 +25,31 @@ jobs:
           components: rustfmt, clippy
           targets: x86_64-pc-windows-gnu, x86_64-apple-darwin, x86_64-unknown-freebsd, x86_64-unknown-netbsd, x86_64-unknown-illumos, aarch64-linux-android, wasm32-unknown-unknown, wasm32-wasip1
       - uses: extractions/setup-just@v4
+      # tests/process.rs runs a launch under fakeroot, and tests/namespaces.rs
+      # runs launches in user namespaces under bubblewrap. They skip without
+      # them, except here.
+      - name: Install fakeroot and bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y fakeroot bubblewrap
+      # Ubuntu's AppArmor can keep programs, bwrap among them, from making
+      # user namespaces.
+      - name: Allow user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Check formatting
         run: just fmt
       - name: Clippy
         run: just clippy
+      # tests/process.rs also runs a launch from a copy of itself made
+      # setgid to another of the runner's groups, which needs no root. It
+      # skips where it can't, except here and on macOS.
       - name: Test (including doctests and cross-process tests)
         run: just test
+        env:
+          INSTANCE_HANDOFF_REQUIRE_FAKEROOT: "1"
+          INSTANCE_HANDOFF_REQUIRE_BWRAP: "1"
+          INSTANCE_HANDOFF_REQUIRE_SETGID: "1"
       - name: Build documentation
         run: just doc
       - name: Lint the Windows code
@@ -62,6 +81,9 @@ jobs:
         run: just clippy
       - name: Test
         run: just test
+        # For tests/process.rs's setgid launch on macOS; Windows has none.
+        env:
+          INSTANCE_HANDOFF_REQUIRE_SETGID: "1"
       # The runner is an administrator with UAC off, so the step above runs
       # at high integrity. This one covers an ordinary, unelevated launch.
       - name: Test at medium integrity

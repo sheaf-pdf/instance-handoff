@@ -1,10 +1,10 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::{BoxError, Claim};
+use crate::{BoxError, Claim, Level, Rights, sys};
 
 /// What [`Builder::start`] decided. Exactly one of three things.
 ///
@@ -36,32 +36,148 @@ impl<T> fmt::Debug for Started<T> {
 /// The owner a launch reached: from [`Started::HandedOff`],
 /// [`Builder::hand_off`] and [`Builder::probe`].
 ///
+/// It displays as its pid and level, for messages: `pid 4242, high`. An
+/// unknown pid shows as `pid unknown`, and an unknown level is left out.
+///
 /// [`Builder::hand_off`]: crate::Builder::hand_off
 /// [`Builder::probe`]: crate::Builder::probe
 #[derive(Debug, Clone)]
 pub struct OwnerInfo {
     pub(crate) pid: Option<u32>,
     pub(crate) confirmed: bool,
+    pub(crate) level: Option<Level>,
+    pub(crate) handed_down: Option<Rights>,
 }
 
 impl OwnerInfo {
     /// The owner's process id, as the OS reported it for the connection.
-    /// `None` where the platform doesn't say, and across PID namespaces
-    /// (every Flatpak instance has its own).
+    /// `None` where the platform doesn't say, across PID namespaces (every
+    /// Flatpak instance has its own), and for an owner at another integrity
+    /// level, unless this launch handed its request down to it.
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
 
-    /// Whether the owner said its handler took the request. It is `false`
-    /// when this launch committed its request and then got no answer: the
-    /// owner stopped, hung, or died with nothing to take its place, or its
-    /// handler panicked. The request may be taken late, or not at all, and
-    /// this process should still exit. Always `true` from
-    /// [`Builder::probe`].
+    /// Whether the owner said its handler took the request, or, from
+    /// [`Builder::probe`], that it serves. It is `false` when this launch
+    /// committed its request and then got no answer: the owner stopped,
+    /// hung, or died with nothing to take its place, or its handler
+    /// panicked. The request may be taken late, or not at all, and this
+    /// process should still exit. It is also `false` from `probe` for an
+    /// owner at another integrity level: a probe hands nothing down, and
+    /// nothing is ever handed up, so it doesn't ask whether that owner
+    /// serves. And it is `false` for an owner this launch reported without
+    /// talking to it.
     ///
     /// [`Builder::probe`]: crate::Builder::probe
     pub fn confirmed(&self) -> bool {
         self.confirmed
+    }
+
+    /// The owner's Windows integrity level, as the owner said it in its
+    /// greeting or in its refusal of a launch at another level, or as the
+    /// marker in its lock showed it when this launch didn't talk to it.
+    /// `None` from owners on other platforms, which have no integrity
+    /// levels and name none, and when this launch can't say which owner has
+    /// its request, as when the owner it committed to died before it
+    /// answered and no other took its place.
+    pub fn level(&self) -> Option<Level> {
+        self.level
+    }
+
+    /// The rights this launch gave up to hand its request down to an owner
+    /// that lacks them ([`Builder::hand_down`]). The owner's handler is
+    /// told them too, as [`Request::handed_down`]. `None` when it gave up
+    /// nothing, and, as for [`OwnerInfo::level`], when this launch can't
+    /// say which owner has its request.
+    ///
+    /// [`Builder::hand_down`]: crate::Builder::hand_down
+    /// [`Request::handed_down`]: crate::Request::handed_down
+    pub fn handed_down(&self) -> Option<&Rights> {
+        self.handed_down.as_ref()
+    }
+}
+
+impl fmt::Display for OwnerInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.pid {
+            Some(pid) => write!(f, "pid {pid}")?,
+            None => f.write_str("pid unknown")?,
+        }
+        match self.level {
+            Some(level) => write!(f, ", {level}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The state folder, held for this process's own work: what
+/// [`Builder::exclusive`] returns. While it is held, no launch owns the
+/// state folder, and no other exclusive run holds it, unless one of them
+/// takes no [guard](crate::Guard): see `exclusive`.
+///
+/// Dropping it releases it at once, as [`Exclusive::release`] does, and so
+/// does the process's exit. That is unlike a [`Claim`] or an
+/// [`Owner`](crate::Owner), which keep the lock until the process exits.
+/// So bind it to a name for as long as the work runs: `let _ = …` drops it
+/// at once. A child forked from this process without `exec` holds it too,
+/// until the child drops its copy or exits.
+///
+/// It never checks that the state folder is still in place, as an owner
+/// does every minute. On Unix, should the folder be removed or replaced
+/// while this is held (renamed aside and made anew, say), nothing tells
+/// it, as [`End::LostState`] tells an owner, and a launch may own the
+/// folder now at the path. On Windows a held guard keeps the folder in
+/// place.
+///
+/// [`Builder::exclusive`]: crate::Builder::exclusive
+#[must_use = "dropping an Exclusive releases the state at once"]
+pub struct Exclusive {
+    state: Option<PathBuf>,
+    held: Holding,
+}
+
+/// What an [`Exclusive`] holds, until it is dropped.
+#[derive(Debug)]
+pub(crate) enum Holding {
+    /// The state folder's guard.
+    Guard(#[allow(dead_code)] sys::Guard),
+    /// Without a guard, the lock in the runtime folder, and the folder.
+    Lock(
+        #[allow(dead_code)] sys::Folder,
+        #[allow(dead_code)] sys::Lock,
+    ),
+}
+
+impl Exclusive {
+    /// For the canonical `state` folder, or none, held by `held`.
+    pub(crate) fn new(state: Option<PathBuf>, held: Holding) -> Exclusive {
+        Exclusive { state, held }
+    }
+
+    /// The state folder given to [`Builder::new`], with its links resolved
+    /// as [`State::dir`] says, or `None` for [`State::none`]. Write the
+    /// state through this path, and only while this `Exclusive` is held.
+    ///
+    /// [`Builder::new`]: crate::Builder::new
+    /// [`State::dir`]: crate::State::dir
+    /// [`State::none`]: crate::State::none
+    pub fn state_dir(&self) -> Option<&Path> {
+        self.state.as_deref()
+    }
+
+    /// Give the state folder up, as dropping this does.
+    pub fn release(self) {
+        drop(self);
+    }
+}
+
+impl fmt::Debug for Exclusive {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Exclusive")
+            .field("state_dir", &self.state_dir())
+            .field("guarded", &matches!(self.held, Holding::Guard(_)))
+            .finish_non_exhaustive()
     }
 }
 
@@ -74,8 +190,9 @@ impl OwnerInfo {
 pub enum End {
     /// [`Owner::stop`] or [`Owner::release`] was called, or the `Owner` was
     /// dropped. After `stop`, launches are told the owner is busy; after a
-    /// drop or `release`, they find nobody listening. If the lock is lost
-    /// afterwards, [`End::LostLock`] replaces it.
+    /// drop or `release`, they find nobody listening. If the lock or the
+    /// state folder is lost afterwards, [`End::LostLock`] or
+    /// [`End::LostState`] replaces it.
     ///
     /// [`Owner::stop`]: crate::Owner::stop
     /// [`Owner::release`]: crate::Owner::release
@@ -84,9 +201,28 @@ pub enum End {
     /// ([`Reason::Declined`]); this process still holds the lock.
     Panicked,
     /// Something deleted the runtime folder under this owner, and another
-    /// process took the lock there before this one could re-create it. That
-    /// process is now the owner: this one must stop writing the state.
+    /// process took the lock there before this one could re-create it. This
+    /// one must stop writing the state. It gives the guard up as it ends, so
+    /// a later launch can own the state folder.
+    ///
+    /// Only an owner that doesn't hold the state folder's
+    /// [guard](crate::Guard) alone ends this way: one that holds none, or
+    /// one with a [scope](crate::Builder::scope), which holds it shared, so
+    /// that a launch of its scope that re-creates the folder takes the guard
+    /// too and owns. An owner that holds it alone waits instead: a launch
+    /// that took the lock in the re-created folder finds the guard held and
+    /// lets go again, and the owner then takes the lock there itself.
     LostLock,
+    /// The state folder was removed or replaced under this owner, which held
+    /// its [guard](crate::Guard): renamed aside and made anew, say. Or the
+    /// guard file was, and another process holds the new one. Another launch
+    /// may own what is at the path now, so this one must stop writing the
+    /// state. It gives up the guard, its socket and the lock as it ends, so
+    /// the next launch can own the folder now at the path. Only an owner
+    /// that holds the guard ends this way. A guard file removed from a state
+    /// folder that is still in place is made and locked again, if nobody
+    /// else holds the new one.
+    LostState,
 }
 
 impl fmt::Display for End {
@@ -95,6 +231,83 @@ impl fmt::Display for End {
             End::Stopped => "stopped",
             End::Panicked => "the handler panicked",
             End::LostLock => "another process took the lock",
+            End::LostState => "the state folder or its guard file was removed or replaced",
+        })
+    }
+}
+
+/// Why a launch may not become the owner: what [`Reason::MayNotOwn`]
+/// carries. The app's [`Kind`] and [`Builder::elevated_owner`] set who may.
+///
+/// It displays as the cause, for messages: `its rights were raised from a
+/// login`.
+///
+/// [`Kind`]: crate::Kind
+/// [`Builder::elevated_owner`]: crate::Builder::elevated_owner
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ineligible {
+    /// It can't show windows, and the app is [windowed]: as from `ssh`,
+    /// cron or a system service. No [`ElevatedOwner`] lets it own.
+    ///
+    /// [windowed]: crate::Kind::Windowed
+    /// [`ElevatedOwner`]: crate::ElevatedOwner
+    NoWindows,
+    /// Its rights were raised from a login, as under `sudo` or, with UAC
+    /// on, Run as administrator, and [`ElevatedOwner::Allow`] wasn't set.
+    ///
+    /// [`ElevatedOwner::Allow`]: crate::ElevatedOwner::Allow
+    Raised,
+    /// It has more rights than a normal process (on Unix, it is root; on
+    /// Windows, its integrity level is above medium, and isn't UIAccess),
+    /// under [`ElevatedOwner::NotAboveNormal`].
+    ///
+    /// [`ElevatedOwner::NotAboveNormal`]: crate::ElevatedOwner::NotAboveNormal
+    AboveNormal,
+}
+
+impl fmt::Display for Ineligible {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Ineligible::NoWindows => "it can't show windows",
+            Ineligible::Raised => "its rights were raised from a login",
+            Ineligible::AboveNormal => "it has more rights than a normal process",
+        })
+    }
+}
+
+/// Why a process may take no part at all: what [`Reason::Excluded`]
+/// carries.
+///
+/// It displays as the cause, for messages: `its real and effective user or
+/// group ids differ`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Excluded {
+    /// On Unix, its real and effective user ids differ, or its real and
+    /// effective group ids do, as in a setuid or setgid program that runs
+    /// with its rights. It has rights its caller lacks, but its caller
+    /// chose its environment and arguments, so it must neither act on
+    /// other launches' requests nor hand its caller's to an owner. Only
+    /// these ids are compared: a set-id program that has set its effective
+    /// ids back to its real ones isn't excluded, though its saved ids may
+    /// let it take its rights back.
+    SetId,
+    /// On Windows, a sandbox confines it: its token is below medium
+    /// integrity, an AppContainer's, or restricted, with restricting SIDs
+    /// that access checks must pass as well. The sandbox keeps it from
+    /// what its user may do, so it must neither hand its requests to the
+    /// user's owner nor own for launches outside the sandbox. A Basic User
+    /// token, as `runas /trustlevel:0x20000` gives, is at medium and has no
+    /// restricting SIDs, so it isn't excluded.
+    Sandboxed,
+}
+
+impl fmt::Display for Excluded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Excluded::SetId => "its real and effective user or group ids differ",
+            Excluded::Sandboxed => "it runs in a sandbox",
         })
     }
 }
@@ -121,12 +334,6 @@ impl fmt::Display for End {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Reason {
-    /// [`Mode::Separate`], and another process owns the app (this one,
-    /// too, if it already holds the lock).
-    ///
-    /// [`Mode::Separate`]: crate::Mode::Separate
-    #[non_exhaustive]
-    OwnerRunning {},
     /// [`Builder::hand_off`] or [`Builder::probe`], and no process owns the
     /// app.
     ///
@@ -136,7 +343,8 @@ pub enum Reason {
     NoOwner {},
     /// The owner turned this launch away: [`Answer::Decline`],
     /// [`Claim::decline_all`], a `Claim` dropped unserved, or an owner whose
-    /// handler panicked earlier.
+    /// handler panicked earlier. Or it refused this launch for a reason
+    /// this build doesn't know, from a later release of this crate.
     ///
     /// [`Answer::Decline`]: crate::Answer::Decline
     #[non_exhaustive]
@@ -149,14 +357,23 @@ pub enum Reason {
         waited: Duration,
     },
     /// An owner holds the lock but didn't take the request before the
-    /// timeout: it hasn't served yet, can't listen, or is hung. The request
-    /// was not delivered, and won't be.
+    /// timeout: it hasn't served yet, can't listen, or is hung. Or an
+    /// [exclusive](crate::Builder::exclusive) run that took the lock
+    /// without a guard holds it, and serves nothing. The request was not
+    /// delivered, and won't be.
     #[non_exhaustive]
     Unresponsive {
         /// How long this launch tried.
         waited: Duration,
     },
-    /// The lock holder is another app: two app ids share a folder.
+    /// The lock holder is another app: the same id of the other [`Kind`],
+    /// another id that shares the folder, or the owner of another state
+    /// folder or scope whose instance folder has the same name, which only
+    /// a hash collision makes. The owner names its app, kind and state when
+    /// a launch connects, so the launch learns this at once and sends
+    /// nothing.
+    ///
+    /// [`Kind`]: crate::Kind
     #[non_exhaustive]
     OtherApp {},
     /// The owner speaks no version of the handoff protocol that this launch
@@ -200,32 +417,115 @@ pub enum Reason {
         /// Why.
         source: BoxError,
     },
-    /// The process at the other end of the owner's socket failed the
-    /// same-user check: another user's, or on Windows the same user's at
-    /// another integrity level. See the crate docs on privileges.
+    /// The owner and this launch failed the same-user check: the socket or
+    /// pipe at this launch's address is another user's, or on Windows its
+    /// address folder or pipe isn't labelled at the integrity level the
+    /// owner's lock shows; or the check found something else wrong or
+    /// couldn't be made. One user at two levels isn't two users: a launch
+    /// at another level than the owner's gets [`Reason::MoreRights`] or
+    /// [`Reason::OwnerHasMoreRights`]. Each end checks the other, and an
+    /// owner that refuses a launch says so at once. See the crate docs on
+    /// privileges.
     #[non_exhaustive]
     Peer {
         /// What the check found.
         source: io::Error,
     },
+    /// This launch has rights the owner lacks, such as a higher integrity
+    /// level. The request wasn't delivered, since the owner would act on it
+    /// without them. [`Builder::hand_down`] lets a launch give them up and
+    /// hand its request down. It returns at once, whatever the
+    /// [timeout](crate::Builder::timeout).
+    ///
+    /// On Windows a launch usually learns this from the marker in the
+    /// owner's lock, before it connects, and then never talks to the owner:
+    /// unlike the owner's greeting, the marker can't show its app, kind or
+    /// state folder. A launch that hands down talks to it all the same.
+    ///
+    /// [`Builder::hand_down`]: crate::Builder::hand_down
+    #[non_exhaustive]
+    MoreRights {
+        /// The owner.
+        owner: OwnerInfo,
+        /// What this launch has and the owner lacks.
+        rights: Rights,
+    },
+    /// The owner has rights this launch lacks, such as a higher integrity
+    /// level. The request wasn't delivered, since the owner would act on it
+    /// with rights its launch never had. It returns at once, and like
+    /// [`Reason::MoreRights`] can come from the owner's marker alone, which
+    /// can't show its app, kind or state folder.
+    #[non_exhaustive]
+    OwnerHasMoreRights {
+        /// The owner.
+        owner: OwnerInfo,
+        /// What the owner has and this launch lacks.
+        rights: Rights,
+    },
+    /// This launch may not become the owner, and nobody it may hand off
+    /// to is running. Or it may not hold the state with
+    /// [`Builder::exclusive`], which never hands off. It never took the
+    /// lock. Only a launch that can show windows may own a [windowed] app,
+    /// though any may hold its state with `exclusive`, and
+    /// [`Builder::elevated_owner`] says which launches with raised rights
+    /// may do either.
+    ///
+    /// [windowed]: crate::Kind::Windowed
+    /// [`Builder::elevated_owner`]: crate::Builder::elevated_owner
+    /// [`Builder::exclusive`]: crate::Builder::exclusive
+    #[non_exhaustive]
+    MayNotOwn {
+        /// Why it may not.
+        why: Ineligible,
+    },
+    /// This process may take no part at all: on Unix, one whose real and
+    /// effective user or group ids differ, as a setuid or setgid program's
+    /// do while it runs with its rights, and on Windows, one that a sandbox
+    /// confines, below medium integrity, in an AppContainer or with a
+    /// restricted token. It neither owns nor hands off, nor holds the state
+    /// with [`Builder::exclusive`]. [`Builder::start`],
+    /// [`Builder::hand_off`], [`Builder::probe`] and `exclusive` return
+    /// this at once, before they look for an owner or make anything. See
+    /// the crate docs on privileges.
+    ///
+    /// [`Builder::start`]: crate::Builder::start
+    /// [`Builder::hand_off`]: crate::Builder::hand_off
+    /// [`Builder::probe`]: crate::Builder::probe
+    /// [`Builder::exclusive`]: crate::Builder::exclusive
+    #[non_exhaustive]
+    Excluded {
+        /// Why it may not.
+        why: Excluded,
+    },
     /// On Linux with systemd: this process has no login session, so the
     /// user's runtime folder (`/run/user/<uid>`) doesn't exist. Launches
-    /// from cron, `@reboot`, `su`, `sudo` or a system service land here. Run
-    /// `loginctl enable-linger` to keep the folder for good, or see the
-    /// crate docs on daemons.
+    /// from cron, `@reboot` or a system service land here. Run `loginctl
+    /// enable-linger` to keep the folder for good, or see the crate docs on
+    /// daemons. Never returned to root, whose folder is fixed, nor from
+    /// [`Builder::hand_off`] or [`Builder::probe`], which look at the state
+    /// folder's [guard](crate::Guard) instead.
+    ///
+    /// [`Builder::hand_off`]: crate::Builder::hand_off
+    /// [`Builder::probe`]: crate::Builder::probe
     #[non_exhaustive]
     NoSession {},
     /// There is no runtime folder to use (Windows without a Local AppData
     /// folder, macOS without a per-user temporary folder, Android without
     /// `TMPDIR`, a Flatpak or snap without `XDG_RUNTIME_DIR`), and
-    /// [`Builder::dir`] wasn't given.
+    /// [`Builder::dir`] wasn't given. Never returned from
+    /// [`Builder::hand_off`] or [`Builder::probe`], which look at the state
+    /// folder's [guard](crate::Guard) instead.
     ///
     /// [`Builder::dir`]: crate::Builder::dir
+    /// [`Builder::hand_off`]: crate::Builder::hand_off
+    /// [`Builder::probe`]: crate::Builder::probe
     #[non_exhaustive]
     NoRuntimeDir {},
     /// The runtime folder can't be created, or isn't safe: not the user's,
-    /// open to others, a symlink, or on Windows made for another integrity
-    /// level. Another user may have created it first.
+    /// open to others, a symlink, or on Windows labelled where not every
+    /// integrity level can use it (above medium, or an instance folder at
+    /// any level but medium) or in the profiles folder outside the user's
+    /// own profile. Another user may have created it first.
     #[non_exhaustive]
     RuntimeDir {
         /// The folder.
@@ -234,13 +534,65 @@ pub enum Reason {
         source: io::Error,
     },
     /// The lock file can't be opened or locked (a file system without
-    /// locks, say).
+    /// locks, say), the missing state folder can't be made, or the state
+    /// folder's [guard](crate::Guard) can't be made, opened or locked (in a
+    /// state folder that is read-only or, on Windows, labelled above medium
+    /// integrity, or a guard file that is another user's).
     #[non_exhaustive]
     Lock {
-        /// The lock file.
+        /// The lock file, the state folder or the guard file.
         path: PathBuf,
         /// What went wrong.
         source: io::Error,
+    },
+    /// Another process holds the state folder. From [`Builder::start`], it
+    /// holds the state folder's [guard](crate::Guard), but not the lock in
+    /// this launch's runtime folder, so this launch can't reach it: an
+    /// owner in another container, one given another [`Builder::dir`], an
+    /// owner of another app id given the same state folder, one whose
+    /// runtime folder was deleted and isn't made again yet, or an
+    /// [exclusive](crate::Builder::exclusive) run. Or one of the two has a
+    /// [scope](crate::Builder::scope) and the other hasn't: owners with
+    /// scopes share the guard only with one another. This launch let go of
+    /// its lock before anyone could connect. Only `start` and `exclusive`
+    /// hold the guard.
+    ///
+    /// From `exclusive`, it is any owner of the state folder, or another
+    /// exclusive run, that holds the guard. Where `exclusive` takes no
+    /// guard, it is an owner or another exclusive run that holds the lock
+    /// in its runtime folder, on Windows at any integrity level.
+    ///
+    /// From [`Builder::hand_off`] and [`Builder::probe`], which found no
+    /// runtime folder to look in, and from a `start` that may not own and
+    /// so looks as they do, it is an exclusive run, or an owner of the state
+    /// folder in another runtime folder, that holds the guard so that
+    /// `start` couldn't take it: any owner, for a launch without a scope,
+    /// and one without a scope, for a launch with one. They take the guard
+    /// for a moment to look, and give it back at once.
+    ///
+    /// [`Builder::dir`]: crate::Builder::dir
+    /// [`Builder::start`]: crate::Builder::start
+    /// [`Builder::hand_off`]: crate::Builder::hand_off
+    /// [`Builder::probe`]: crate::Builder::probe
+    #[non_exhaustive]
+    StateInUse {
+        /// The guard file, or the lock file for an exclusive run that takes
+        /// no guard.
+        path: PathBuf,
+    },
+    /// The state folder, or the folder it would be created in, belongs to
+    /// another user: root given the user's home by `sudo -E`, say. Nothing
+    /// was created. Only [`Builder::start`] and [`Builder::exclusive`]
+    /// check this; see [`Builder::new`].
+    ///
+    /// [`Builder::start`]: crate::Builder::start
+    /// [`Builder::exclusive`]: crate::Builder::exclusive
+    /// [`Builder::new`]: crate::Builder::new
+    #[non_exhaustive]
+    ForeignState {
+        /// The folder that belongs to another user: the state folder, or
+        /// the nearest folder above it that exists.
+        path: PathBuf,
     },
     /// This crate doesn't support the target platform (the web, WASI,
     /// Solaris, iOS and others), so no process can be the owner. An app
@@ -262,7 +614,6 @@ impl Reason {
 impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Reason::OwnerRunning {} => f.write_str("another instance is running"),
             Reason::NoOwner {} => f.write_str("no instance is running"),
             Reason::Declined {} => f.write_str("the running instance turned this launch away"),
             Reason::Busy { waited } => {
@@ -271,7 +622,10 @@ impl fmt::Display for Reason {
             Reason::Unresponsive { waited } => {
                 write!(f, "an instance is running but didn't answer in {waited:?}")
             }
-            Reason::OtherApp {} => f.write_str("another app holds the runtime folder"),
+            Reason::OtherApp {} => f.write_str(
+                "another app, or this one of the other kind or of another state, holds the \
+                 runtime folder",
+            ),
             Reason::WireVersion { ours, theirs } => write!(
                 f,
                 "the running instance speaks handoff protocol {theirs}, this one {ours}"
@@ -289,6 +643,21 @@ impl fmt::Display for Reason {
             }
             Reason::Encode { source } => write!(f, "couldn't encode the request: {source}"),
             Reason::Peer { source } => write!(f, "the running instance isn't ours: {source}"),
+            Reason::MoreRights { owner, rights } => write!(
+                f,
+                "the running instance ({owner}) lacks this launch's {rights}"
+            ),
+            Reason::OwnerHasMoreRights { owner, rights } => write!(
+                f,
+                "the running instance ({owner}) has {rights}, which this launch lacks"
+            ),
+            Reason::MayNotOwn { why } => {
+                write!(f, "this launch may not become the running instance: {why}")
+            }
+            Reason::Excluded { why } => write!(
+                f,
+                "this launch may neither hand off nor become the running instance: {why}"
+            ),
             Reason::NoSession {} => f.write_str(
                 "no login session, so no runtime folder (`loginctl enable-linger` keeps one)",
             ),
@@ -297,6 +666,16 @@ impl fmt::Display for Reason {
                 write!(f, "runtime folder {}: {source}", path.display())
             }
             Reason::Lock { path, source } => write!(f, "lock {}: {source}", path.display()),
+            Reason::StateInUse { path } => write!(
+                f,
+                "an instance this launch can't reach holds the state folder: {}",
+                path.display()
+            ),
+            Reason::ForeignState { path } => write!(
+                f,
+                "the state folder, or the folder it would be created in, belongs to another user: {}",
+                path.display()
+            ),
             Reason::Unsupported {} => {
                 f.write_str("single-instance handoff isn't available on this platform")
             }
@@ -313,5 +692,134 @@ impl Error for Reason {
             | Reason::Lock { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owner(pid: Option<u32>, level: Option<Level>) -> OwnerInfo {
+        OwnerInfo {
+            pid,
+            confirmed: true,
+            level,
+            handed_down: None,
+        }
+    }
+
+    #[test]
+    fn owners_display_their_pid_and_level() {
+        assert_eq!(
+            owner(Some(4242), Some(Level::HIGH)).to_string(),
+            "pid 4242, high"
+        );
+        assert_eq!(owner(Some(4242), None).to_string(), "pid 4242");
+        assert_eq!(
+            owner(None, Some(Level::MEDIUM)).to_string(),
+            "pid unknown, medium"
+        );
+        assert_eq!(owner(None, None).to_string(), "pid unknown");
+    }
+
+    #[test]
+    fn rights_reasons_name_the_owner_and_the_rights() {
+        let more = Reason::MoreRights {
+            owner: owner(Some(4242), Some(Level::MEDIUM)),
+            rights: Rights::Level {
+                launch: Level::HIGH,
+                owner: Level::MEDIUM,
+            },
+        };
+        assert_eq!(
+            more.to_string(),
+            "the running instance (pid 4242, medium) lacks this launch's high integrity"
+        );
+        let fewer = Reason::OwnerHasMoreRights {
+            owner: owner(None, Some(Level::HIGH)),
+            rights: Rights::Level {
+                launch: Level::MEDIUM,
+                owner: Level::HIGH,
+            },
+        };
+        assert_eq!(
+            fewer.to_string(),
+            "the running instance (pid unknown, high) has high integrity, which this launch lacks"
+        );
+        assert!(more.source().is_none() && fewer.source().is_none());
+    }
+
+    #[test]
+    fn ends_say_why() {
+        assert_eq!(End::LostLock.to_string(), "another process took the lock");
+        assert_eq!(
+            End::LostState.to_string(),
+            "the state folder or its guard file was removed or replaced"
+        );
+    }
+
+    #[test]
+    fn foreign_state_names_the_folder() {
+        let reason = Reason::ForeignState {
+            path: PathBuf::from("/home/me"),
+        };
+        assert!(
+            reason.to_string().ends_with("another user: /home/me"),
+            "{reason}"
+        );
+        assert!(reason.source().is_none());
+    }
+
+    #[test]
+    fn state_in_use_names_the_guard() {
+        let reason = Reason::StateInUse {
+            path: PathBuf::from("/home/me/app/.instance-handoff.lock"),
+        };
+        assert_eq!(
+            reason.to_string(),
+            "an instance this launch can't reach holds the state folder: \
+             /home/me/app/.instance-handoff.lock"
+        );
+        assert!(reason.source().is_none());
+    }
+
+    #[test]
+    fn may_not_own_says_why() {
+        let raised = Reason::MayNotOwn {
+            why: Ineligible::Raised,
+        };
+        assert_eq!(
+            raised.to_string(),
+            "this launch may not become the running instance: its rights were raised from a login"
+        );
+        let above = Reason::MayNotOwn {
+            why: Ineligible::AboveNormal,
+        };
+        assert_eq!(
+            above.to_string(),
+            "this launch may not become the running instance: it has more rights than a normal process"
+        );
+        let no_windows = Reason::MayNotOwn {
+            why: Ineligible::NoWindows,
+        };
+        assert_eq!(
+            no_windows.to_string(),
+            "this launch may not become the running instance: it can't show windows"
+        );
+        assert!(raised.source().is_none());
+    }
+
+    #[test]
+    fn excluded_says_why() {
+        let set_id = Reason::Excluded {
+            why: Excluded::SetId,
+        };
+        assert_eq!(
+            set_id.to_string(),
+            "this launch may neither hand off nor become the running instance: its real and \
+             effective user or group ids differ"
+        );
+        assert_eq!(Excluded::Sandboxed.to_string(), "it runs in a sandbox");
+        assert!(set_id.source().is_none());
     }
 }

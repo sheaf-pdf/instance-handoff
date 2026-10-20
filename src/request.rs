@@ -1,6 +1,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::Rights;
+
 /// Window-activation data a launch was started with, so the owner may
 /// raise a window on its behalf.
 ///
@@ -80,6 +82,7 @@ pub struct Request<T> {
     cwd: Option<PathBuf>,
     activation: Activation,
     launcher_pid: Option<u32>,
+    handed_down: Option<Rights>,
     remote: bool,
 }
 
@@ -97,6 +100,7 @@ impl<T> Request<T> {
             cwd: std::env::current_dir().ok(),
             activation: Activation::default(),
             launcher_pid: None,
+            handed_down: None,
             remote: false,
         }
     }
@@ -106,12 +110,14 @@ impl<T> Request<T> {
         cwd: Option<PathBuf>,
         activation: Activation,
         launcher_pid: Option<u32>,
+        handed_down: Option<Rights>,
     ) -> Request<T> {
         Request {
             payload,
             cwd,
             activation,
             launcher_pid,
+            handed_down,
             remote: true,
         }
     }
@@ -153,6 +159,7 @@ impl<T> Request<T> {
             cwd: self.cwd,
             activation: self.activation,
             launcher_pid: self.launcher_pid,
+            handed_down: self.handed_down,
             remote: self.remote,
         }
     }
@@ -190,6 +197,18 @@ impl<T> Request<T> {
         self.launcher_pid
     }
 
+    /// The rights the launch gave up to hand this request down to this
+    /// process, which lacks them ([`Builder::hand_down`]). Don't do what
+    /// would need them; say so instead. They come from the levels Windows
+    /// reports for the launch and for this process, never from what the
+    /// launch says. `None` for a launch with the owner's own rights, and
+    /// for [`Request::local`].
+    ///
+    /// [`Builder::hand_down`]: crate::Builder::hand_down
+    pub fn handed_down(&self) -> Option<&Rights> {
+        self.handed_down.as_ref()
+    }
+
     /// Whether another process sent this request (not [`Request::local`]).
     pub fn is_remote(&self) -> bool {
         self.remote
@@ -203,6 +222,7 @@ impl<T: Clone> Clone for Request<T> {
             cwd: self.cwd.clone(),
             activation: self.activation.clone(),
             launcher_pid: self.launcher_pid,
+            handed_down: self.handed_down.clone(),
             remote: self.remote,
         }
     }
@@ -215,6 +235,7 @@ impl<T: fmt::Debug> fmt::Debug for Request<T> {
             .field("cwd", &self.cwd)
             .field("activation", &self.activation)
             .field("launcher_pid", &self.launcher_pid)
+            .field("handed_down", &self.handed_down)
             .field("remote", &self.remote)
             .finish()
     }

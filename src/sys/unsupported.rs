@@ -8,6 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::level::OwnerLevel;
 use crate::server::Core;
 use crate::{AppId, Payload, Reason};
 
@@ -42,6 +43,34 @@ pub(crate) fn default_place(_: &AppId) -> Result<Place, Reason> {
     Err(Reason::Unsupported {})
 }
 
+pub(crate) fn final_path(_: &Path) -> io::Result<PathBuf> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+pub(crate) fn is_foreign(_: &Path) -> io::Result<bool> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+pub(crate) fn raised() -> bool {
+    false
+}
+
+pub(crate) fn above_normal() -> bool {
+    false
+}
+
+pub(crate) fn level() -> Option<crate::Level> {
+    None
+}
+
+pub(crate) fn excluded() -> Option<crate::Excluded> {
+    None
+}
+
+pub(crate) fn can_show_windows() -> Option<bool> {
+    None
+}
+
 pub(crate) fn open_folder(_: &Place, _: bool) -> Result<Option<Folder>, Reason> {
     Err(Reason::Unsupported {})
 }
@@ -67,7 +96,15 @@ impl Folder {
         unreachable!()
     }
 
-    pub(crate) fn connect(&self, _: Option<Instant>) -> Result<Conn, Connect> {
+    pub(crate) fn owner_level(&self) -> io::Result<OwnerLevel> {
+        unreachable!()
+    }
+
+    pub(crate) fn connect(
+        &self,
+        _: Option<Instant>,
+        _: Option<crate::Level>,
+    ) -> Result<Conn, Connect> {
         unreachable!()
     }
 }
@@ -77,6 +114,25 @@ pub(crate) struct Lock(());
 
 impl Drop for Lock {
     fn drop(&mut self) {}
+}
+
+#[derive(Debug)]
+pub(crate) struct Guard(());
+
+impl Drop for Guard {
+    fn drop(&mut self) {}
+}
+
+pub(crate) fn make_state_dir(_: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+pub(crate) fn take_guard(_: &Path, _: bool) -> Result<Option<Guard>, Reason> {
+    Ok(None)
+}
+
+pub(crate) fn guard_held(_: &Path, _: bool) -> io::Result<bool> {
+    Ok(false)
 }
 
 pub(crate) struct Conn(());
@@ -118,12 +174,16 @@ impl Waker {
 #[derive(Debug)]
 pub(crate) struct Held {
     pub(crate) lock: Option<Lock>,
+    pub(crate) guard: Option<Guard>,
 }
 
 impl Held {
     #[cfg(test)]
     pub(crate) fn detached() -> Held {
-        Held { lock: None }
+        Held {
+            lock: None,
+            guard: None,
+        }
     }
 
     pub(crate) fn unlink_socket(&self) {}
@@ -136,11 +196,15 @@ pub(crate) struct Claimed {
 }
 
 impl Claimed {
-    pub(crate) fn new(_: Folder, _: Lock, _: &AppId) -> Claimed {
+    pub(crate) fn new(_: Folder, _: Lock, _: Option<Guard>, _: &AppId) -> Claimed {
         unreachable!()
     }
 
     pub(crate) fn forked(&self) -> bool {
+        unreachable!()
+    }
+
+    pub(crate) fn guarded(&self) -> bool {
         unreachable!()
     }
 
