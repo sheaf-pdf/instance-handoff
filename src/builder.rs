@@ -178,13 +178,16 @@ pub enum ElevatedOwner {
     /// ([`Ineligible::Raised`]). On Unix that is root whose person is
     /// known and isn't root: `sudo`, `run0`, `pkexec`, `doas`, and on Linux
     /// `su`. Root's own login and systemd's services still own. On Windows
-    /// it is a launch with the full half of a token that UAC split: Run as
-    /// administrator, or Windows `sudo`, with UAC on. An administrator with
-    /// UAC off has no split token, and nor has the built-in Administrator
-    /// unless Admin Approval Mode covers it, so their elevated launches
-    /// still own. An elevated OpenSSH logon owns too if, as expected, its
-    /// token isn't split. See the crate docs on privileges, which also
-    /// cover containers.
+    /// it is a launch with the full half of a token that UAC split, above
+    /// medium integrity: Run as administrator, or Windows `sudo`, with UAC
+    /// on. A medium token made from that half, as
+    /// `runas /trustlevel:0x20000` makes from an elevated shell, isn't
+    /// raised, as on Unix a launch that is no longer root isn't. An
+    /// administrator with UAC off has no split token, and nor has the
+    /// built-in Administrator unless Admin Approval Mode covers it, so
+    /// their elevated launches still own. An elevated OpenSSH logon owns
+    /// too if, as expected, its token isn't split. See the crate docs on
+    /// privileges, which also cover containers.
     ///
     /// [`Ineligible::Raised`]: crate::Ineligible::Raised
     #[default]

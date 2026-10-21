@@ -9,11 +9,18 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use instance_handoff::{AppId, Args, Builder, Claim, Kind, Reason, Started, State};
+use instance_handoff::{AppId, Args, Builder, Claim, ElevatedOwner, Kind, Reason, Started, State};
 
 const APP: AppId = AppId::headless("test.process");
 const ROLE: &str = "INSTANCE_HANDOFF_TEST_ROLE";
 const DIR: &str = "INSTANCE_HANDOFF_TEST_DIR";
+
+/// `Builder::new`, but its launches may own whatever their rights: run as
+/// administrator with UAC on, or under `sudo`, the tests and the owners
+/// they start are raised, and by default wouldn't own.
+fn new_builder(app: AppId, state: impl Into<State>) -> Builder {
+    Builder::new(app, state).elevated_owner(ElevatedOwner::Allow)
+}
 
 /// Not a test: the owner process the other tests start. It serves as
 /// `serve` says, and a request whose first argument is `hang` holds its
@@ -24,7 +31,7 @@ fn owner_process() {
         return;
     }
     let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
-    let claim = match Builder::new(APP, state(&dir))
+    let claim = match new_builder(APP, state(&dir))
         .dir(dir)
         .start(&Args::default())
     {
@@ -45,7 +52,7 @@ fn next_owner_process() {
         return;
     }
     let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
-    let builder = Builder::new(APP, state(&dir)).dir(dir);
+    let builder = new_builder(APP, state(&dir)).dir(dir);
     let probe = builder.clone().timeout(Duration::from_millis(100));
     let mut waiting = false;
     let claim = loop {
@@ -78,7 +85,7 @@ fn exclusive_process() {
         return;
     }
     let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
-    match Builder::new(APP, state(&dir)).dir(dir).exclusive() {
+    match new_builder(APP, state(&dir)).dir(dir).exclusive() {
         Ok(held) => {
             say("held");
             let mut rest = String::new();
@@ -100,7 +107,7 @@ fn fork_owner_process() {
         return;
     };
     let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
-    let claim = match Builder::new(APP, state(&dir))
+    let claim = match new_builder(APP, state(&dir))
         .dir(dir)
         .start(&Args::default())
     {
@@ -151,7 +158,7 @@ fn hang_launch_process() {
         return;
     }
     let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
-    let started = match Builder::new(APP, state(&dir))
+    let started = match new_builder(APP, state(&dir))
         .dir(dir)
         .timeout(Duration::from_secs(20))
         .start(&Args::new(["hang"]))
@@ -378,7 +385,7 @@ fn a_launch_hands_off_to_another_process() {
     let (_tmp, dir) = dir();
     let owner = Owner::start(&dir);
     let args = Args::new([odd_name(), "x".into()]);
-    match Builder::new(APP, state(&dir)).dir(&dir).start(&args) {
+    match new_builder(APP, state(&dir)).dir(&dir).start(&args) {
         Started::HandedOff(info) => {
             assert!(info.confirmed());
             assert_eq!(info.pid(), Some(owner.pid()));
@@ -403,7 +410,7 @@ fn a_launch_of_another_payload_version_is_refused_at_once() {
     let (_tmp, dir) = dir();
     let owner = Owner::start(&dir);
     let t = Instant::now();
-    let reason = match Builder::new(APP, state(&dir))
+    let reason = match new_builder(APP, state(&dir))
         .dir(&dir)
         .payload_version(1)
         .timeout(Duration::from_secs(10))
@@ -435,7 +442,7 @@ fn a_launch_of_the_other_kind_is_refused_at_once() {
     let (_tmp, dir) = dir();
     let owner = Owner::start(&dir);
     let t = Instant::now();
-    let reason = match Builder::new(
+    let reason = match new_builder(
         AppId::parse(APP.as_str(), Kind::Windowed).unwrap(),
         state(&dir),
     )
@@ -464,7 +471,7 @@ fn windowed_launch_process() {
     };
     let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
     let app = AppId::parse(APP.as_str(), Kind::Windowed).unwrap();
-    let builder = Builder::new(app, state(&dir))
+    let builder = new_builder(app, state(&dir))
         .dir(dir)
         .timeout(Duration::from_secs(20));
     if role == "exclusive" {
@@ -559,7 +566,7 @@ fn hidden_launch_process() {
         Kind::Headless
     };
     let app = AppId::parse(APP.as_str(), kind).unwrap();
-    match Builder::new(app, state(&dir))
+    match new_builder(app, state(&dir))
         .dir(dir)
         .timeout(Duration::from_secs(20))
         .start(&Args::default())
@@ -646,7 +653,7 @@ fn launch_process() {
     let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
     // SAFETY: geteuid has no preconditions and can't fail.
     println!("geteuid {}", unsafe { libc::geteuid() });
-    match Builder::new(APP, state(&dir))
+    match new_builder(APP, state(&dir))
         .dir(dir)
         .hand_off(&Args::new(["fakeroot"]))
     {
@@ -730,7 +737,7 @@ fn setgid_launch_process() {
     // SAFETY: getgid and getegid have no preconditions and can't fail.
     let (gid, egid) = unsafe { (libc::getgid(), libc::getegid()) };
     println!("gid {gid} egid {egid}");
-    let builder = Builder::new(APP, state(&dir)).dir(dir);
+    let builder = new_builder(APP, state(&dir)).dir(dir);
     let args = Args::new(["setgid"]);
     let alone = match builder.start(&args) {
         Started::Alone(reason) => Some(reason),
@@ -845,7 +852,7 @@ fn a_setgid_launch_takes_no_part() {
         assert!(lines.contains(&excluded), "{call}: {lines:?}");
     }
     // The first request the owner takes is this one.
-    Builder::new(APP, state(&dir))
+    new_builder(APP, state(&dir))
         .dir(&dir)
         .hand_off(&Args::new(["after"]))
         .unwrap();
@@ -862,7 +869,7 @@ fn a_stopped_owner_never_delivers_a_launch_that_ran_alone() {
     let (_tmp, dir) = dir();
     let owner = Owner::start(&dir);
     owner.suspend();
-    let reason = match Builder::new(APP, state(&dir))
+    let reason = match new_builder(APP, state(&dir))
         .dir(&dir)
         .timeout(Duration::from_millis(400))
         .start(&Args::new(["while-stopped"]))
@@ -878,7 +885,7 @@ fn a_stopped_owner_never_delivers_a_launch_that_ran_alone() {
         "delivered after running alone"
     );
 
-    Builder::new(APP, state(&dir))
+    new_builder(APP, state(&dir))
         .dir(&dir)
         .hand_off(&Args::new(["after"]))
         .unwrap();
@@ -895,7 +902,7 @@ fn a_stopped_owner_never_delivers_a_launch_that_ran_alone() {
 #[test]
 fn an_exclusive_run_in_another_process_is_reported_at_once() {
     let (_tmp, dir) = dir();
-    let builder = Builder::new(APP, state(&dir))
+    let builder = new_builder(APP, state(&dir))
         .dir(&dir)
         .timeout(Duration::from_secs(10));
     let mut held = Owner::spawn(&dir, "exclusive_process", "exclusive");
@@ -933,7 +940,7 @@ fn a_guard_held_by_another_process_is_reported_at_once() {
     let (_tmp, dir) = dir();
     let owner = Owner::start(&dir);
     let t = Instant::now();
-    let reason = match Builder::new(APP, state(&dir))
+    let reason = match new_builder(APP, state(&dir))
         .dir(dir.with_file_name("other"))
         .timeout(Duration::from_secs(10))
         .start(&Args::new(["x"]))
@@ -951,7 +958,7 @@ fn a_killed_owner_hands_the_lock_to_the_next_launch() {
     let (_tmp, dir) = dir();
     let mut owner = Owner::start(&dir);
     owner.kill();
-    match Builder::new(APP, state(&dir))
+    match new_builder(APP, state(&dir))
         .dir(&dir)
         .start(&Args::default())
     {
@@ -967,7 +974,7 @@ fn launches_wait_for_an_owner_that_is_starting() {
     let launch_dir = dir.clone();
     let launch = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(50));
-        Builder::new(APP, state(&launch_dir))
+        new_builder(APP, state(&launch_dir))
             .dir(&launch_dir)
             .timeout(Duration::from_secs(10))
             .hand_off(&Args::new(["early"]))
@@ -989,7 +996,7 @@ fn an_owner_killed_after_the_commit_leaves_the_launch_to_take_over() {
     let mut owner = Owner::start(&dir);
     let launch_dir = dir.clone();
     let launch = std::thread::spawn(move || {
-        Builder::new(APP, state(&launch_dir))
+        new_builder(APP, state(&launch_dir))
             .dir(&launch_dir)
             .timeout(Duration::from_secs(5))
             .start(&Args::new(["hang"]))
@@ -1010,7 +1017,7 @@ fn an_owner_killed_after_the_commit_leaves_a_hand_off_unconfirmed() {
     let mut owner = Owner::start(&dir);
     let launch_dir = dir.clone();
     let launch = std::thread::spawn(move || {
-        Builder::new(APP, state(&launch_dir))
+        new_builder(APP, state(&launch_dir))
             .dir(&launch_dir)
             .timeout(Duration::from_secs(5))
             .hand_off(&Args::new(["hang"]))
@@ -1032,7 +1039,7 @@ fn a_launch_whose_owner_died_is_delivered_at_most_once() {
     // Long, so that the launch still waits for the reply when the owner
     // dies, even if the next owner is slow to start.
     let launch = std::thread::spawn(move || {
-        Builder::new(APP, state(&launch_dir))
+        new_builder(APP, state(&launch_dir))
             .dir(&launch_dir)
             .timeout(Duration::from_secs(20))
             .start(&Args::new(["hang"]))
@@ -1096,7 +1103,7 @@ fn a_fork_child_leaves_the_lock_to_its_parent(role: &str) {
     let (_tmp, dir) = dir();
     let owner = Owner::spawn(&dir, "fork_owner_process", role);
     owner.wait_for("ready");
-    match Builder::new(APP, state(&dir))
+    match new_builder(APP, state(&dir))
         .dir(&dir)
         .start(&Args::new(["x"]))
     {
@@ -1112,7 +1119,7 @@ fn a_fork_child_leaves_the_lock_to_its_parent(role: &str) {
     );
     // The lock is still held: an exclusive run that takes it, with no
     // guard, can't.
-    let reason = Builder::new(APP, state(&dir))
+    let reason = new_builder(APP, state(&dir))
         .dir(&dir)
         .guard(instance_handoff::Guard::Off)
         .exclusive()
@@ -1120,7 +1127,7 @@ fn a_fork_child_leaves_the_lock_to_its_parent(role: &str) {
     assert!(matches!(reason, Reason::StateInUse { .. }), "{reason}");
     // And so is the guard: a launch in another runtime folder finds the
     // state folder in use.
-    let reason = match Builder::new(APP, state(&dir))
+    let reason = match new_builder(APP, state(&dir))
         .dir(dir.with_file_name("other"))
         .start(&Args::default())
     {

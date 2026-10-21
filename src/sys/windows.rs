@@ -412,22 +412,26 @@ fn me() -> io::Result<&'static Identity> {
     mine().map(|me| &me.id)
 }
 
-/// Whether a token of this elevation type has rights raised from a login:
-/// it is the full half of a token that UAC split, as Run as administrator
-/// and Windows `sudo` give an administrator. A token that UAC didn't split
-/// isn't, though it may be at high integrity: any administrator's with UAC
-/// off, the built-in Administrator's (RID 500) unless Admin Approval Mode
-/// covers it, and, as expected but not yet measured, an elevated OpenSSH
-/// logon's. Nor is a type this doesn't know, or one that couldn't be read,
-/// since this only keeps launches from owning.
-fn raised_from(elevation: Option<TOKEN_ELEVATION_TYPE>) -> bool {
-    elevation == Some(TokenElevationTypeFull)
+/// Whether a token of this elevation type and integrity level has rights
+/// raised from a login: it is the full half of a token that UAC split, as
+/// Run as administrator and Windows `sudo` give an administrator, and is
+/// still above medium. A medium token made from that half, as SAFER and
+/// `runas /trustlevel:0x20000` make from an elevated shell, keeps its
+/// elevation type, but its rights were lowered again, as on Unix a launch
+/// that is no longer root isn't raised. A token that UAC didn't split
+/// isn't either, though it may be at high integrity: any administrator's
+/// with UAC off, the built-in Administrator's (RID 500) unless Admin
+/// Approval Mode covers it, and, as expected but not yet measured, an
+/// elevated OpenSSH logon's. Nor is a type this doesn't know, or one that
+/// couldn't be read, since this only keeps launches from owning.
+fn raised_from(elevation: Option<TOKEN_ELEVATION_TYPE>, level: crate::Level) -> bool {
+    elevation == Some(TokenElevationTypeFull) && level > crate::Level::MEDIUM
 }
 
 /// Whether this launch's rights were raised from a login: its token is
-/// the full half of a split one.
+/// the full half of a split one, above medium.
 pub(crate) fn raised() -> bool {
-    mine().is_ok_and(|me| raised_from(me.elevation))
+    mine().is_ok_and(|me| raised_from(me.elevation, crate::Level::from_rid(me.id.integrity)))
 }
 
 /// Whether this launch has more rights than a normal process: its
@@ -4059,40 +4063,49 @@ mod tests {
         assert_ne!(unsafe { IsTokenRestricted(restricted.as_raw_handle()) }, 0);
     }
 
-    // Only the full half of a token that UAC split is raised.
+    // Only the full half of a token that UAC split is raised, and only
+    // while it is above medium.
     #[test]
     fn raised_launches() {
+        use crate::Level;
         use windows_sys::Win32::Security::{TokenElevationTypeDefault, TokenElevationTypeLimited};
         let (full, limited, default) = (
             Some(TokenElevationTypeFull),
             Some(TokenElevationTypeLimited),
             Some(TokenElevationTypeDefault),
         );
-        // (launch, elevation type, raised)
+        let (medium, high) = (Level::MEDIUM, Level::HIGH);
+        // (launch, elevation type, level, raised)
         let rows = [
-            ("Run as administrator, UAC on", full, true),
-            ("Windows sudo", full, true),
-            ("an administrator's normal launch", limited, false),
-            ("the built-in Administrator (RID 500)", default, false),
-            ("RID 500 under Admin Approval Mode, elevated", full, true),
-            ("an administrator, UAC off", default, false),
-            ("an elevated OpenSSH logon, as expected", default, false),
-            ("a standard user", default, false),
-            ("a type Windows might add", Some(4), false),
-            ("unread", None, false),
+            ("Run as administrator, UAC on", full, high, true),
+            ("Windows sudo", full, high, true),
+            ("an administrator's normal launch", limited, medium, false),
+            ("a medium token made from a full one", full, medium, false),
+            ("the built-in Administrator (RID 500)", default, high, false),
+            ("RID 500 elevated in Admin Approval Mode", full, high, true),
+            ("an administrator, UAC off", default, high, false),
+            ("elevated OpenSSH logon, as expected", default, high, false),
+            ("a standard user", default, medium, false),
+            ("a type Windows might add", Some(4), high, false),
+            ("unread", None, high, false),
         ];
-        for (launch, elevation, raised) in rows {
-            assert_eq!(raised_from(elevation), raised, "{launch}: {elevation:?}");
+        for (launch, elevation, level, raised) in rows {
+            assert_eq!(
+                raised_from(elevation, level),
+                raised,
+                "{launch}: {elevation:?} at {level}"
+            );
         }
     }
 
     // The elevation type is read, and raised and above_normal agree with
     // facts read apart from it: only a split token has a linked half, and
-    // only its full half is elevated; the tests run at medium, or at high
-    // or above. On CI's runner both tokens are unsplit, of the default
-    // type: the built-in Administrator's at high, and the SAFER token of
-    // the medium run (docs/design/0015-windows-measurements.md). So
-    // neither run is raised there, and only the high one is above normal.
+    // only its full half is elevated, which is raised above medium; the
+    // tests run at medium, or at high or above. On CI's runner both tokens
+    // are unsplit, of the default type: the built-in Administrator's at
+    // high, and the SAFER token of the medium run
+    // (docs/design/0015-windows-measurements.md). So neither run is raised
+    // there, and only the high one is above normal.
     // Only a machine with UAC on has a full token to show.
     #[test]
     fn the_tests_elevation_type_is_read() {
@@ -4136,7 +4149,11 @@ mod tests {
         let elevated = elevation_info.TokenIsElevated != 0;
         let facts = format!("type {elevation}, split {split}, elevated {elevated}, {level}");
         assert_eq!(split, elevation != TokenElevationTypeDefault, "{facts}");
-        assert_eq!(raised(), split && elevated, "{facts}");
+        assert_eq!(
+            raised(),
+            split && elevated && level > Level::MEDIUM,
+            "{facts}"
+        );
 
         if level == Level::MEDIUM {
             assert!(!above_normal(), "{facts}");

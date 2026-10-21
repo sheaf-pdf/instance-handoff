@@ -397,11 +397,13 @@
 //! a login, by a daemon such as Docker's. A container started from `sudo`
 //! with no user namespace keeps the login user id, so its root counts as
 //! raised. On Windows that is a launch with the full half of a token that
-//! UAC split, as Run as administrator and Windows `sudo` give an
-//! administrator with UAC on. An administrator with UAC off has no split
-//! token, and nor has the built-in Administrator (RID 500) unless Admin
-//! Approval Mode covers it, so their elevated launches still own when no
-//! owner runs, and normal launches then run alone with
+//! UAC split, above medium integrity, as Run as administrator and Windows
+//! `sudo` give an administrator with UAC on. A medium token made from that
+//! half, as `runas /trustlevel:0x20000` makes from an elevated shell,
+//! isn't raised: its rights were lowered again. An administrator with UAC
+//! off has no split token, and nor has the built-in Administrator (RID
+//! 500) unless Admin Approval Mode covers it, so their elevated launches
+//! still own when no owner runs, and normal launches then run alone with
 //! [`Reason::OwnerHasMoreRights`]. An elevated OpenSSH logon owns too if,
 //! as expected, its token isn't split. Under
 //! [`ElevatedOwner::NotAboveNormal`] none of these own: on Windows no
