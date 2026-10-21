@@ -635,8 +635,8 @@ fn a_panicking_handler_ends_the_owner_and_declines_later_launches() {
 
 #[test]
 fn a_launch_that_gave_up_is_never_delivered_later() {
-    // Sheaf's bug 11: the launch runs alone, and the owner must not open
-    // the same files once it gets to them.
+    // The launch runs alone, and the owner must not open the same files
+    // once it gets to them.
     let dir = dir();
     let claim = claim(builder(&dir).start(&Args::default()));
     let reason = alone(builder(&dir).timeout(SHORT).start(&args(&["gave-up"])));

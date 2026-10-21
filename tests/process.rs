@@ -865,7 +865,8 @@ fn a_setgid_launch_takes_no_part() {
 #[cfg(unix)]
 #[test]
 fn a_stopped_owner_never_delivers_a_launch_that_ran_alone() {
-    // Sheaf's bug 11, from a suspended owner (Ctrl-Z, SIGSTOP, a debugger).
+    // An owner suspended (Ctrl-Z, SIGSTOP, a debugger) while a launch gives
+    // up must not deliver it once it resumes.
     let (_tmp, dir) = dir();
     let owner = Owner::start(&dir);
     owner.suspend();

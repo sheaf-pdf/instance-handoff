@@ -1,6 +1,6 @@
 # 0015. One owner per state; rights and placement decided separately
 
-**Status:** Accepted with changes, 2026-10-18, by the maintainer. Built, 2026-10-20: on `migrate-to-0015` in the slices of [docs/impl/0015-plan.md](../impl/0015-plan.md), merged into main as 046ded6, whose CI passed on Linux, macOS, Windows at high and medium integrity, and Rust 1.85. A run under real UAC then confirmed the Windows layout and narrowed what counts as raised there (row 4); see [0015-windows-measurements.md](0015-windows-measurements.md). It supersedes [0012](0012-privilege-levels.md), whose principle it keeps, and [0013](0013-root-on-linux.md). The calls on the review's twelve questions are under "The maintainer's calls".
+**Status:** Accepted with changes, 2026-10-18, by the maintainer. Built, 2026-10-20: on `migrate-to-0015` in the slices of [docs/impl/0015-plan.md at 042c264](https://github.com/sheaf-pdf/instance-handoff/blob/042c264a21f7b8969bf24d3eacd169532cdc5b6b/docs/impl/0015-plan.md), merged into main as 046ded6, whose CI passed on Linux, macOS, Windows at high and medium integrity, and Rust 1.85. A run under real UAC then confirmed the Windows layout and narrowed what counts as raised there (row 4); see [0015-windows-measurements.md](0015-windows-measurements.md). It supersedes [0012](0012-privilege-levels.md), whose principle it keeps, and [0013](0013-root-on-linux.md). The calls on the review's twelve questions are under "The maintainer's calls".
 
 ## Context
 
@@ -58,7 +58,7 @@ The review's full API sketch, including the staged parts, is in [0015-api-sketch
 
 ## Consequences
 
-- `Builder::new` takes the state, and `AppId` gains a kind. `Mode` goes. `launcher_pid` stays for 0.1 (call 9.4 in [docs/impl/0015-calls.md](../impl/0015-calls.md)).
+- `Builder::new` takes the state, and `AppId` gains a kind. `Mode` goes. `launcher_pid` stays for 0.1 (call 9.4 in [docs/impl/0015-calls.md at 042c264](https://github.com/sheaf-pdf/instance-handoff/blob/042c264a21f7b8969bf24d3eacd169532cdc5b6b/docs/impl/0015-calls.md)).
 - A `.instance-handoff.lock` file appears in the app's state folder. Folders that sync tools manage need `Guard::Off`.
 - A shell whose environment points at another state folder gets an owner of its own. Each owner is still the only writer of its state.
 - Apps must never replace their state folder, or the owner ends with `End::LostState`.
