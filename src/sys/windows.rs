@@ -415,15 +415,18 @@ fn me() -> io::Result<&'static Identity> {
 /// Whether a token of this elevation type and integrity level has rights
 /// raised from a login: it is the full half of a token that UAC split, as
 /// Run as administrator and Windows `sudo` give an administrator, and is
-/// still above medium. A medium token made from that half, as SAFER and
-/// `runas /trustlevel:0x20000` make from an elevated shell, keeps its
-/// elevation type, but its rights were lowered again, as on Unix a launch
-/// that is no longer root isn't raised. A token that UAC didn't split
-/// isn't either, though it may be at high integrity: any administrator's
-/// with UAC off, the built-in Administrator's (RID 500) unless Admin
-/// Approval Mode covers it, and, as expected but not yet measured, an
-/// elevated OpenSSH logon's. Nor is a type this doesn't know, or one that
-/// couldn't be read, since this only keeps launches from owning.
+/// still above medium. A medium token made from that half with SAFER, as
+/// the levels tests' children are, keeps its elevation type, but its
+/// rights were lowered again, as on Unix a launch that is no longer root
+/// isn't raised. `runas /trustlevel:0x20000` from an elevated shell makes
+/// no such token: it keeps high integrity, so it is raised, since an
+/// owner there would turn later normal launches away. A token that UAC
+/// didn't split isn't raised, though it may be at high integrity: any
+/// administrator's with UAC off, the built-in Administrator's (RID 500)
+/// unless Admin Approval Mode covers it, and, as expected but not yet
+/// measured, an elevated OpenSSH logon's. Nor is a type this doesn't
+/// know, or one that couldn't be read, since this only keeps launches
+/// from owning.
 fn raised_from(elevation: Option<TOKEN_ELEVATION_TYPE>, level: crate::Level) -> bool {
     elevation == Some(TokenElevationTypeFull) && level > crate::Level::MEDIUM
 }
@@ -445,8 +448,9 @@ pub(crate) fn above_normal() -> bool {
 /// take no part, if it may not: a sandbox confines it. It runs below
 /// medium integrity (at low, as every AppContainer does, or untrusted), in
 /// an AppContainer, or with restricting SIDs. A Basic User token, which
-/// SAFER makes as `runas /trustlevel:0x20000` does, is at medium and has
-/// none, so it takes part.
+/// SAFER makes as `runas /trustlevel:0x20000` does, has none, and keeps
+/// the level of the token it was made from, so made from a normal or an
+/// elevated one, it takes part.
 fn excluded_from(integrity: u32, sandbox: Sandbox) -> Option<crate::Excluded> {
     (integrity < MEDIUM || sandbox.app_container || sandbox.restricted)
         .then_some(crate::Excluded::Sandboxed)

@@ -3,8 +3,9 @@
 //! These need a process at high integrity, which can start children at
 //! medium: GitHub's Windows runner is one (an administrator with UAC off).
 //! The children get the Basic User token that `runas /trustlevel:0x20000`
-//! uses: the same user, with Administrators deny-only, no admin privileges
-//! and medium integrity, as an unelevated launch has. One test lowers that
+//! uses, lowered to medium integrity (runas keeps the level it is run at):
+//! the same user, with Administrators deny-only, no admin privileges and
+//! medium integrity, as an unelevated launch has. One test lowers that
 //! token to low instead, as a sandbox runs. Real UAC (a split token,
 //! consent, Windows `sudo`) needs a machine with UAC on. Below high
 //! integrity, each test returns at once.

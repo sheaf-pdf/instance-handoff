@@ -298,8 +298,9 @@ pub enum Excluded {
     /// that access checks must pass as well. The sandbox keeps it from
     /// what its user may do, so it must neither hand its requests to the
     /// user's owner nor own for launches outside the sandbox. A Basic User
-    /// token, as `runas /trustlevel:0x20000` gives, is at medium and has no
-    /// restricting SIDs, so it isn't excluded.
+    /// token, as `runas /trustlevel:0x20000` gives, has no restricting
+    /// SIDs, and keeps the level of the token it was made from, so made
+    /// from a normal or an elevated one, it isn't excluded.
     Sandboxed,
 }
 
