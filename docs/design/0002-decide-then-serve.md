@@ -1,6 +1,6 @@
 # 0002. Decide before the event loop exists, serve after
 
-**Status:** Accepted in part, 2026-10-18, by the maintainer. Built on `api-0.1`. Accepted: the shape, meaning `start`, `Claim`, `serve`, a handler that only forwards, and non-exhaustive `Reason` and `End`. The `Builder`'s arguments, such as the state and `Mode`, follow [0015](0015-state-keyed-identity.md).
+**Status:** Accepted in part, 2026-10-18, by the maintainer. Built on `api-0.1`. Accepted: the shape, meaning `start`, `Claim`, `serve`, a handler that only forwards, and non-exhaustive `Reason` and `End`. The `Builder`'s arguments follow [0015](0015-state-keyed-identity.md), built on `migrate-to-0015` (2026-10-20): `Builder::new` takes the state, and `exclusive()` replaces `Mode`.
 
 ## Context
 
@@ -10,7 +10,7 @@ A launch should know whether it owns before it opens a window, starts a GPU cont
 
 ## Decision
 
-- `Builder::new(id)`, configured with `scope`, `dir`, `mode`, `timeout` and `payload_version`, ends in `start(&payload)`, `hand_off(&payload)` or `probe()`.
+- `Builder::new(id, state)`, configured with `scope`, `dir`, `guard`, `elevated_owner`, `hand_down`, `timeout` and `payload_version`, ends in `start(&payload)`, `hand_off(&payload)`, `probe()` or `exclusive()`. `exclusive()`, which holds the state for batch work and serves nothing, replaces `Mode::Separate` ([0015](0015-state-keyed-identity.md)).
 - `start` returns `Started::{Owner(Claim), HandedOff(OwnerInfo), Alone(Reason)}` and starts no thread.
 - A `Claim` holds the lock and the listening socket. `serve(handler)` or `decline_all()` turns it into an `Owner`. Launches that arrive in between wait.
 - The handler runs on the crate's one thread and only forwards: `FnMut(Request) -> Answer`, or `-> bool`, so `tx.send(r).is_ok()` is a complete handler.

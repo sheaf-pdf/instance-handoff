@@ -1,6 +1,6 @@
 # 0011. Named pipes on Windows, with seven controls
 
-**Status:** Accepted, 2026-10-18, by the maintainer. Built on `api-0.1`. Control 7 follows [0012](0012-privilege-levels.md) and [0015](0015-state-keyed-identity.md).
+**Status:** Accepted, 2026-10-18, by the maintainer. Built on `api-0.1`. Controls 6 and 7 follow [0015](0015-state-keyed-identity.md), built on `migrate-to-0015` (2026-10-20).
 
 ## Context
 
@@ -15,8 +15,8 @@ Named pipes, with seven controls:
 3. A protected DACL that grants access only to the user's SID, with an explicit owner.
 4. A mandatory label at the owner's integrity level (no-write-up, no-read-up).
 5. `PIPE_REJECT_REMOTE_CLIENTS`.
-6. The client opens with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`, and checks that the pipe's owner SID is its own, and the pipe's label its own level, before sending anything.
-7. A handoff across integrity levels is refused both ways ([0012](0012-privilege-levels.md)). `AllowSetForegroundWindow` names the owner's pid, never `ASFW_ANY`.
+6. The client opens with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`, and checks that the pipe's owner SID is its own, and the pipe's label the level that the owner's marker in `instance.lock` shows, before sending anything. That is its own level, or with `hand_down` a lower one.
+7. A request never goes up a level, and goes down only when the app sets `hand_down`. Otherwise a launch at another level is refused at once, with `MoreRights` or `OwnerHasMoreRights` ([0015](0015-state-keyed-identity.md)). `AllowSetForegroundWindow` names the owner's pid, never `ASFW_ANY`.
 
 ## Why
 
@@ -27,6 +27,6 @@ Named pipes, with seven controls:
 ## Consequences
 
 - About 450 lines of overlapped I/O on `windows-sys`.
-- It passes Windows CI at high and medium integrity, and passed on a Windows 11 machine with UAC on (2026-10-18).
+- It passes Windows CI at high and medium integrity, and passed on a Windows 11 machine with UAC on (2026-10-18, and as 0015 built it on 2026-10-20).
 - Remote means another computer, reached through file sharing. Launches from SSH, Remote Desktop and RDS or AVD sessions on the same machine are local, and reach the pipe.
 - [0016](0016-windows-address-file.md) has the owner keep `instance.pipe` open, so a delete can't remove it.

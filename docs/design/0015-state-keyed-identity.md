@@ -1,6 +1,6 @@
 # 0015. One owner per state; rights and placement decided separately
 
-**Status:** Accepted with changes, 2026-10-18, by the maintainer. Not built yet. It supersedes [0012](0012-privilege-levels.md), whose principle it keeps, and [0013](0013-root-on-linux.md). The calls on the review's twelve questions are under "The maintainer's calls".
+**Status:** Accepted with changes, 2026-10-18, by the maintainer. Built, 2026-10-20: on `migrate-to-0015` in the slices of [docs/impl/0015-plan.md](../impl/0015-plan.md), merged into main as 046ded6, whose CI passed on Linux, macOS, Windows at high and medium integrity, and Rust 1.85. A run under real UAC then confirmed the Windows layout and narrowed what counts as raised there (row 4); see [0015-windows-measurements.md](0015-windows-measurements.md). It supersedes [0012](0012-privilege-levels.md), whose principle it keeps, and [0013](0013-root-on-linux.md). The calls on the review's twelve questions are under "The maintainer's calls".
 
 ## Context
 
@@ -13,7 +13,7 @@ A review then traced 90 scenarios: `sudo` and `su`, root logins, terminal servic
 Three separate decisions, in place of one folder rule:
 
 1. **Ownership.** Two launches are the same instance when they share the app id and its kind (windowed or headless), the user, the canonical state folder (or both `State::none()`) and the scope. That set names the instance folder. The owner also holds a guard lock inside the state folder. On one host, no difference in integrity level, session, display or namespace makes a second owner of that state.
-2. **Rights.** Only kernel-attested facts decide admission. A request never goes to another user and never goes up. It goes down only when the app sets `hand_down`, and the owner is told what was given up. Otherwise the launch gets `MoreRights` or `OwnerHasMoreRights` at once, naming the owner. A raised launch (Windows full elevation; Unix root reached through `sudo`, `su`, `doas`, `pkexec` or `run0`) doesn't own by default.
+2. **Rights.** Only kernel-attested facts decide admission. A request never goes to another user and never goes up. It goes down only when the app sets `hand_down`, and the owner is told what was given up. Otherwise the launch gets `MoreRights` or `OwnerHasMoreRights` at once, naming the owner. A raised launch (on Windows the full half of a split token, above medium integrity; Unix root reached through `sudo`, `su`, `doas`, `pkexec` or `run0`) doesn't own by default.
 3. **Placement.** A windowed app's `start` delivers only where the request's window would appear, and never to another person the kernel can tell apart. This is behaviour, not contract, so it is staged for 0.2.
 
 For 0.1:
@@ -36,7 +36,7 @@ Staged for 0.2: screens and persons, completion (`--wait`) and Linux capabilitie
 | 1 | What makes two launches one instance | Accepted |
 | 2 | Windows: one lock per state, shared by every integrity level | Accepted. Its precondition was measured on CI and under real UAC ([0015-windows-measurements.md](0015-windows-measurements.md)) |
 | 3 | An elevated launch meets a normal owner | Accepted: `MoreRights` at once, and `hand_down` as an app's opt-in |
-| 4 | Whether a raised launch may own when nobody does | Accepted: `ElevatedOwner::NotRaised` by default. This adopts, for owning, the exception 0013 deferred. The evidence is installers that start the app elevated from their finish page |
+| 4 | Whether a raised launch may own when nobody does | Accepted: `ElevatedOwner::NotRaised` by default. This adopts, for owning, the exception 0013 deferred. The evidence is installers that start the app elevated from their finish page. On 2026-10-20, after the run under real UAC, the maintainer narrowed raised on Windows to the full half of a split token above medium integrity. A medium token made from that half with SAFER keeps the elevation type, but its rights were lowered again, as on Unix a launch that is no longer root isn't raised. `runas /trustlevel:0x20000` from an elevated shell keeps high integrity, with Administrators deny-only, and stays raised: what decides is the level, since an owner at high would turn later normal launches away |
 | 5 | Root on Linux | Changed: root gets the fixed folder `/run/instance-handoff`, but a raised launch of a windowed app isn't refused a root owner. Whether it should be waits for placement in 0.2 |
 | 6 | Windowed or headless | Accepted, reworded: a kind says who may become the owner, not whether the owner shows windows. Windowed: only a launch that can show windows. Headless: any launch, including a daemon that opens windows for its clients, as Emacs's does. Most single-instance apps are GUIs; a case the two kinds don't fit is revisited when an app needs it |
 | 7 | `exclusive()` replaces `Mode` | Accepted |
@@ -58,7 +58,7 @@ The review's full API sketch, including the staged parts, is in [0015-api-sketch
 
 ## Consequences
 
-- `Builder::new` takes the state, and `AppId` gains a kind. `Mode` and `launcher_pid` go.
+- `Builder::new` takes the state, and `AppId` gains a kind. `Mode` goes. `launcher_pid` stays for 0.1 (call 9.4 in [docs/impl/0015-calls.md](../impl/0015-calls.md)).
 - A `.instance-handoff.lock` file appears in the app's state folder. Folders that sync tools manage need `Guard::Off`.
 - A shell whose environment points at another state folder gets an owner of its own. Each owner is still the only writer of its state.
 - Apps must never replace their state folder, or the owner ends with `End::LostState`.
@@ -68,4 +68,5 @@ The review's full API sketch, including the staged parts, is in [0015-api-sketch
   - A medium process could open, write and lock a high process's file labelled medium or not labelled at all. It could lock a file labelled high (no-write-up) through a read-only handle, but not write it. A high no-read-up label shut it out.
   - Byte-range locks conflicted across levels in both directions, so each level reads the other's level byte correctly.
   - With UAC on, what high makes is owned by Administrators, not the user as on the runner. That changed none of the results. Access comes from the access list and the label; being the owner only adds the right to read and change the access list.
+- Under real UAC on 2026-10-20, the layout as the crate builds it carried one label per object, all owned by the user: the instance folder and `instance.lock` labelled medium, `run` labelled medium for what is made in it, and the guard labelled medium. A launch run as administrator got `MoreRights` from a medium owner, handed down when asked, and with nobody owning got `MayNotOwn { Raised }` and made nothing.
 - So the lock file must be made like the crate's folders are: with an explicit access list for the user, not one inherited from wherever the state lives, and with a medium label or none. It must never sit in, or inherit from, a folder labelled for a higher level.

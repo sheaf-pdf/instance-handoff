@@ -380,8 +380,9 @@
 //!   an AppContainer, or with a restricted token, which has restricting
 //!   SIDs. The sandbox keeps it from what its user may do, so it must
 //!   neither reach the user's owner nor own for launches outside the
-//!   sandbox. A Basic User token, as `runas /trustlevel:0x20000` gives, is
-//!   at medium and has no restricting SIDs, so it takes part.
+//!   sandbox. A Basic User token, as `runas /trustlevel:0x20000` gives,
+//!   has no restricting SIDs, and keeps the level of the token it was made
+//!   from, so made from a normal or an elevated one, it takes part.
 //!
 //! A launch whose rights were raised from a login hands off to its level's
 //! owner, but by default never becomes it ([`Builder::elevated_owner`]):
@@ -397,8 +398,12 @@
 //! a login, by a daemon such as Docker's. A container started from `sudo`
 //! with no user namespace keeps the login user id, so its root counts as
 //! raised. On Windows that is a launch with the full half of a token that
-//! UAC split, as Run as administrator and Windows `sudo` give an
-//! administrator with UAC on. An administrator with UAC off has no split
+//! UAC split, above medium integrity, as Run as administrator and Windows
+//! `sudo` give an administrator with UAC on. A medium token made from that
+//! half with SAFER isn't raised: its rights were lowered again. But
+//! `runas /trustlevel:0x20000` from an elevated shell keeps high
+//! integrity, so its launches are: an owner at high would turn later
+//! normal launches away. An administrator with UAC off has no split
 //! token, and nor has the built-in Administrator (RID 500) unless Admin
 //! Approval Mode covers it, so their elevated launches still own when no
 //! owner runs, and normal launches then run alone with

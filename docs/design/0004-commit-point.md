@@ -24,6 +24,6 @@ A fault-injection prototype on Linux ran 520 scenarios twice. No rule based on t
 ## Consequences
 
 - Each launch ends in exactly one of three ways: handed off (the request delivered at most once), alone (no owner delivers it), or owner.
-- The one gap is an owner that dies after its handler took a request but before REPLY. The launch then owns or hands off again, so work the dead owner had started may be done twice. This is documented under Guarantees.
+- The one gap is an owner that dies after its handler took a request but before REPLY. The launch then owns or hands off again, so work the dead owner had started may be done twice. This is documented under Guarantees. Tests in `tests/process.rs` kill an owner after the commit and check that the launch reports an unconfirmed handoff or takes over, and is delivered at most once (a5ca503).
 - If a handler panics mid-request, the launch reports an unconfirmed handoff, not alone, because the request may already have been acted on.
 - Timeouts under 100 ms count as 100 ms. A launch blocks for at most its timeout plus the greater of the timeout and 1 s.

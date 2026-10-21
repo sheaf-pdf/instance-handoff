@@ -17,4 +17,4 @@ These mistakes are easy to make and hard to see. With the lock held, a mistake p
 ## Consequences
 
 - A process that really wants to step down must call `release()`.
-- The lock is held per open file and is inherited across `fork`. A forked child that drops its copy must not release the parent's lock: the drop sees it is a forked copy and touches nothing. No test covers this yet.
+- The lock is held per open file and is inherited across `fork`. A forked child that drops its copy must not release the parent's lock: the drop sees it is a forked copy and touches nothing. Tests in `tests/process.rs` fork an owner and check that the child's drop, or its `release()`, leaves the parent's lock (a5ca503).

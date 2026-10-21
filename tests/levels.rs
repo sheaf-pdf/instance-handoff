@@ -3,8 +3,9 @@
 //! These need a process at high integrity, which can start children at
 //! medium: GitHub's Windows runner is one (an administrator with UAC off).
 //! The children get the Basic User token that `runas /trustlevel:0x20000`
-//! uses: the same user, with Administrators deny-only, no admin privileges
-//! and medium integrity, as an unelevated launch has. One test lowers that
+//! uses, lowered to medium integrity (runas keeps the level it is run at):
+//! the same user, with Administrators deny-only, no admin privileges and
+//! medium integrity, as an unelevated launch has. One test lowers that
 //! token to low instead, as a sandbox runs. Real UAC (a split token,
 //! consent, Windows `sudo`) needs a machine with UAC on. Below high
 //! integrity, each test returns at once.
@@ -457,10 +458,11 @@ fn a_low_launch_is_excluded() {
 // runs alone at once with MayNotOwn, and exclusive fails with it, both
 // making nothing. Beside a medium owner, start hands off as hand_off
 // does: MoreRights, or with hand_down the request handed down. By default
-// only a raised launch, with the full half of a split token, is kept from
-// owning: CI's runner, the built-in Administrator, isn't raised, so the
-// expectations come from this process's own token, and only a machine
-// with UAC on shows the raised case.
+// only a raised launch, with the full half of a split token above medium,
+// is kept from owning: CI's runner, the built-in Administrator, isn't
+// raised, so the expectations come from this process's own token, and
+// only a machine with UAC on shows the raised case. The medium child made
+// from that token keeps its elevation type, but isn't raised, so it owns.
 #[test]
 fn raised_and_not_above_normal_at_high() {
     if !elevated() {
@@ -972,7 +974,8 @@ fn at_high(id: AppId, state: impl Into<State>) -> Builder {
 }
 
 /// Whether this process's token is the full half of a split one, as Run
-/// as administrator gives with UAC on: the crate counts it as raised.
+/// as administrator gives with UAC on: at high, where the tests that read
+/// it run, the crate counts it as raised.
 fn full_token() -> bool {
     let token = own_token();
     // SAFETY: the class's information is a TOKEN_ELEVATION_TYPE, a number.

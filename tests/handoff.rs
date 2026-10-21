@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use instance_handoff::{
-    AppId, Args, Builder, Claim, ElevatedOwner, End, Guard, Kind, Level, Owner, Reason, Request,
-    Started, State,
+    AppId, Args, Builder, Claim, ElevatedOwner, End, Guard, Ineligible, Kind, Level, Owner, Reason,
+    Request, Started, State,
 };
 
 const APP: AppId = AppId::headless("test.handoff");
@@ -39,9 +39,21 @@ fn state(dir: &Dir) -> State {
 }
 
 fn builder(dir: &Dir) -> Builder {
+    plain(dir).elevated_owner(ElevatedOwner::Allow)
+}
+
+/// A builder with the default policy for raised launches.
+fn plain(dir: &Dir) -> Builder {
     Builder::new(APP, state(dir))
         .dir(&dir.path)
         .timeout(Duration::from_secs(3))
+}
+
+/// `Builder::new`, but its launches may own whatever their rights: run as
+/// administrator with UAC on, or under `sudo`, the tests are raised, and
+/// by default wouldn't own.
+fn new_builder(app: AppId, state: impl Into<State>) -> Builder {
+    Builder::new(app, state).elevated_owner(ElevatedOwner::Allow)
 }
 
 /// What the crate makes of a folder that exists: its links resolved, and
@@ -287,7 +299,7 @@ fn an_exclusive_run_without_a_guard_takes_the_lock() {
     assert!(rx.try_recv().is_err());
     owner.release();
 
-    let none = Builder::new(APP, State::none())
+    let none = new_builder(APP, State::none())
         .dir(&dir.path)
         .timeout(SHORT);
     let held = none.exclusive().unwrap();
@@ -300,14 +312,15 @@ fn an_exclusive_run_without_a_guard_takes_the_lock() {
     claim(none.start(&Args::default())).release();
 }
 
-// The tests don't run raised, so Allow and the default policy both own
-// and hand off as launches always have.
+// Allow and the default policy both hand off to an owner at their level,
+// raised or not. Not raised, as on CI, the default owns as launches
+// always have; raised, it runs alone at once.
 #[test]
 fn allow_owns_and_hands_off_as_before() {
     let dir = dir();
-    let allow = builder(&dir).elevated_owner(ElevatedOwner::Allow);
+    let allow = builder(&dir);
     let (owner, rx) = serve(claim(allow.start(&args(&["one"]))));
-    for launch in [allow, builder(&dir)] {
+    for launch in [allow, plain(&dir)] {
         let info = match launch.start(&args(&["two"])) {
             Started::HandedOff(info) => info,
             other => panic!("{other:?}"),
@@ -316,7 +329,14 @@ fn allow_owns_and_hands_off_as_before() {
         assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["two"]));
     }
     owner.release();
-    claim(builder(&dir).start(&Args::default())).release();
+    match plain(&dir).start(&Args::default()) {
+        Started::Owner(claim) => claim.release(),
+        Started::Alone(Reason::MayNotOwn {
+            why: Ineligible::Raised,
+            ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
 }
 
 // Every launch here is at the owner's level, so hand_down changes
@@ -408,7 +428,7 @@ fn without_a_runtime_folder_hand_off_and_probe_look_at_the_guard() {
     // Under Guard::Off, or with no state folder, there is no guard to look
     // at.
     nobody(&unkeyed.clone().guard(Guard::Off));
-    nobody(&Builder::new(APP, State::none()).dir(&missing));
+    nobody(&new_builder(APP, State::none()).dir(&missing));
     owner.release();
 
     let a = claim(builder(&dir).scope("a").start(&Args::default()));
@@ -561,7 +581,7 @@ fn mismatches_are_reported_at_once() {
         "{reason}"
     );
     let reason = alone(
-        Builder::new(AppId::headless("test.other"), state(&dir))
+        new_builder(AppId::headless("test.other"), state(&dir))
             .dir(&dir.path)
             .start(&Args::default()),
     );
@@ -570,7 +590,7 @@ fn mismatches_are_reported_at_once() {
     // the kind differs.
     let t = Instant::now();
     let reason = alone(
-        Builder::new(
+        new_builder(
             AppId::parse(APP.as_str(), Kind::Windowed).unwrap(),
             state(&dir),
         )
@@ -1033,7 +1053,7 @@ fn an_owner_whose_state_folder_was_replaced_ends_with_lost_state() {
     );
     assert_eq!(first.ended(), Some(End::LostState));
     let aside = claim(
-        Builder::new(APP, State::dir(&old))
+        new_builder(APP, State::dir(&old))
             .dir(&dir.path)
             .start(&Args::default()),
     );
@@ -1160,7 +1180,7 @@ fn the_owner_reports_its_state_folder_with_links_resolved() {
     owner.release();
 
     let none = self::claim(
-        Builder::new(APP, State::none())
+        new_builder(APP, State::none())
             .dir(&dir.path)
             .start(&Args::default()),
     );
@@ -1177,7 +1197,7 @@ fn a_state_folder_named_through_a_link_is_reported_where_it_is() {
     let link = dir.tmp.path().join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let claim = claim(
-        Builder::new(APP, link.join("app"))
+        new_builder(APP, link.join("app"))
             .dir(&dir.path)
             .start(&Args::default()),
     );
@@ -1193,7 +1213,7 @@ fn a_state_folder_named_through_a_link_is_reported_where_it_is() {
 #[test]
 fn each_state_folder_has_an_owner_of_its_own() {
     let dir = dir();
-    let other = Builder::new(APP, dir.tmp.path().join("other")).dir(&dir.path);
+    let other = new_builder(APP, dir.tmp.path().join("other")).dir(&dir.path);
     let a = claim(builder(&dir).start(&Args::default()));
     let b = claim(other.start(&Args::default()));
     assert_ne!(a.dir(), b.dir());
@@ -1217,11 +1237,11 @@ fn launches_that_name_one_state_folder_through_a_link_meet() {
     let link = dir.tmp.path().join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let (owner, rx) = serve(claim(
-        Builder::new(APP, real.join("app"))
+        new_builder(APP, real.join("app"))
             .dir(&dir.path)
             .start(&Args::default()),
     ));
-    let info = match Builder::new(APP, link.join("app"))
+    let info = match new_builder(APP, link.join("app"))
         .dir(&dir.path)
         .start(&args(&["x"]))
     {
@@ -1230,7 +1250,7 @@ fn launches_that_name_one_state_folder_through_a_link_meet() {
     };
     assert!(info.confirmed());
     assert_eq!(rx.recv_timeout(SHORT).unwrap().payload(), &args(&["x"]));
-    Builder::new(APP, link.join("app"))
+    new_builder(APP, link.join("app"))
         .dir(&dir.path)
         .probe()
         .unwrap();
@@ -1278,7 +1298,7 @@ fn guard_off_and_no_state_take_no_guard() {
     off.release();
 
     let none = claim(
-        Builder::new(APP, State::none())
+        new_builder(APP, State::none())
             .dir(&dir.path)
             .start(&Args::default()),
     );
@@ -1346,8 +1366,8 @@ fn launches_of_the_owners_state_and_scope_pass_its_check() {
         builder(&dir),
         builder(&dir).scope("work"),
         builder(&dir).scope("x".repeat(5000)),
-        Builder::new(APP, State::none()).dir(&dir.path),
-        Builder::new(APP, State::none()).dir(&dir.path).scope(""),
+        new_builder(APP, State::none()).dir(&dir.path),
+        new_builder(APP, State::none()).dir(&dir.path).scope(""),
     ] {
         let (owner, rx) = serve(claim(b.start(&Args::default())));
         assert!(b.probe().unwrap().confirmed());
@@ -1399,7 +1419,7 @@ fn a_slow_handler_leaves_the_launch_handed_off_unconfirmed() {
 
 #[test]
 fn a_relative_folder_is_made_absolute() {
-    let dir = Builder::new(APP, State::none())
+    let dir = new_builder(APP, State::none())
         .dir("run")
         .runtime_dir()
         .unwrap();

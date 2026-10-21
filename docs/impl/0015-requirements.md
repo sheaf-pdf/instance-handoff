@@ -42,7 +42,7 @@ Keep `Builder::scope(impl AsRef<OsStr>)`. The key is hashed with the canonical s
 
 *api; all. Source: 0015 Decision 2, For 0.1 bullet 3, call 4 (NotRaised default); sketch ElevatedOwner; notes 'Who may own'.*
 
-`Builder::elevated_owner(ElevatedOwner)` and `#[non_exhaustive] #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] pub enum ElevatedOwner { #[default] NotRaised, NotAboveNormal, Allow }`, documented as in sketch lines 205-225. NotRaised: Windows TokenElevationTypeFull, and Unix root whose person is known and isn't root, don't own; RID 500, UAC off, an elevated OpenSSH logon and root's own login still own. NotAboveNormal: also no owner above medium, though UIAccess (0x2010) may own. Allow: any eligible launch owns, and later normal launches get OwnerHasMoreRights.
+`Builder::elevated_owner(ElevatedOwner)` and `#[non_exhaustive] #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] pub enum ElevatedOwner { #[default] NotRaised, NotAboveNormal, Allow }`, documented as in sketch lines 205-225. NotRaised: Windows TokenElevationTypeFull above medium, and Unix root whose person is known and isn't root, don't own; RID 500, UAC off, an elevated OpenSSH logon and root's own login still own. NotAboveNormal: also no owner above medium, though UIAccess (0x2010) may own. Allow: any eligible launch owns, and later normal launches get OwnerHasMoreRights.
 
 ## R08. Builder::exclusive() and Exclusive
 
@@ -216,7 +216,7 @@ A start that may not own never takes the runtime lock. It hands off where it may
 
 *behaviour; Unix, Windows. Source: 0015 Decision 2, call 4; 0013 'Deferred' (adopted for owning); notes plan step 3; sketch ElevatedOwner::NotRaised doc.*
 
-On Windows a launch is raised when its TokenElevationType is TokenElevationTypeFull. RID 500, UAC off and an elevated OpenSSH logon (TokenElevationTypeDefault) are not raised. On Unix it is euid 0, by the raw syscall, with a known person who isn't root: SUDO_UID, PKEXEC_UID, DOAS_USER (a name resolved to a uid) and, on Linux, /proc/self/loginuid when it isn't the unset value 4294967295. Root's own login is not raised. This only restricts owning; it never admits. A pure function over gathered facts (like linux_rule) makes it table-testable.
+On Windows a launch is raised when its TokenElevationType is TokenElevationTypeFull and its integrity level is above medium (the maintainer's call of 2026-10-20; a medium token made from a full one isn't raised). RID 500, UAC off and an elevated OpenSSH logon (TokenElevationTypeDefault) are not raised. On Unix it is euid 0, by the raw syscall, with a known person who isn't root: SUDO_UID, PKEXEC_UID, DOAS_USER (a name resolved to a uid) and, on Linux, /proc/self/loginuid when it isn't the unset value 4294967295. Root's own login is not raised. This only restricts owning; it never admits. A pure function over gathered facts (like linux_rule) makes it table-testable.
 
 ## R37. Detecting whether a launch can show windows (windowed kind)
 
