@@ -1,6 +1,6 @@
 # 0009. What two builds share is frozen at 0.1
 
-**Status:** Accepted in part, 2026-10-18, by the maintainer. Accepted: only a major release of this crate changes what two builds share. What is on that list follows [0015](0015-state-keyed-identity.md), and nothing is frozen until 0.1 ships. With 0015 built (2026-10-20), the list below is complete. The Windows layout went on it only after a run under real UAC ([0015-windows-measurements.md](0015-windows-measurements.md)).
+**Status:** Accepted in part, 2026-10-18, by the maintainer. Accepted: only a major release of this crate changes what two builds share. What is on that list follows [0015](0015-state-keyed-identity.md), and nothing is frozen until 0.1 ships. With 0015 built (2026-10-20), the list below is complete. The Windows layout went on it only after a run under real UAC ([0015-windows-measurements.md](0015-windows-measurements.md)). The maintainer's call of 2026-10-20: 0.1.0's alphas, from 0.1.0-alpha.1, are published so that sheaf can move to the crate, and may still change the list where that move shows they must; the changelog says when. It's frozen from 0.1.0.
 
 ## Context
 
