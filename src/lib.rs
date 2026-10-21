@@ -537,7 +537,8 @@
 //! # The contract between builds
 //!
 //! Two builds of one app may use different releases of this crate, so what
-//! they share is fixed, and only a major release changes it:
+//! they share is fixed. From 0.1.0 only a major release changes it; before
+//! then an alpha may, and its changelog entry says so. It is:
 //!
 //! - the folder rule above, and the instance folder's name: `i-` and 16
 //!   lowercase hex digits of the FNV-1a 64 hash of the state folder, as

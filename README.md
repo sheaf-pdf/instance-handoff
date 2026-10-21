@@ -42,10 +42,13 @@ fn main() {
 
 ## Status
 
-Not published yet. The API was reworked from sheaf's `sheaf-instance` after a pre-release review, then reworked again around the app's state ([0015](docs/design/0015-state-keyed-identity.md)). `Cargo.toml` keeps `publish = false` until:
+0.1.0-alpha.1 is an alpha. The API was reworked from sheaf's `sheaf-instance` after a pre-release review, then reworked again around the app's state ([0015](docs/design/0015-state-keyed-identity.md)), and it's published so that sheaf can move to it. Until 0.1.0, an alpha may change the API, and even what two builds share ([0009](docs/design/0009-contract-between-builds.md)), where sheaf's move shows it must; the changelog says when. 0.1.0 follows once sheaf has moved and the maintainers have reviewed the API.
 
-- sheaf has moved to the new API;
-- the maintainers have reviewed the new API.
+Cargo counts a later alpha as compatible, so pin the one you build against:
+
+```toml
+instance-handoff = "=0.1.0-alpha.1"
+```
 
 CI runs the tests on Linux, macOS and Windows, on Windows at high and at medium integrity. Its Windows runner is an administrator with UAC off, so no launch there has a split token, and the Windows layout was also checked by hand on a machine with UAC on ([measurements](docs/design/0015-windows-measurements.md)).
 

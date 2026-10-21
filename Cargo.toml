@@ -1,6 +1,6 @@
 [package]
 name = "instance-handoff"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -10,8 +10,6 @@ keywords = ["single-instance", "single-process", "singleton", "ipc", "desktop"]
 categories = ["os", "gui", "command-line-interface"]
 # Only what users need, so local tooling files can't end up in the package.
 include = ["/src", "/README.md", "/CHANGELOG.md", "/LICENSE-*"]
-# Until sheaf uses the new API and the maintainers have reviewed it.
-publish = false
 
 [features]
 # `Json<T>`: any serde type as a payload.

@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-alpha.1 (2026-10-20)
 
-The first release as a crate of its own, reworked from sheaf's `sheaf-instance` after a pre-release review, then reworked again around the app's state. It no longer meets `sheaf-instance` builds on the same lock, on any platform: the lock moved into a folder named after the state. So during an upgrade an old and a new build can each be an owner until the old one quits.
+The first release as a crate of its own, and an alpha: until 0.1.0, an alpha may change the API, and what two builds share. Reworked from sheaf's `sheaf-instance` after a pre-release review, then reworked again around the app's state. It no longer meets `sheaf-instance` builds on the same lock, on any platform: the lock moved into a folder named after the state. So during an upgrade an old and a new build can each be an owner until the old one quits.
 
 - **API.** `Builder::new(app, state)` takes the app id and the folder the app keeps its state in (`State::dir`, or `State::none` for an app that keeps no files). It is configured with `scope`, `dir`, `guard`, `elevated_owner`, `hand_down`, `timeout` and `payload_version`, and ends in `start`, `hand_off`, `probe` or `exclusive`. `start` returns `Started::{Owner(Claim), HandedOff(OwnerInfo), Alone(Reason)}`, and a `Claim` is served with a handler (`claim.serve(|r| tx.send(r).is_ok())`) once the app has somewhere to send requests. `AppId::windowed` and `AppId::headless` give an app id its kind. `exclusive` holds the state for batch work and serves nothing; it replaces the first draft's `Mode`, `Builder::mode` and `Reason::OwnerRunning`. No `futures` or `serde` in the public API.
 - **Payloads.** The `Payload` trait, implemented for `Args` (argv, lossless), `Vec<u8>`, `String`, `()`, and `Json<T>` with the `serde` feature. The launch's working directory and activation tokens travel beside every payload.

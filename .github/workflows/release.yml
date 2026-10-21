@@ -9,6 +9,10 @@ name: Release
 # tag that commit and push the tag:
 #
 #   git tag -a v0.1.0 -m "instance-handoff 0.1.0" && git push origin v0.1.0
+#
+# crates.io lets only a crate that exists trust a workflow, so the first
+# version was published by hand, from main. A tag for a version crates.io
+# already has is checked and tested, but not published again.
 
 on:
   push:
@@ -22,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      published: ${{ steps.published.outputs.published }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,6 +47,16 @@ jobs:
           fi
       - name: Test
         run: cargo test --locked --all-features
+      - name: See whether crates.io has this version
+        id: published
+        run: |
+          if curl -sf https://index.crates.io/in/st/instance-handoff \
+            | jq -e --arg v "${GITHUB_REF_NAME#v}" 'select(.vers == $v)' >/dev/null; then
+            echo "::notice::${GITHUB_REF_NAME#v} is already on crates.io, so it isn't published again."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # Any step in a job that may request an identity token could publish with
   # it, so this job runs nothing but the checkout, the token exchange and
@@ -49,6 +65,7 @@ jobs:
   publish:
     name: Publish to crates.io
     needs: check
+    if: needs.check.outputs.published == 'false'
     runs-on: ubuntu-latest
     environment: release
     permissions:
