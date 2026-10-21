@@ -1,6 +1,6 @@
 # 0001. Scope: funnel every launch into one owning process
 
-**Status:** Accepted, 2026-10-18, by the maintainer.
+**Status:** Accepted, 2026-10-18, by the maintainer. Built for 0.1, 2026-10-20, with [0015](0015-state-keyed-identity.md).
 
 ## Context
 
@@ -14,7 +14,7 @@ In scope:
 
 - deciding, at each launch, whether this process owns, hands off, or has to run alone, and saying why;
 - carrying a launch's request to the owner losslessly and exactly once, or not at all;
-- deciding which launches count as the same instance (the same user, at the same privilege level, in the same runtime folder), correctly across the ways programs get launched: terminals, desktops, `sudo`, SSH, remote desktops, services, CI, containers.
+- deciding which launches count as the same instance (since [0015](0015-state-keyed-identity.md), the same app, user, state folder and scope), correctly across the ways programs get launched: terminals, desktops, `sudo`, SSH, remote desktops, services, CI, containers.
 
 Out of scope, for now or for good:
 

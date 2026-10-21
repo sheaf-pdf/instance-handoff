@@ -10,7 +10,7 @@ keywords = ["single-instance", "single-process", "singleton", "ipc", "desktop"]
 categories = ["os", "gui", "command-line-interface"]
 # Only what users need, so local tooling files can't end up in the package.
 include = ["/src", "/README.md", "/CHANGELOG.md", "/LICENSE-*"]
-# Until the maintainers have reviewed the new API and Windows has run in CI.
+# Until sheaf uses the new API and the maintainers have reviewed it.
 publish = false
 
 [features]

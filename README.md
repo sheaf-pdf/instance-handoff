@@ -44,9 +44,10 @@ fn main() {
 
 Not published yet. The API was reworked from sheaf's `sheaf-instance` after a pre-release review, then reworked again around the app's state ([0015](docs/design/0015-state-keyed-identity.md)). `Cargo.toml` keeps `publish = false` until:
 
-- the Windows layout has been checked by hand on a machine with UAC on. CI runs the tests on Windows at high and at medium integrity, but its runner is an administrator with UAC off, so no launch there has a split token;
 - sheaf has moved to the new API;
 - the maintainers have reviewed the new API.
+
+CI runs the tests on Linux, macOS and Windows, on Windows at high and at medium integrity. Its Windows runner is an administrator with UAC off, so no launch there has a split token, and the Windows layout was also checked by hand on a machine with UAC on ([measurements](docs/design/0015-windows-measurements.md)).
 
 ## How it works
 

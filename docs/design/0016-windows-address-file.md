@@ -38,4 +38,4 @@ A Windows test deletes the app's folder recursively under a running owner, with 
 - Nobody can delete the app's runtime folder while the app runs. That was already so because of the lock file; now the owner also stays reachable after an attempt.
 - A program that opens `instance.pipe` to write or delete it while the owner runs gets a sharing violation. Programs that only read it are unaffected.
 - Unix can't do this, because a file held open can still be unlinked. There the gap stays as 0008 records, including a possible second owner for up to a minute. Whether to check more often there is a separate decision.
-- If [0015](0015-state-keyed-identity.md) changes the layout, the same rule applies to whichever file names the pipe.
+- Under [0015](0015-state-keyed-identity.md)'s layout the file is `instance.pipe` in the address folder of the owner's level (`run` or `run-high` in the instance folder), and the owner holds it the same way.

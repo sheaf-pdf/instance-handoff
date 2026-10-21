@@ -8,7 +8,7 @@
 
 ## Decision
 
-- Call `flock(LOCK_EX | LOCK_NB)` on Unix and `LockFileEx` on Windows directly, and never write to the lock file.
+- Call `flock(LOCK_EX | LOCK_NB)` on Unix and `LockFileEx` on Windows directly, and never write to the lock file. The state folder's guard ([0015](0015-state-keyed-identity.md)) uses the same calls and is never written either: shared (`LOCK_SH`, or a shared `LockFileEx` on its byte 2^31) for owners with a scope.
 - On a target without a lock that this crate trusts (wasm, WASI, Solaris and others), the crate still compiles, every type is usable, and launches return `Reason::Unsupported`.
 - The minimum Rust version is 1.85.
 

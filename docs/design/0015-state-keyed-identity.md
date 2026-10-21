@@ -1,6 +1,6 @@
 # 0015. One owner per state; rights and placement decided separately
 
-**Status:** Accepted with changes, 2026-10-18, by the maintainer. Not built yet. It supersedes [0012](0012-privilege-levels.md), whose principle it keeps, and [0013](0013-root-on-linux.md). The calls on the review's twelve questions are under "The maintainer's calls".
+**Status:** Accepted with changes, 2026-10-18, by the maintainer. Built, 2026-10-20: on `migrate-to-0015` in the slices of [docs/impl/0015-plan.md](../impl/0015-plan.md), merged into main as 046ded6, whose CI passed on Linux, macOS, Windows at high and medium integrity, and Rust 1.85. A run under real UAC then confirmed the Windows layout and narrowed what counts as raised there (row 4); see [0015-windows-measurements.md](0015-windows-measurements.md). It supersedes [0012](0012-privilege-levels.md), whose principle it keeps, and [0013](0013-root-on-linux.md). The calls on the review's twelve questions are under "The maintainer's calls".
 
 ## Context
 
@@ -58,7 +58,7 @@ The review's full API sketch, including the staged parts, is in [0015-api-sketch
 
 ## Consequences
 
-- `Builder::new` takes the state, and `AppId` gains a kind. `Mode` and `launcher_pid` go.
+- `Builder::new` takes the state, and `AppId` gains a kind. `Mode` goes. `launcher_pid` stays for 0.1 (call 9.4 in [docs/impl/0015-calls.md](../impl/0015-calls.md)).
 - A `.instance-handoff.lock` file appears in the app's state folder. Folders that sync tools manage need `Guard::Off`.
 - A shell whose environment points at another state folder gets an owner of its own. Each owner is still the only writer of its state.
 - Apps must never replace their state folder, or the owner ends with `End::LostState`.
@@ -68,4 +68,5 @@ The review's full API sketch, including the staged parts, is in [0015-api-sketch
   - A medium process could open, write and lock a high process's file labelled medium or not labelled at all. It could lock a file labelled high (no-write-up) through a read-only handle, but not write it. A high no-read-up label shut it out.
   - Byte-range locks conflicted across levels in both directions, so each level reads the other's level byte correctly.
   - With UAC on, what high makes is owned by Administrators, not the user as on the runner. That changed none of the results. Access comes from the access list and the label; being the owner only adds the right to read and change the access list.
+- Under real UAC on 2026-10-20, the layout as the crate builds it carried one label per object, all owned by the user: the instance folder and `instance.lock` labelled medium, `run` labelled medium for what is made in it, and the guard labelled medium. A launch run as administrator got `MoreRights` from a medium owner, handed down when asked, and with nobody owning got `MayNotOwn { Raised }` and made nothing.
 - So the lock file must be made like the crate's folders are: with an explicit access list for the user, not one inherited from wherever the state lives, and with a medium label or none. It must never sit in, or inherit from, a folder labelled for a higher level.

@@ -40,5 +40,5 @@ Decisions about how one app uses the crate, such as sheaf's app id, belong in th
 | [0012](0012-privilege-levels.md) | Hand off only within one user and privilege level | Superseded by 0015 |
 | [0013](0013-root-on-linux.md) | No special case for root or `sudo` on Linux | Superseded by 0015 |
 | [0014](0014-process-ids.md) | Process ids come from the OS, never from the peer | Accepted |
-| [0015](0015-state-keyed-identity.md) | One owner per state; rights and placement decided separately | Accepted with changes, not built |
+| [0015](0015-state-keyed-identity.md) | One owner per state; rights and placement decided separately | Accepted with changes, built |
 | [0016](0016-windows-address-file.md) | The Windows owner keeps its address file open | Accepted, built |
