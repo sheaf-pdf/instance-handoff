@@ -462,7 +462,8 @@ fn a_launch_of_the_other_kind_is_refused_at_once() {
 /// `windowed_launch` starts with the display it is given. It serves if it
 /// owns, and otherwise prints how it started. When ROLE is `exclusive`, it
 /// is an exclusive run instead: it prints `exclusive` and `held`, releasing
-/// the state folder at once, or why it failed.
+/// the state folder at once, or why it failed. When ROLE is `try_own`, it
+/// prints `try_own` and `owned`, releasing at once, or why it failed.
 #[cfg(target_os = "linux")]
 #[test]
 fn windowed_launch_process() {
@@ -484,6 +485,16 @@ fn windowed_launch_process() {
         }
         return;
     }
+    if role == "try_own" {
+        match builder.try_own::<Args>() {
+            Ok(claim) => {
+                say("try_own owned");
+                claim.release();
+            }
+            Err(reason) => say(&format!("try_own failed: {reason:?}")),
+        }
+        return;
+    }
     match builder.start(&Args::new(["windowed"])) {
         Started::Owner(claim) => serve(claim, false),
         Started::HandedOff(info) => say(&format!(
@@ -495,7 +506,8 @@ fn windowed_launch_process() {
     }
 }
 
-/// A `windowed_launch_process` in `role`, `windowed` or `exclusive`, whose
+/// A `windowed_launch_process` in `role`, `windowed`, `exclusive` or
+/// `try_own`, whose
 /// only display variable is `DISPLAY` set to `display`, or which has none.
 #[cfg(target_os = "linux")]
 fn windowed_launch(dir: &Path, role: &str, display: Option<&str>) -> Owner {
@@ -509,9 +521,10 @@ fn windowed_launch(dir: &Path, role: &str, display: Option<&str>) -> Owner {
 
 // Only a launch that can show windows owns a windowed app: on Linux, one
 // with a display variable. One without runs alone at once, creating
-// nothing, or hands off to the owner. No display server is needed, since
-// nothing connects to it. An exclusive run serves no launches, so one
-// without a display variable still holds the state folder.
+// nothing, or hands off to the owner, and a try_own without one fails at
+// once, creating nothing. No display server is needed, since nothing
+// connects to it. An exclusive run serves no launches, so one without a
+// display variable still holds the state folder.
 #[cfg(target_os = "linux")]
 #[test]
 fn only_a_launch_that_can_show_windows_owns_a_windowed_app() {
@@ -525,6 +538,13 @@ fn only_a_launch_that_can_show_windows_owns_a_windowed_app() {
     // Child included, well inside its 20 second timeout.
     assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     assert!(!dir.exists());
+    let tried = windowed_launch(&dir, "try_own", None);
+    assert_eq!(
+        tried.said("try_own ", Duration::from_secs(10)).as_deref(),
+        Some("failed: MayNotOwn { why: NoWindows }")
+    );
+    assert!(!dir.exists() && !dir.with_file_name("state").exists());
+    drop(tried);
     let held = windowed_launch(&dir, "exclusive", None);
     assert_eq!(
         held.said("exclusive ", Duration::from_secs(10)).as_deref(),

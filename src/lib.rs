@@ -110,9 +110,9 @@
 //!   with fewer unless the app lets the launch hand it down
 //!   ([`Builder::hand_down`]). It never goes to another user. Both ends
 //!   check the other: see [Privileges](#privileges).
-//! - [`Builder::start`], [`Builder::hand_off`], [`Builder::probe`] and
-//!   [`Builder::exclusive`] never panic, whatever the
-//!   [timeout](Builder::timeout). Every failure is a [`Reason`], and
+//! - [`Builder::start`], [`Builder::try_own`], [`Builder::hand_off`],
+//!   [`Builder::probe`] and [`Builder::exclusive`] never panic, whatever
+//!   the [timeout](Builder::timeout). Every failure is a [`Reason`], and
 //!   failures that waiting can't fix return at once.
 //!
 //! # The state
@@ -131,9 +131,10 @@
 //!   letter belongs to one logon session, and a launch run as
 //!   administrator with UAC on has a logon session of its own (see
 //!   [Containers and sandboxes](#containers-and-sandboxes)).
-//! - The folder needn't exist: a [`Builder::start`] that takes the lock,
-//!   and [`Builder::exclusive`], make it when it is missing, private,
-//!   whether or not they take the guard.
+//! - The folder needn't exist: a [`Builder::start`] or
+//!   [`Builder::try_own`] that takes the lock, and [`Builder::exclusive`],
+//!   make it when it is missing, private, whether or not they take the
+//!   guard.
 //! - A launch that the app's function gives another folder gets another
 //!   owner. If the function follows the environment, as
 //!   `dirs::config_dir()` follows `HOME` and `XDG_CONFIG_HOME` on Unix, a
@@ -173,6 +174,10 @@
 //!   import, a cron job or a CI step, holds it with [`Builder::exclusive`]
 //!   (see its example). That serves no launches, and while it is held no
 //!   launch owns the state folder (see [`Exclusive`] for the exceptions).
+//! - **A new instance.** A `--new-instance` flag, or a developer build run
+//!   beside the app, uses [`Builder::try_own`]: it owns when nothing else
+//!   does, and otherwise runs alone, handing nothing off and writing no
+//!   state.
 //! - **Front ends.** Commands that only make sense against a running app,
 //!   such as `status`, `stop` or `--remote open`, use [`Builder::probe`]
 //!   and [`Builder::hand_off`], which never own: see
@@ -198,8 +203,9 @@
 //!   their timeout.
 //! - `start` creates no thread. A [`Claim`] is a held lock and a listening
 //!   socket, nothing more; [`Claim::serve`] and [`Claim::decline_all`] start
-//!   the crate's one thread, named after the app id. [`Builder::exclusive`]
-//!   never waits for the state folder and creates no thread.
+//!   the crate's one thread, named after the app id. [`Builder::try_own`]
+//!   never waits for an owner, nor [`Builder::exclusive`] for the state
+//!   folder, and neither creates a thread.
 //! - The handler given to [`Claim::serve`] runs on that thread, one call at
 //!   a time, and is dropped there. It must not block: send the [`Request`]
 //!   to a channel or an event-loop proxy and return. Use a send that can't
@@ -373,8 +379,9 @@
 //!
 //! A process that has rights its caller lacks, or that a sandbox confines,
 //! takes no part at all. Its launches run alone at once with
-//! [`Reason::Excluded`], and [`Builder::hand_off`], [`Builder::probe`] and
-//! [`Builder::exclusive`] fail with it, before they look for an owner:
+//! [`Reason::Excluded`], and [`Builder::try_own`], [`Builder::hand_off`],
+//! [`Builder::probe`] and [`Builder::exclusive`] fail with it, before they
+//! look for an owner:
 //!
 //! - On Unix, a process whose real and effective user or group ids differ,
 //!   as a setuid or setgid program's do while it runs with its rights. Its
@@ -393,7 +400,8 @@
 //! A launch whose rights were raised from a login hands off to its level's
 //! owner, but by default never becomes it ([`Builder::elevated_owner`]):
 //! with no owner running, it runs alone at once with
-//! [`Reason::MayNotOwn`], and [`Builder::exclusive`] fails with it. On
+//! [`Reason::MayNotOwn`], and [`Builder::try_own`] and
+//! [`Builder::exclusive`] fail with it. On
 //! Unix that is root whose person is known and isn't root: `SUDO_UID`
 //! names them (`sudo`, `run0`), or `PKEXEC_UID` (`pkexec`), `DOAS_USER`
 //! (`doas`), or on Linux the login user id that `su` keeps

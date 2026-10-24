@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **API.** `Builder::try_own()` owns when nobody does, and otherwise fails at once with `StateInUse`, handing nothing off: for `--new-instance` flags and developer builds that run beside the app but should own when nothing else does. `exclusive`'s docs no longer suggest it for `--new-instance`.
 - **Docs.** A shorter README. "The state" warns that a launch with a stripped environment can compute another state folder, and so get an owner of its own.
 - **Reasons.** `StateInUse` reads "another process holds the state folder", which fits `exclusive` too: it never tries to reach the process.
 

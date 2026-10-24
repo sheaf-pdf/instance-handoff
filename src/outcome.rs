@@ -464,15 +464,16 @@ pub enum Reason {
         rights: Rights,
     },
     /// This launch may not become the owner, and nobody it may hand off
-    /// to is running. Or it may not hold the state with
-    /// [`Builder::exclusive`], which never hands off. It never took the
-    /// lock. Only a launch that can show windows may own a [windowed] app,
-    /// though any may hold its state with `exclusive`, and
+    /// to is running. Or it may not own with [`Builder::try_own`], or hold
+    /// the state with [`Builder::exclusive`], which never hand off. It
+    /// never took the lock. Only a launch that can show windows may own a
+    /// [windowed] app, though any may hold its state with `exclusive`, and
     /// [`Builder::elevated_owner`] says which launches with raised rights
     /// may do either.
     ///
     /// [windowed]: crate::Kind::Windowed
     /// [`Builder::elevated_owner`]: crate::Builder::elevated_owner
+    /// [`Builder::try_own`]: crate::Builder::try_own
     /// [`Builder::exclusive`]: crate::Builder::exclusive
     #[non_exhaustive]
     MayNotOwn {
@@ -485,11 +486,12 @@ pub enum Reason {
     /// confines, below medium integrity, in an AppContainer or with a
     /// restricted token. It neither owns nor hands off, nor holds the state
     /// with [`Builder::exclusive`]. [`Builder::start`],
-    /// [`Builder::hand_off`], [`Builder::probe`] and `exclusive` return
-    /// this at once, before they look for an owner or make anything. See
-    /// the crate docs on privileges.
+    /// [`Builder::try_own`], [`Builder::hand_off`], [`Builder::probe`] and
+    /// `exclusive` return this at once, before they look for an owner or
+    /// make anything. See the crate docs on privileges.
     ///
     /// [`Builder::start`]: crate::Builder::start
+    /// [`Builder::try_own`]: crate::Builder::try_own
     /// [`Builder::hand_off`]: crate::Builder::hand_off
     /// [`Builder::probe`]: crate::Builder::probe
     /// [`Builder::exclusive`]: crate::Builder::exclusive
@@ -555,8 +557,14 @@ pub enum Reason {
     /// [exclusive](crate::Builder::exclusive) run. Or one of the two has a
     /// [scope](crate::Builder::scope) and the other hasn't: owners with
     /// scopes share the guard only with one another. This launch let go of
-    /// its lock before anyone could connect. Only `start` and `exclusive`
-    /// hold the guard.
+    /// its lock before anyone could connect. Only `start`, `try_own` and
+    /// `exclusive` hold the guard.
+    ///
+    /// From [`Builder::try_own`], it is any process that holds the lock in
+    /// this launch's runtime folder, on Windows at any integrity level: an
+    /// owner, one still starting, or an exclusive run that takes no guard.
+    /// With the lock free, it is a process that holds the guard, as for
+    /// `start`.
     ///
     /// From `exclusive`, it is any owner of the state folder, or another
     /// exclusive run, that holds the guard. Where `exclusive` takes no
@@ -573,20 +581,22 @@ pub enum Reason {
     ///
     /// [`Builder::dir`]: crate::Builder::dir
     /// [`Builder::start`]: crate::Builder::start
+    /// [`Builder::try_own`]: crate::Builder::try_own
     /// [`Builder::hand_off`]: crate::Builder::hand_off
     /// [`Builder::probe`]: crate::Builder::probe
     #[non_exhaustive]
     StateInUse {
-        /// The guard file, or the lock file for an exclusive run that takes
-        /// no guard.
+        /// The guard file, or the lock file: for an exclusive run that
+        /// takes no guard, and for a `try_own` that finds the lock held.
         path: PathBuf,
     },
     /// The state folder, or the folder it would be created in, belongs to
     /// another user: root given the user's home by `sudo -E`, say. Nothing
-    /// was created. Only [`Builder::start`] and [`Builder::exclusive`]
-    /// check this; see [`Builder::new`].
+    /// was created. Only [`Builder::start`], [`Builder::try_own`] and
+    /// [`Builder::exclusive`] check this; see [`Builder::new`].
     ///
     /// [`Builder::start`]: crate::Builder::start
+    /// [`Builder::try_own`]: crate::Builder::try_own
     /// [`Builder::exclusive`]: crate::Builder::exclusive
     /// [`Builder::new`]: crate::Builder::new
     #[non_exhaustive]

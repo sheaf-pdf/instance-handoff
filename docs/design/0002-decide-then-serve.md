@@ -1,6 +1,6 @@
 # 0002. Decide before the event loop exists, serve after
 
-**Status:** Accepted in part, 2026-10-18, by the maintainer. Built on `api-0.1`. Accepted: the shape, meaning `start`, `Claim`, `serve`, a handler that only forwards, and non-exhaustive `Reason` and `End`. The `Builder`'s arguments follow [0015](0015-state-keyed-identity.md), built on `migrate-to-0015` (2026-10-20): `Builder::new` takes the state, and `exclusive()` replaces `Mode`.
+**Status:** Accepted in part, 2026-10-18, by the maintainer. Built on `api-0.1`. Accepted: the shape, meaning `start`, `Claim`, `serve`, a handler that only forwards, and non-exhaustive `Reason` and `End`. The `Builder`'s arguments follow [0015](0015-state-keyed-identity.md), built on `migrate-to-0015` (2026-10-20): `Builder::new` takes the state, and `exclusive()` replaces `Mode`. [0018](0018-own-or-run-alone.md) adds `try_own()`, built on `alpha-2` (2026-10-24).
 
 ## Context
 
