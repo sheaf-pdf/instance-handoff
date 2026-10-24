@@ -141,6 +141,12 @@
 //!   If it follows the account, as the Windows known folders do (they
 //!   ignore `%APPDATA%`), a test must pass its folder through an option of
 //!   the app's own.
+//! - A launch started with a stripped environment, as cron, systemd units
+//!   and some MCP clients start programs, gets the function's defaults.
+//!   Where the user has set the variables it follows, that is another
+//!   folder, and the launch gets an owner of its own. Where every launch
+//!   must meet one owner, derive the folder from what every launch agrees
+//!   on, such as the account, rather than from the environment.
 //! - The owner keeps its [guard](Guard), `.instance-handoff.lock`, in the
 //!   folder. For a folder that a sync tool copies between machines, and
 //!   for config that is read-only or shared, use [`Guard::Off`].

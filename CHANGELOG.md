@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- **Docs.** A shorter README.
+- **Docs.** A shorter README. "The state" warns that a launch with a stripped environment can compute another state folder, and so get an owner of its own.
+- **Reasons.** `StateInUse` reads "another process holds the state folder", which fits `exclusive` too: it never tries to reach the process.
 
 ## 0.1.0-alpha.1 (2026-10-20)
 

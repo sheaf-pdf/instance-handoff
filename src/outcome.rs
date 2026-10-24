@@ -669,7 +669,7 @@ impl fmt::Display for Reason {
             Reason::Lock { path, source } => write!(f, "lock {}: {source}", path.display()),
             Reason::StateInUse { path } => write!(
                 f,
-                "an instance this launch can't reach holds the state folder: {}",
+                "another process holds the state folder: {}",
                 path.display()
             ),
             Reason::ForeignState { path } => write!(
@@ -778,8 +778,7 @@ mod tests {
         };
         assert_eq!(
             reason.to_string(),
-            "an instance this launch can't reach holds the state folder: \
-             /home/me/app/.instance-handoff.lock"
+            "another process holds the state folder: /home/me/app/.instance-handoff.lock"
         );
         assert!(reason.source().is_none());
     }
