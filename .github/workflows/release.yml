@@ -5,10 +5,10 @@ name: Release
 # short-lived identity token for a crates.io token that is revoked when the
 # job ends, so no publishing token is stored anywhere.
 #
-# To release, merge a version bump (Cargo.toml and Cargo.lock) to main, then
-# tag that commit and push the tag:
+# To release, merge a version bump to main, then tag that commit and push
+# the tag. release.toml says how cargo-release makes both:
 #
-#   git tag -a v0.1.0 -m "instance-handoff 0.1.0" && git push origin v0.1.0
+#   cargo release tag --execute && git push origin v0.1.0
 #
 # crates.io lets only a crate that exists trust a workflow, so the first
 # version was published by hand, from main. A tag for a version crates.io
