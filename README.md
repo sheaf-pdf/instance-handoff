@@ -34,7 +34,7 @@ fn main() {
 ## Install
 
 ```sh
-cargo add instance-handoff@=0.1.0-alpha.1
+cargo add instance-handoff@=0.1.0-alpha.2
 ```
 
 This is an alpha. Until 0.1.0, an alpha may change the API, and how two builds of your app find each other; the [changelog](CHANGELOG.md) says when. Cargo treats a later alpha as compatible, so pin the version with `=`. The `serde` feature adds `Json<T>`, for any serde type as a payload.
