@@ -226,7 +226,7 @@ mod tests {
     fn ids_are_safe_file_names() {
         for kind in [Kind::Windowed, Kind::Headless] {
             for good in [
-                "sheaf",
+                "viewer",
                 "org.example.Viewer",
                 "a",
                 "my_app-2",
@@ -261,8 +261,8 @@ mod tests {
 
     #[test]
     fn the_kind_is_part_of_the_app_id() {
-        const WINDOWED: AppId = AppId::windowed("sheaf");
-        const HEADLESS: AppId = AppId::headless("sheaf");
+        const WINDOWED: AppId = AppId::windowed("viewer");
+        const HEADLESS: AppId = AppId::headless("viewer");
         fn hash(id: &AppId) -> u64 {
             let mut h = DefaultHasher::new();
             id.hash(&mut h);
@@ -273,11 +273,11 @@ mod tests {
         assert_ne!(WINDOWED, HEADLESS);
         assert_ne!(hash(&WINDOWED), hash(&HEADLESS));
         // A literal and a parsed id of one kind are the same app id.
-        let parsed = AppId::parse("sheaf", Kind::Windowed).unwrap();
+        let parsed = AppId::parse("viewer", Kind::Windowed).unwrap();
         assert_eq!(parsed, WINDOWED);
         assert_eq!(hash(&parsed), hash(&WINDOWED));
         // Folder names, the thread and the address see the bare id.
-        assert_eq!(WINDOWED.to_string(), "sheaf");
-        assert_eq!(HEADLESS.as_str(), "sheaf");
+        assert_eq!(WINDOWED.to_string(), "viewer");
+        assert_eq!(HEADLESS.as_str(), "viewer");
     }
 }

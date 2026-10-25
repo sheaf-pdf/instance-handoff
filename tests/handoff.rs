@@ -312,6 +312,93 @@ fn an_exclusive_run_without_a_guard_takes_the_lock() {
     claim(none.start(&Args::default())).release();
 }
 
+// With nobody owning, try_own owns as start would: it makes the missing
+// state folder, private, and takes the guard. Beside its owner, another
+// try_own fails at once, naming the lock file, and hands nothing over,
+// while a start hands off to it. Released, the lock is free for the next.
+#[test]
+fn try_own_owns_when_nobody_does_and_otherwise_runs_alone() {
+    let dir = dir();
+    let state = canonical(dir.tmp.path()).join("state");
+    let lock = builder(&dir).runtime_dir().unwrap().join("instance.lock");
+    let first = builder(&dir).try_own::<Args>().unwrap();
+    assert_eq!(first.state_dir(), Some(state.as_path()));
+    assert!(first.guarded());
+    assert_private(&state);
+    let (owner, rx) = serve(first);
+
+    let t = Instant::now();
+    in_use(builder(&dir).try_own::<Args>().unwrap_err(), &lock);
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert!(rx.try_recv().is_err());
+    match builder(&dir).start(&args(&["x"])) {
+        Started::HandedOff(info) => assert!(info.confirmed()),
+        other => panic!("expected to hand off: {other:?}"),
+    }
+    let got = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(got.payload(), &args(&["x"]));
+    owner.release();
+
+    builder(&dir).try_own::<Args>().unwrap().release();
+}
+
+// Launches that try_own at once make one owner. Every other fails,
+// naming the lock file.
+#[test]
+fn launches_that_try_own_at_once_make_one_owner() {
+    let dir = dir();
+    let lock = builder(&dir).runtime_dir().unwrap().join("instance.lock");
+    let at_once = Arc::new(std::sync::Barrier::new(8));
+    let tries: Vec<_> = (0..8)
+        .map(|_| {
+            let b = builder(&dir);
+            let at_once = at_once.clone();
+            std::thread::spawn(move || {
+                at_once.wait();
+                b.try_own::<Args>()
+            })
+        })
+        .collect();
+    let mut owners = Vec::new();
+    for t in tries {
+        match t.join().unwrap() {
+            Ok(claim) => owners.push(claim),
+            Err(reason) => in_use(reason, &lock),
+        }
+    }
+    assert_eq!(owners.len(), 1);
+    owners.pop().unwrap().release();
+}
+
+// With the lock free, try_own still needs the guard. An exclusive run, or
+// an owner of the state folder in another runtime folder, keeps it out at
+// once, naming the guard file, and it lets go of its lock, so nobody owns
+// there.
+#[test]
+fn try_own_needs_the_guard_too() {
+    let dir = dir();
+    let held = builder(&dir).exclusive().unwrap();
+    let t = Instant::now();
+    in_use(
+        builder(&dir).try_own::<Args>().unwrap_err(),
+        &guard_file(&dir),
+    );
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    let reason = builder(&dir).probe().unwrap_err();
+    assert!(matches!(reason, Reason::NoOwner { .. }), "{reason}");
+    held.release();
+
+    let other = builder(&dir).dir(dir.tmp.path().join("other"));
+    let elsewhere = claim(other.start(&Args::default()));
+    in_use(
+        builder(&dir).try_own::<Args>().unwrap_err(),
+        &guard_file(&dir),
+    );
+    elsewhere.release();
+
+    builder(&dir).try_own::<Args>().unwrap().release();
+}
+
 // Allow and the default policy both hand off to an owner at their level,
 // raised or not. Not raised, as on CI, the default owns as launches
 // always have; raised, it runs alone at once.
@@ -635,8 +722,8 @@ fn a_panicking_handler_ends_the_owner_and_declines_later_launches() {
 
 #[test]
 fn a_launch_that_gave_up_is_never_delivered_later() {
-    // Sheaf's bug 11: the launch runs alone, and the owner must not open
-    // the same files once it gets to them.
+    // The launch runs alone, and the owner must not open the same files
+    // once it gets to them.
     let dir = dir();
     let claim = claim(builder(&dir).start(&Args::default()));
     let reason = alone(builder(&dir).timeout(SHORT).start(&args(&["gave-up"])));

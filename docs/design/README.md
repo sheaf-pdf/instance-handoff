@@ -42,3 +42,5 @@ Decisions about how one app uses the crate, such as sheaf's app id, belong in th
 | [0014](0014-process-ids.md) | Process ids come from the OS, never from the peer | Accepted |
 | [0015](0015-state-keyed-identity.md) | One owner per state; rights and placement decided separately | Accepted with changes, built |
 | [0016](0016-windows-address-file.md) | The Windows owner keeps its address file open | Accepted, built |
+| [0017](0017-own-the-transport.md) | Sockets and pipes directly, not through interprocess | Accepted |
+| [0018](0018-own-or-run-alone.md) | A launch that owns if nobody does, and otherwise runs alone | Accepted, built |

@@ -16,9 +16,9 @@ use crate::{
 
 /// Between attempts while the owner starts, is busy or quits.
 const RETRY: Duration = Duration::from_millis(50);
-/// An exclusive run that takes no guard, and finds the lock held, looks
-/// again for this long, so a `hand_off` or `probe` testing the lock isn't
-/// taken for an owner.
+/// An exclusive run that takes no guard, or a `try_own`, that finds the
+/// lock held looks again for this long, so a `hand_off` or `probe` testing
+/// the lock isn't taken for an owner.
 const LOCK_RETRY: Duration = Duration::from_millis(50);
 /// A launch that holds the lock and finds the guard held looks again for
 /// this long. An owner that exits lets go of its lock a moment before its
@@ -305,8 +305,8 @@ fn ineligible_rights(
 
 /// Whether this process may take part at all: not where nothing can own
 /// ([`Reason::Unsupported`]), nor when it is excluded
-/// ([`Reason::Excluded`]). `start`, `hand_off`, `probe` and `exclusive` ask
-/// first, before they look for an owner or make anything.
+/// ([`Reason::Excluded`]). `start`, `try_own`, `hand_off`, `probe` and
+/// `exclusive` ask first, before they look for an owner or make anything.
 fn take_part() -> Result<(), Reason> {
     if !sys::SUPPORTED {
         return Err(Reason::Unsupported {});
@@ -369,7 +369,12 @@ fn start_as<T: Payload>(b: &Builder, payload: &T, may_not_own: Option<Ineligible
     let mut waiting: Option<Waiting> = None;
     loop {
         match folder.lock() {
-            Ok(Some(lock)) => return own(b, place, folder, lock, state, key),
+            Ok(Some(lock)) => {
+                return match own(b, place, folder, lock, state, key) {
+                    Ok(claim) => Started::Owner(claim),
+                    Err(reason) => Started::Alone(reason),
+                };
+            }
             Ok(None) => {}
             // The folder was deleted under this launch (a cleaner, `rm`):
             // open it afresh and keep going.
@@ -448,11 +453,40 @@ fn own<T>(
     lock: sys::Lock,
     state: Option<PathBuf>,
     key: Vec<u8>,
-) -> Started<T> {
-    match take_state(b, state.as_deref()) {
-        Ok(guard) => Started::Owner(Claim::new(b, place, folder, lock, guard, state, key)),
-        Err(reason) => Started::Alone(reason),
+) -> Result<Claim<T>, Reason> {
+    let guard = take_state(b, state.as_deref())?;
+    Ok(Claim::new(b, place, folder, lock, guard, state, key))
+}
+
+pub(crate) fn try_own<T: Payload>(b: &Builder) -> Result<Claim<T>, Reason> {
+    take_part()?;
+    let may_not_own = ineligible(
+        b.app_id.kind(),
+        sys::can_show_windows(),
+        b.elevated_owner,
+        sys::raised(),
+        sys::above_normal(),
+    );
+    try_own_as(b, may_not_own)
+}
+
+/// `try_own` for a launch that may own, or that may not, and why. It
+/// checks what `start` checks before it takes the lock, then owns as
+/// `start` does, or finds the lock held and runs alone, as an exclusive
+/// run does where it takes no guard. It never looks for the owner.
+fn try_own_as<T>(b: &Builder, may_not_own: Option<Ineligible>) -> Result<Claim<T>, Reason> {
+    if let Some(why) = may_not_own {
+        return Err(Reason::MayNotOwn { why });
     }
+    let state = b.canonical_state();
+    // Before anything is created, as for `start`.
+    if let Some(path) = state.as_deref().and_then(crate::state::foreign) {
+        return Err(Reason::ForeignState { path });
+    }
+    let place = b.place(state.as_deref())?;
+    let key = b.instance_key(state.as_deref());
+    let (folder, lock) = lock_alone(&place, LOCK_RETRY)?;
+    own(b, place, folder, lock, state, key)
 }
 
 /// For a launch that holds the lock: creates the canonical `state` folder
@@ -521,7 +555,7 @@ fn exclusive_as(b: &Builder, may_not_own: Option<Ineligible>) -> Result<Exclusiv
         }
     }
     let place = b.place(state.as_deref())?;
-    let (folder, lock) = lock_alone(&place)?;
+    let (folder, lock) = lock_alone(&place, LOCK_RETRY)?;
     // As `start` makes it once it holds the lock. Where the guard was
     // skipped, it is made already, and left as it is.
     if let Some(dir) = state.as_deref() {
@@ -531,12 +565,13 @@ fn exclusive_as(b: &Builder, may_not_own: Option<Ineligible>) -> Result<Exclusiv
 }
 
 /// Opens the runtime folder at `place`, making it if it is missing, and
-/// takes its lock for an exclusive run, looking again for [`LOCK_RETRY`].
-/// Still held, it gives [`Reason::StateInUse`], naming the lock file.
-fn lock_alone(place: &sys::Place) -> Result<(sys::Folder, sys::Lock), Reason> {
+/// takes its lock for an exclusive run or `try_own`, looking again for
+/// `retry` ([`LOCK_RETRY`]). Still held, it gives [`Reason::StateInUse`],
+/// naming the lock file.
+fn lock_alone(place: &sys::Place, retry: Duration) -> Result<(sys::Folder, sys::Lock), Reason> {
     let open = || sys::open_folder(place, true)?.ok_or(Reason::NoRuntimeDir {});
     let mut folder = open()?;
-    let until = Instant::now() + LOCK_RETRY;
+    let until = Instant::now() + retry;
     loop {
         match folder.lock() {
             Ok(Some(lock)) => return Ok((folder, lock)),
@@ -1718,8 +1753,8 @@ mod tests {
 
     // A launch told it may not own never takes the lock or makes the
     // folder. It hands off to an owner that is running, and otherwise runs
-    // alone. An exclusive run told so fails at once, beside an owner or
-    // not, and makes nothing either.
+    // alone. A try_own or an exclusive run told so fails at once, beside an
+    // owner or not, and makes nothing either.
     #[cfg(any(unix, windows))]
     #[test]
     fn a_launch_that_may_not_own_hands_off_or_runs_alone() {
@@ -1748,6 +1783,10 @@ mod tests {
                 Err(Reason::MayNotOwn { why }) => assert_eq!(why, Ineligible::Raised),
                 other => panic!("expected MayNotOwn: {other:?}"),
             }
+            match try_own_as::<Args>(b, raised) {
+                Err(Reason::MayNotOwn { why }) => assert_eq!(why, Ineligible::Raised),
+                other => panic!("expected MayNotOwn: {other:?}"),
+            }
         }
         assert!(!run.exists() && !state.exists());
 
@@ -1760,16 +1799,45 @@ mod tests {
         }
         let got = rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(got.payload(), &sent);
-        // An exclusive run never hands off.
+        // Neither a try_own nor an exclusive run ever hands off.
         assert!(matches!(
             exclusive_as(&b, raised),
             Err(Reason::MayNotOwn { .. })
         ));
+        assert!(matches!(
+            try_own_as::<Args>(&b, raised),
+            Err(Reason::MayNotOwn { .. })
+        ));
+        assert!(rx.try_recv().is_err());
 
         // The folder stays, with nobody holding its lock.
         owner.release();
         may_not_own(start_as(&b, &Args::default(), raised));
         own(start_as(&b, &Args::default(), None)).release();
+    }
+
+    // A lock held for a moment, as a hand_off or probe holds it to test it,
+    // doesn't make a try_own or an exclusive run give up: lock_alone looks
+    // again, and takes the lock once it is free. Here it looks for far
+    // longer than LOCK_RETRY, since the system may stretch the holder's
+    // sleep well past it (macOS does on CI); a real holder lets go without
+    // sleeping.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_lock_held_for_a_moment_is_looked_at_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Builder::new(AppId::headless("test.try"), crate::State::none())
+            .dir(tmp.path().join("run"));
+        let place = b.place(None).unwrap();
+        let folder = sys::open_folder(&place, true).unwrap().unwrap();
+        let lock = folder.lock().unwrap().unwrap();
+        assert!(folder.lock_held().unwrap());
+        let tester = std::thread::spawn(move || {
+            std::thread::sleep(LOCK_RETRY / 2);
+            drop(lock);
+        });
+        lock_alone(&place, Duration::from_secs(10)).unwrap();
+        tester.join().unwrap();
     }
 
     // With no runtime folder to look in, a launch that may not own looks

@@ -141,7 +141,7 @@ Across levels, with the owner holding byte 0 and the byte at its level's RID:
 | Make its own level folder | `run`: made | `run-high`: made |
 | List the other level's folder | `run-high`: access denied | not tried |
 
-Medium could also open high's key folder. So labels that aren't protected stay single, a folder's label that doesn't inherit reaches none of its children, and each level finds the other's marker. A protected label can't be set by either level, so the layout uses labels that aren't protected (call 5.8 in [docs/impl/0015-calls.md](../impl/0015-calls.md)).
+Medium could also open high's key folder. So labels that aren't protected stay single, a folder's label that doesn't inherit reaches none of its children, and each level finds the other's marker. A protected label can't be set by either level, so the layout uses labels that aren't protected (call 5.8 in [docs/impl/0015-calls.md at 042c264](https://github.com/sheaf-pdf/instance-handoff/blob/042c264a21f7b8969bf24d3eacd169532cdc5b6b/docs/impl/0015-calls.md)).
 
 ## The built layout under real UAC
 
@@ -155,7 +155,7 @@ On 2026-10-20 the UAC machine above ran the crate as built: main at 046ded6, the
 | Administrators | enabled, group owner | deny-only | not enabled | deny-only |
 | Elevation type | full, with a linked token | not printed; the crate didn't count it as raised | full, with a linked token | full, as the crate's `Raised` shows |
 
-The probe's medium child is a SAFER Basic User token made from the elevated one and lowered to medium. It keeps the elevation type full. Slice 35 counted every full token as raised, so these children couldn't own, and the maintainer narrowed the rule: a full token is raised only above medium (call 7.5 in [docs/impl/0015-calls.md](../impl/0015-calls.md)). `runas /trustlevel:0x20000` gives no such token from an elevated shell: SAFER keeps the level of the token it starts from, so its launches stay raised.
+The probe's medium child is a SAFER Basic User token made from the elevated one and lowered to medium. It keeps the elevation type full. Slice 35 counted every full token as raised, so these children couldn't own, and the maintainer narrowed the rule: a full token is raised only above medium (call 7.5 in [docs/impl/0015-calls.md at 042c264](https://github.com/sheaf-pdf/instance-handoff/blob/042c264a21f7b8969bf24d3eacd169532cdc5b6b/docs/impl/0015-calls.md)). `runas /trustlevel:0x20000` gives no such token from an elevated shell: SAFER keeps the level of the token it starts from, so its launches stay raised.
 
 ### The CLI example
 

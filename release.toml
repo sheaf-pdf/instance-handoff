@@ -1,0 +1,44 @@
+# cargo-release (`cargo install cargo-release`). A release takes two steps,
+# because main takes changes through pull requests, and CI publishes:
+#
+# 1. On a branch, bump the version, rewrite the places that name it and
+#    commit, in one run, then open a pull request. The level is alpha,
+#    beta, rc, patch, minor, major or release, or a version. (The `version`
+#    and `replace` steps can't run one after the other: `replace` refuses
+#    the tree `version` leaves uncommitted.)
+#
+#      cargo release alpha --no-publish --no-tag --no-push --execute
+#
+# 2. Once it is merged, tag main and push the tag. release.yml tests the
+#    tag and publishes it to crates.io with trusted publishing.
+#
+#      cargo release tag --execute
+#      git push origin v0.1.0-alpha.2
+#
+# Without `--execute`, each step only says what it would do. Nothing here
+# publishes or pushes. Replacements run for alphas, betas and rcs too
+# (`prerelease`), since cargo-release skips them for pre-releases by
+# default.
+
+publish = false
+push = false
+# release.yml publishes `v*` tags.
+tag-name = "v{{version}}"
+tag-message = "instance-handoff {{version}}"
+pre-release-commit-message = "Publish {{version}}"
+
+# The changelog's Unreleased section becomes the release's.
+[[pre-release-replacements]]
+file = "CHANGELOG.md"
+search = '(?m)^## Unreleased$'
+replace = "## {{version}} ({{date}})"
+exactly = 1
+prerelease = true
+
+# The README's install line pins the exact version.
+[[pre-release-replacements]]
+file = "README.md"
+search = 'instance-handoff@=\S+'
+replace = "instance-handoff@={{version}}"
+exactly = 1
+prerelease = true
