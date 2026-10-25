@@ -485,7 +485,7 @@ fn try_own_as<T>(b: &Builder, may_not_own: Option<Ineligible>) -> Result<Claim<T
     }
     let place = b.place(state.as_deref())?;
     let key = b.instance_key(state.as_deref());
-    let (folder, lock) = lock_alone(&place)?;
+    let (folder, lock) = lock_alone(&place, LOCK_RETRY)?;
     own(b, place, folder, lock, state, key)
 }
 
@@ -555,7 +555,7 @@ fn exclusive_as(b: &Builder, may_not_own: Option<Ineligible>) -> Result<Exclusiv
         }
     }
     let place = b.place(state.as_deref())?;
-    let (folder, lock) = lock_alone(&place)?;
+    let (folder, lock) = lock_alone(&place, LOCK_RETRY)?;
     // As `start` makes it once it holds the lock. Where the guard was
     // skipped, it is made already, and left as it is.
     if let Some(dir) = state.as_deref() {
@@ -566,12 +566,12 @@ fn exclusive_as(b: &Builder, may_not_own: Option<Ineligible>) -> Result<Exclusiv
 
 /// Opens the runtime folder at `place`, making it if it is missing, and
 /// takes its lock for an exclusive run or `try_own`, looking again for
-/// [`LOCK_RETRY`]. Still held, it gives [`Reason::StateInUse`], naming the
-/// lock file.
-fn lock_alone(place: &sys::Place) -> Result<(sys::Folder, sys::Lock), Reason> {
+/// `retry` ([`LOCK_RETRY`]). Still held, it gives [`Reason::StateInUse`],
+/// naming the lock file.
+fn lock_alone(place: &sys::Place, retry: Duration) -> Result<(sys::Folder, sys::Lock), Reason> {
     let open = || sys::open_folder(place, true)?.ok_or(Reason::NoRuntimeDir {});
     let mut folder = open()?;
-    let until = Instant::now() + LOCK_RETRY;
+    let until = Instant::now() + retry;
     loop {
         match folder.lock() {
             Ok(Some(lock)) => return Ok((folder, lock)),
@@ -1817,24 +1817,26 @@ mod tests {
     }
 
     // A lock held for a moment, as a hand_off or probe holds it to test it,
-    // doesn't make a try_own run alone: it looks again, and owns once the
-    // lock is free.
+    // doesn't make a try_own or an exclusive run give up: lock_alone looks
+    // again, and takes the lock once it is free. Here it looks for far
+    // longer than LOCK_RETRY, since the system may stretch the holder's
+    // sleep well past it (macOS does on CI); a real holder lets go without
+    // sleeping.
     #[cfg(any(unix, windows))]
     #[test]
-    fn a_try_own_looks_again_at_a_lock_held_for_a_moment() {
-        use crate::Args;
+    fn a_lock_held_for_a_moment_is_looked_at_again() {
         let tmp = tempfile::tempdir().unwrap();
         let b = Builder::new(AppId::headless("test.try"), crate::State::none())
             .dir(tmp.path().join("run"));
-        let folder = sys::open_folder(&b.place(None).unwrap(), true)
-            .unwrap()
-            .unwrap();
+        let place = b.place(None).unwrap();
+        let folder = sys::open_folder(&place, true).unwrap().unwrap();
         let lock = folder.lock().unwrap().unwrap();
+        assert!(folder.lock_held().unwrap());
         let tester = std::thread::spawn(move || {
             std::thread::sleep(LOCK_RETRY / 2);
             drop(lock);
         });
-        try_own_as::<Args>(&b, None).unwrap().release();
+        lock_alone(&place, Duration::from_secs(10)).unwrap();
         tester.join().unwrap();
     }
 
